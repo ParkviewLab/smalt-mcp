@@ -82,6 +82,32 @@ def _call_tool(
     return json.loads(contents[0]["text"])
 
 
+def _call_tool_raw_text(
+    client: TestClient,
+    session_id: str,
+    name: str,
+    arguments: dict,
+    *,
+    req_id: int = 100,
+) -> str:
+    """Return the first content block's raw text — without JSON-parsing.
+
+    Used for tests that hit MCP's input-schema validation (which rejects
+    with a plain-text error message, not a JSON payload).
+    """
+    body, _ = _mcp(
+        client,
+        "tools/call",
+        {"name": name, "arguments": arguments},
+        req_id=req_id,
+        session_id=session_id,
+    )
+    assert "result" in body, f"tools/call returned: {body!r}"
+    contents = body["result"]["content"]
+    assert contents and contents[0]["type"] == "text"
+    return contents[0]["text"]
+
+
 # ---------------------------------------------------------------------------
 # HTTP routes
 
@@ -109,29 +135,166 @@ def test_admin_version(mcp_client: TestClient):
 # MCP surface
 
 
-def test_mcp_initialize_lists_status(mcp_client: TestClient):
+def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     body, _ = _mcp(mcp_client, "tools/list", {}, req_id=2, session_id=sid)
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
-    assert "status" in names
+    # Every read-only tool must show up when the server is in read_write
+    # (the dev-mode default). When the scope tightens to read_only, the
+    # read-write tools (none yet) drop out; read-only set is unchanged.
+    assert {"status", "list_pages", "read_page", "traverse", "search"} <= names
 
 
 def test_status_tool(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "status", {}, req_id=10)
-    # smalt_dir was set by conftest.py before the server imported config
-    assert "smalt_dir" in result
-    assert "exists" in result
-    assert "tables" in result
-    assert "page_count" in result
-    assert "mutex" in result
-    assert "embedding" in result
-    assert result["embedding"]["provider"] == "fastembed"
+    # smalt_dir was set by conftest.py before the server imported config; the
+    # seed-Smalt fixture also created the LanceDB tables and indexed 5 pages.
+    assert result["exists"] is True
+    assert set(result["tables"]) >= {"pages", "embeddings", "links", "claims", "sources"}
+    assert result["page_count"] == 5
+    assert result["embedding"]["provider"] == "fake"
     assert result["embedding"]["dim"] == 384
 
 
-def test_status_unknown_tool(mcp_client: TestClient):
+def test_unknown_tool_returns_structured_error(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "does_not_exist", {}, req_id=11)
     assert result.get("error") == "unknown_tool"
+
+
+# ---------------------------------------------------------------------------
+# list_pages
+
+
+def test_list_pages_all(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "list_pages", {}, req_id=20)
+    assert result["count"] == 5
+    ids = {p["id"] for p in result["pages"]}
+    assert ids == {"ent-alice", "ent-bob", "con-embedding", "con-index", "src-doc1"}
+
+
+def test_list_pages_filter_by_type(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "list_pages", {"type": "entity"}, req_id=21)
+    ids = {p["id"] for p in result["pages"]}
+    assert ids == {"ent-alice", "ent-bob"}
+    assert all(p["type"] == "entity" for p in result["pages"])
+
+
+def test_list_pages_filter_by_prefix(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "list_pages", {"prefix": "con-"}, req_id=22)
+    ids = {p["id"] for p in result["pages"]}
+    assert ids == {"con-embedding", "con-index"}
+
+
+# ---------------------------------------------------------------------------
+# read_page
+
+
+def test_read_page_existing(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "read_page", {"page_id": "ent-alice"}, req_id=30)
+    assert result["id"] == "ent-alice"
+    assert result["title"] == "Alice"
+    assert result["type"] == "entity"
+    assert "Alice is a fictional person" in result["body"]
+    # Frontmatter is round-tripped JSON; basic shape check.
+    assert result["frontmatter"]["type"] == "entity"
+    assert "Alicia" in result["frontmatter"].get("aliases", [])
+
+
+def test_read_page_missing(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "read_page", {"page_id": "ent-nope"}, req_id=31)
+    assert result.get("error") == "not_found"
+    assert result.get("page_id") == "ent-nope"
+
+
+def test_read_page_requires_page_id(mcp_client: TestClient):
+    """MCP's input-schema validation rejects calls missing a `required` field."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(mcp_client, sid, "read_page", {}, req_id=32)
+    assert "page_id" in text and ("required" in text.lower() or "missing" in text.lower())
+
+
+# ---------------------------------------------------------------------------
+# traverse
+
+
+def test_traverse_one_hop(mcp_client: TestClient):
+    """con-index --built_over--> con-embedding (1-hop)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "traverse", {"from_id": "con-index"}, req_id=40)
+    assert result["from_id"] == "con-index"
+    assert result["count"] == 1
+    edge = result["edges"][0]
+    assert edge["from_id"] == "con-index"
+    assert edge["to_id"] == "con-embedding"
+    assert edge["label"] == "built_over"
+
+
+def test_traverse_with_label_filter(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    # con-embedding --example_of--> ent-alice
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-embedding", "label": "example_of"},
+        req_id=41,
+    )
+    assert result["count"] == 1
+    assert result["edges"][0]["to_id"] == "ent-alice"
+
+    # Label that no edge has → empty.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-embedding", "label": "nonexistent"},
+        req_id=42,
+    )
+    assert result["count"] == 0
+
+
+def test_traverse_no_outgoing(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "traverse", {"from_id": "ent-alice"}, req_id=43)
+    assert result["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# search
+
+
+def test_search_finds_relevant_pages(mcp_client: TestClient):
+    """The word 'embedding' appears in 3 of 5 seed pages — FTS finds them."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "search", {"query": "embedding"}, req_id=50)
+    ids = {r["id"] for r in result["results"]}
+    # At minimum these three should rank in the top results (FTS body match).
+    # The fake embedder may pull in others via random vector similarity, so
+    # we assert subset rather than equality.
+    assert {"con-embedding", "con-index", "src-doc1"} <= ids
+    # Snippet + score shape:
+    for r in result["results"]:
+        assert "snippet" in r
+        assert "score" in r
+        assert r["score"] > 0
+
+
+def test_search_top_k_caps_results(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "search", {"query": "Alice", "top_k": 2}, req_id=51)
+    assert result["count"] <= 2
+
+
+def test_search_requires_query(mcp_client: TestClient):
+    """MCP's input-schema validation rejects calls missing a `required` field."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(mcp_client, sid, "search", {}, req_id=52)
+    assert "query" in text and ("required" in text.lower() or "missing" in text.lower())
