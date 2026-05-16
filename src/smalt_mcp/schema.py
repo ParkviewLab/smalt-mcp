@@ -31,6 +31,70 @@ class PageType(StrEnum):
     SYNTHESIS = "synthesis"  # cross-source pages, written by Cogitate (Phase 2)
 
 
+class ProposalKind(StrEnum):
+    """Kind of proposal. Determines which downstream system / lifecycle applies.
+
+    The full set is described in `cobalt-grinding/docs/plan.md` → "Proposal
+    document shape and lifecycle"; keep this enum in sync as new kinds land.
+    """
+
+    # Schema layer — Cogitate proposes additions; Curate flags drift/removal.
+    SCHEMA_ADDITION = "schema_addition"
+    SCHEMA_DRIFT = "schema_drift"
+    SCHEMA_REMOVAL = "schema_removal"
+
+    # Graph structure — Cogitate constructs; Curate critiques.
+    WIKI_EDGE = "wiki_edge"
+    CONCEPT_MERGE = "concept_merge"
+    NOVEL_CONCEPT = "novel_concept"
+    CONTRADICTION = "contradiction"
+    NOVEL_SYNTHESIS = "novel_synthesis"
+
+    # Corpus growth — Research proposes new sources.
+    SOURCE_ADOPTION = "source_adoption"
+
+    # Capability surface — Toolsmith (Phase 3).
+    TOOL_ADOPTION = "tool_adoption"
+    TOOL_SPECIFICATION = "tool_specification"
+    TOOLKIT_ADDITION = "toolkit_addition"
+    TOOLKIT_REMOVAL = "toolkit_removal"
+
+    # Curate audits.
+    ORPHAN = "orphan"
+    DUPLICATE = "duplicate"
+    BROKEN_LINK = "broken_link"
+    STALENESS = "staleness"
+
+
+class ProposalStatus(StrEnum):
+    """Lifecycle state of a proposal."""
+
+    PROPOSED = "proposed"
+    UNDER_TEST = "under_test"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+    SUPERSEDED = "superseded"
+
+
+class TestStatus(StrEnum):
+    """Test outcome for a proposal's prediction."""
+
+    UNTESTED = "untested"
+    PASSED = "passed"
+    FAILED = "failed"
+    UNTESTABLE = "untestable"  # falsifiability gap; the user is the test
+
+
+class TestCost(StrEnum):
+    """Coarse cost tier. Governs whether the system auto-tests."""
+
+    TRIVIAL = "trivial"   # no test required; user-approve and apply
+    CHEAP = "cheap"       # auto-test
+    MEDIUM = "medium"     # test if budget allows
+    EXPENSIVE = "expensive"  # run only on user request
+
+
 class LocationKind(StrEnum):
     """How a source's `location_uri` should be interpreted."""
 
@@ -84,6 +148,18 @@ class Claim(BaseModel):
     )
 
 
+class Evidence(BaseModel):
+    """A `(source_id, snippet)` pair attached to a concept, recording *where* a
+    term was used in a particular source. Glossary entries on `ConceptPage`
+    accumulate evidence across sources so a reader (or an agent) can see the
+    in-context uses without re-fetching the source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str = Field(description="id of the SourcePage this evidence came from")
+    snippet: str = Field(description="short verbatim excerpt; provenance, not a copy of the source")
+
+
 # ---- common base for all page types ----
 
 
@@ -120,14 +196,63 @@ class EntityPage(PageBase):
         default=None,
         description="optional sub-kind: person, org, product, repo, package, place, ...",
     )
+    domains: list[str] = Field(
+        default_factory=list,
+        description=(
+            "ids of ConceptPages this entity belongs to. Used for disambiguation "
+            "when same-name entities live in different domains (e.g. a CS Smith "
+            "vs. an economist Smith)."
+        ),
+    )
     claims: list[Claim] = Field(default_factory=list)
 
 
 class ConceptPage(PageBase):
+    """A concept page. Three notable flags:
+
+    - `is_domain=True`: this concept is itself a domain. The auto-generated
+      `pages/domains.md` IndexPage lists all of these. Domain hierarchy is
+      expressed by `subdomain_of` labeled links (in `links_out`), NOT by the
+      `domains:` field — keeps "what this is about" cleanly separated from
+      "what this is under".
+    - `glossary=True`: this is a short-definition glossary entry. The
+      `evidence` list collects per-source snippets so a reader can see where
+      the term was used. Richer concepts (parents, claims) leave the flag
+      false.
+    - `domains: [...]`: ids of ConceptPages (themselves marked `is_domain`)
+      that this concept is *about*. Multi-domain by default — a concept can
+      belong to several domains.
+    """
+
     type: Literal[PageType.CONCEPT] = PageType.CONCEPT  # type: ignore[assignment]
     parents: list[str] = Field(
         default_factory=list,
         description="ids of broader concept pages (taxonomy edges, populated by Cogitate)",
+    )
+    domains: list[str] = Field(
+        default_factory=list,
+        description=(
+            "ids of ConceptPages this concept belongs to. Use `subdomain_of` "
+            "labeled links for hierarchy between domains themselves."
+        ),
+    )
+    is_domain: bool = Field(
+        default=False,
+        description=(
+            "When true, this concept is itself a domain. Listed in the "
+            "auto-generated pages/domains.md IndexPage."
+        ),
+    )
+    glossary: bool = Field(
+        default=False,
+        description=(
+            "When true, this is a short-definition glossary entry; listed in "
+            "the auto-generated pages/glossary.md IndexPage."
+        ),
+    )
+    evidence: list[Evidence] = Field(
+        default_factory=list,
+        description="Per-source (source_id, snippet) pairs; used by glossary entries.",
     )
     claims: list[Claim] = Field(default_factory=list)
 
@@ -172,6 +297,25 @@ class SourcePage(PageBase):
         description="filenames found in this source but not ingested in the current milestone",
     )
 
+    # Domain hints — multi-domain by default. Gives the SME ingest agent a
+    # default for terms extracted from this source.
+    domains: list[str] = Field(
+        default_factory=list,
+        description="ids of ConceptPages this source is about",
+    )
+
+    # Hybrid source layout — multi-file sources have an index page + one
+    # section page per file; section pages link back via parent_source; the
+    # index page enumerates its sections via `sections`.
+    parent_source: str | None = Field(
+        default=None,
+        description="id of the parent SourcePage if this is a section page",
+    )
+    sections: list[str] = Field(
+        default_factory=list,
+        description="ids of section SourcePages this source contains",
+    )
+
     # Git-source metadata (only populated when location_kind == git).
     git_remote: str | None = None
     git_branch: str | None = None
@@ -210,3 +354,55 @@ Page = Annotated[
     Field(discriminator="type"),
 ]
 """Any Smalt page, discriminated on `type`."""
+
+
+# ---- ProposalPage (lives outside the Page union) ----
+#
+# Proposals don't live in `pages/` — they live in `tasks/proposals/<system or
+# schema>/`. The indexer walks `pages/` only, so ProposalPages aren't
+# projected into the LanceDB pages table. Keeping them out of the discriminated
+# `Page` union keeps that boundary clean.
+#
+# Per `cobalt-grinding/docs/plan.md` → "Proposal document shape and lifecycle":
+# every system that doesn't directly write the corpus emits proposals (Curate,
+# Cogitate, Research, Converse's novelty detector, Toolsmith). Each proposal
+# is a hypothesis with a falsifiable prediction; the system tests where cheap
+# and the user reviews hypothesis + evidence together.
+
+
+class ProposalPage(BaseModel):
+    """Structured proposal — Observation/Hypothesis/Prediction/Test in body;
+    lifecycle + provenance metadata in frontmatter.
+
+    The body is plain markdown with an expected section ordering
+    (Observation, Hypothesis, Prediction, Test, Reasoning); this model only
+    validates the frontmatter shape.
+    """
+
+    model_config = ConfigDict(extra="allow")  # forward-compat for new kinds/fields
+
+    id: str = Field(description="stable proposal id; usually a slug")
+    type: Literal["proposal"] = "proposal"
+    title: str
+    proposal_kind: ProposalKind
+    status: ProposalStatus = ProposalStatus.PROPOSED
+    proposed_by: str = Field(
+        description=(
+            "name of the agentic system that emitted this proposal — typically "
+            "one of: cogitate, curate, research, converse, toolsmith"
+        ),
+    )
+    proposed_at: datetime
+    test_status: TestStatus = TestStatus.UNTESTED
+    test_cost: TestCost = TestCost.MEDIUM
+    related_pages: list[str] = Field(
+        default_factory=list,
+        description="ids of pages this proposal references (its `Observation` source material)",
+    )
+    supersedes: str | None = Field(
+        default=None, description="proposal id this proposal supersedes, if any"
+    )
+    superseded_by: str | None = Field(
+        default=None,
+        description="proposal id that supersedes this one (set when a later proposal lands)",
+    )
