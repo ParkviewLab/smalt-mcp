@@ -140,10 +140,19 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     body, _ = _mcp(mcp_client, "tools/list", {}, req_id=2, session_id=sid)
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
-    # Every read-only tool must show up when the server is in read_write
-    # (the dev-mode default). When the scope tightens to read_only, the
-    # read-write tools (none yet) drop out; read-only set is unchanged.
-    assert {"status", "list_pages", "read_page", "traverse", "search"} <= names
+    # Server defaults to read_write scope; every tool (5 read-only + 3
+    # read-write) should be listed. If scope is tightened later via
+    # SMALT_SCOPE=read_only, the read-write set drops out.
+    assert names == {
+        "status",
+        "list_pages",
+        "read_page",
+        "traverse",
+        "search",
+        "bootstrap",
+        "write_page",
+        "write_pages",
+    }
 
 
 def test_status_tool(mcp_client: TestClient):
@@ -298,3 +307,153 @@ def test_search_requires_query(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     text = _call_tool_raw_text(mcp_client, sid, "search", {}, req_id=52)
     assert "query" in text and ("required" in text.lower() or "missing" in text.lower())
+
+
+# ---------------------------------------------------------------------------
+# bootstrap
+
+
+def test_bootstrap_idempotent(mcp_client: TestClient):
+    """Second bootstrap call must be a complete no-op."""
+    sid = _initialize(mcp_client)
+    # First call: may create some of the dirs/files the conftest didn't —
+    # we don't assert specifics, just that the call succeeds and returns
+    # the expected shape.
+    first = _call_tool(mcp_client, sid, "bootstrap", {}, req_id=60)
+    assert first["smalt_dir"]
+    assert isinstance(first["created_dirs"], list)
+    assert isinstance(first["created_files"], list)
+    assert isinstance(first["created_tables"], list)
+
+    # Second call: every canonical dir / file / table is already in place.
+    second = _call_tool(mcp_client, sid, "bootstrap", {}, req_id=61)
+    assert second["created_dirs"] == []
+    assert second["created_files"] == []
+    assert second["created_tables"] == []
+
+
+# ---------------------------------------------------------------------------
+# write_page
+
+
+def test_write_page_round_trip(mcp_client: TestClient):
+    """write_page → read_page returns the same content."""
+    sid = _initialize(mcp_client)
+    fm = {
+        "id": "ent-test-write-rt",
+        "type": "entity",
+        "title": "Test Write Roundtrip",
+        "entity_kind": "test",
+    }
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": fm, "body": "roundtrip body content"},
+        req_id=70,
+    )
+    assert result["id"] == "ent-test-write-rt"
+    assert result["path"] == "pages/entities/ent-test-write-rt.md"
+    assert result["type"] == "entity"
+    assert "index_result" in result
+    # Indexer should have picked up exactly one new page.
+    idx = result["index_result"]
+    assert idx["inserted"] >= 1
+    # Round-trip via read_page.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-test-write-rt"}, req_id=71
+    )
+    assert read["title"] == "Test Write Roundtrip"
+    assert read["body"] == "roundtrip body content"
+    assert read["type"] == "entity"
+
+
+def test_write_page_validation_error(mcp_client: TestClient):
+    """Frontmatter missing a required field → structured validation_error."""
+    sid = _initialize(mcp_client)
+    # Missing `title` — entity requires id, type, title at minimum.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": {"id": "ent-test-invalid", "type": "entity"}},
+        req_id=72,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_write_page_overwrite_updates(mcp_client: TestClient):
+    """Writing the same id twice updates the page; the second body wins."""
+    sid = _initialize(mcp_client)
+    fm = {"id": "ent-test-write-ow", "type": "entity", "title": "v1", "entity_kind": "test"}
+    _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm, "body": "first"}, req_id=73)
+    fm2 = {**fm, "title": "v2"}
+    _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm2, "body": "second"}, req_id=74)
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-test-write-ow"}, req_id=75
+    )
+    assert read["title"] == "v2"
+    assert read["body"] == "second"
+
+
+# ---------------------------------------------------------------------------
+# write_pages
+
+
+def test_write_pages_batch(mcp_client: TestClient):
+    """Two pages written in one batch are both indexed and readable."""
+    sid = _initialize(mcp_client)
+    pages = [
+        {
+            "frontmatter": {
+                "id": "ent-test-batch-1",
+                "type": "entity",
+                "title": "Batch 1",
+                "entity_kind": "test",
+            },
+            "body": "batch page 1",
+        },
+        {
+            "frontmatter": {
+                "id": "ent-test-batch-2",
+                "type": "entity",
+                "title": "Batch 2",
+                "entity_kind": "test",
+            },
+            "body": "batch page 2",
+        },
+    ]
+    result = _call_tool(mcp_client, sid, "write_pages", {"pages": pages}, req_id=80)
+    assert result["count"] == 2
+    written_ids = {w["id"] for w in result["written"]}
+    assert written_ids == {"ent-test-batch-1", "ent-test-batch-2"}
+    # Both readable.
+    for pid in written_ids:
+        r = _call_tool(mcp_client, sid, "read_page", {"page_id": pid}, req_id=81)
+        assert r["id"] == pid
+
+
+def test_write_pages_validation_aborts_batch(mcp_client: TestClient):
+    """Invalid entry N aborts the whole batch — earlier valid entries are NOT written."""
+    sid = _initialize(mcp_client)
+    pages = [
+        {
+            "frontmatter": {
+                "id": "ent-test-abort-ok",
+                "type": "entity",
+                "title": "OK",
+                "entity_kind": "test",
+            },
+            "body": "",
+        },
+        # Second: missing required `title`
+        {"frontmatter": {"id": "ent-test-abort-bad", "type": "entity"}, "body": ""},
+    ]
+    result = _call_tool(mcp_client, sid, "write_pages", {"pages": pages}, req_id=82)
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # The valid first page was NOT written (validate-all-then-write contract).
+    r = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-test-abort-ok"}, req_id=83
+    )
+    assert r.get("error") == "not_found"

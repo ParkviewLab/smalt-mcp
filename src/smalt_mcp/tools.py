@@ -14,20 +14,71 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import frontmatter
 from mcp import types
+from pydantic import TypeAdapter, ValidationError
 
 from smalt_mcp.permissions import Scope
-from smalt_mcp.storage import lance
+from smalt_mcp.schema import Page, PageType
+from smalt_mcp.storage import lance, paths
 
 if TYPE_CHECKING:
     from smalt_mcp.app import App
 
 
 logger = logging.getLogger(__name__)
+
+
+PAGE_ADAPTER: TypeAdapter[Page] = TypeAdapter(Page)
+
+
+# Map a page's type to the subdirectory under `smalt/pages/` where its file lives.
+_TYPE_TO_SUBDIR: dict[PageType, str] = {
+    PageType.ENTITY: "entities",
+    PageType.CONCEPT: "concepts",
+    PageType.SOURCE: "sources",
+    PageType.SYNTHESIS: "syntheses",
+}
+
+
+# Bootstrap placeholders. These are intentionally minimal — they exist so a
+# fresh Smalt has *something* at the canonical paths; downstream agents and
+# humans flesh them out over time, treating them as living documents (see
+# `cobalt-grinding/docs/north_star.md` → "The Smalt documents itself").
+_SCHEMA_MD_PLACEHOLDER = """# SCHEMA.md
+
+This is the human-readable narrative of the page types, frontmatter shape,
+and link-edge vocabulary in this Smalt. The machine-readable version lives
+in `smalt_mcp/schema.py` (the Pydantic models).
+
+This document is a **living artifact** — proposals, audits, and edits flow
+through the same `tasks/proposals/` queue as everything else.
+"""
+
+_POLICY_MD_PLACEHOLDER = """# POLICY.md
+
+This is the human-readable policy that agentic systems operate under when
+producing or modifying pages in this Smalt: when to create new pages vs.
+extend, how contradictions are handled, how confidence is assigned, and
+the falsifiability / cost-tier rules from the proposal-as-hypothesis
+discipline.
+
+Like SCHEMA.md, this document is **living** — edits flow through the
+proposal queue.
+"""
+
+_GAPS_MD_PLACEHOLDER = """# Knowledge gaps
+
+Gap signals emitted by the retrieve and converse systems land here. Each
+entry is one knowledge gap; the research system reads this queue and
+proposes sources to fill them.
+"""
 
 
 # ---- ToolDef + handler signature ----
@@ -61,6 +112,39 @@ def _ensure_initialized(app: App) -> tuple[bool, dict[str, Any] | None]:
     except FileNotFoundError:
         return False, _not_initialized()
     return True, None
+
+
+def _serialize_and_write_page(target: Path, fm_dict: dict[str, Any], body: str) -> None:
+    """Serialize `{frontmatter: ..., body: ...}` to a YAML+markdown file at `target`, atomically.
+
+    Atomic = write to a sibling `.tmp` file, then `os.replace()` onto the target.
+    Caller is responsible for holding any required write-lock (mutex).
+    """
+    post = frontmatter.Post(body)
+    post.metadata.update(fm_dict)
+    serialized = frontmatter.dumps(post)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(serialized, encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def _page_target_path(smalt_root: Path, page: Page) -> Path:
+    """Compute the canonical on-disk path for `page` inside `smalt_root`."""
+    subdir = _TYPE_TO_SUBDIR[page.type]
+    return paths.pages_dir(smalt_root) / subdir / f"{page.id}.md"
+
+
+def _run_indexer(app: App) -> dict[str, Any]:
+    """Run an incremental indexer pass. Caller must hold the corpus mutex."""
+    from smalt_mcp.storage.indexer import Indexer
+
+    result = Indexer(
+        smalt_root=app.cfg.smalt_dir,
+        embedder=app.embedder(),
+        db=app.db(),
+    ).run()
+    return result.to_dict()
 
 
 # ---- handler: status ----
@@ -341,6 +425,140 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"results": results, "count": len(results)}
 
 
+# ---- handler: bootstrap (READ_WRITE) ----
+
+
+async def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Initialize an empty Smalt at the configured `SMALT_DIR`.
+
+    Creates the canonical directory layout, drops in SCHEMA.md / POLICY.md /
+    tasks/gaps.md placeholders if they're missing, and creates the LanceDB
+    tables. Idempotent: existing directories / files / tables are left alone;
+    the response reports only what was *newly* created.
+    """
+    smalt_root = app.cfg.smalt_dir
+    smalt_root.mkdir(parents=True, exist_ok=True)
+
+    created_dirs: list[str] = []
+    for rel in paths.ALL_DIRS:
+        d = smalt_root / rel
+        if not d.exists():
+            d.mkdir(parents=True)
+            created_dirs.append(rel)
+
+    created_files: list[str] = []
+    for rel, content in (
+        ("schema/SCHEMA.md", _SCHEMA_MD_PLACEHOLDER),
+        ("schema/POLICY.md", _POLICY_MD_PLACEHOLDER),
+        ("tasks/gaps.md", _GAPS_MD_PLACEHOLDER),
+    ):
+        target = smalt_root / rel
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            created_files.append(rel)
+
+    created_tables = lance.ensure_tables(smalt_root, embedding_dim=app.cfg.embedding.dim)
+
+    return {
+        "smalt_dir": str(smalt_root),
+        "created_dirs": created_dirs,
+        "created_files": created_files,
+        "created_tables": created_tables,
+    }
+
+
+# ---- handler: write_page (READ_WRITE) ----
+
+
+async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Write one page (frontmatter + body) and trigger an incremental indexer pass.
+
+    Path is derived from the page's type + id: `pages/<subdir>/<page_id>.md`.
+    Atomic at the filesystem level (tmp-then-rename). Wrapped in the corpus
+    mutex so the write + indexer pass form a single critical section. New ids
+    create files; existing ids overwrite.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    fm = arguments.get("frontmatter")
+    if not fm:
+        return {"error": "missing_argument", "message": "frontmatter is required"}
+    body = arguments.get("body") or ""
+
+    try:
+        page = PAGE_ADAPTER.validate_python(fm)
+    except ValidationError as e:
+        return {"error": "validation_error", "message": str(e)}
+
+    target = _page_target_path(app.cfg.smalt_dir, page)
+
+    with app.mutex.acquire("write_page"):
+        _serialize_and_write_page(target, fm, body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page.id,
+        "path": str(target.relative_to(app.cfg.smalt_dir)),
+        "type": page.type.value,
+        "index_result": index_result,
+    }
+
+
+# ---- handler: write_pages (READ_WRITE) — batch ----
+
+
+async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Batch-write a list of pages with a single indexer pass at the end.
+
+    Validates every page's frontmatter before any write hits disk. If
+    validation fails on page N, no writes happen and the error reports the
+    offending index. After validation, writes proceed sequentially under the
+    corpus mutex; the indexer runs once at the end (cheap incremental pass
+    over the whole pages tree).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    items = arguments.get("pages")
+    if not items or not isinstance(items, list):
+        return {"error": "missing_argument", "message": "pages must be a non-empty list"}
+
+    # Validate every entry before we touch disk.
+    validated: list[tuple[Page, dict[str, Any], str]] = []
+    for i, entry in enumerate(items):
+        if not isinstance(entry, dict):
+            return {"error": "validation_error", "index": i, "message": "each entry must be an object"}
+        fm = entry.get("frontmatter")
+        if not fm:
+            return {"error": "validation_error", "index": i, "message": "frontmatter is required"}
+        body = entry.get("body") or ""
+        try:
+            page = PAGE_ADAPTER.validate_python(fm)
+        except ValidationError as e:
+            return {"error": "validation_error", "index": i, "message": str(e)}
+        validated.append((page, fm, body))
+
+    written: list[dict[str, str]] = []
+    with app.mutex.acquire("write_pages"):
+        for page, fm, body in validated:
+            target = _page_target_path(app.cfg.smalt_dir, page)
+            _serialize_and_write_page(target, fm, body)
+            written.append(
+                {
+                    "id": page.id,
+                    "path": str(target.relative_to(app.cfg.smalt_dir)),
+                    "type": page.type.value,
+                }
+            )
+        index_result = _run_indexer(app)
+
+    return {"written": written, "count": len(written), "index_result": index_result}
+
+
 # ---- registry ----
 
 
@@ -480,6 +698,97 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=search,
+    ),
+    # ---- READ_WRITE ----
+    ToolDef(
+        spec=types.Tool(
+            name="bootstrap",
+            description=(
+                "Initialize an empty Smalt at the configured SMALT_DIR. "
+                "Creates the canonical directory layout, drops in SCHEMA.md / "
+                "POLICY.md / tasks/gaps.md placeholders, and creates the "
+                "LanceDB tables. Idempotent — running it on an existing "
+                "Smalt is a no-op; the response reports only what was newly "
+                "created."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=bootstrap,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="write_page",
+            description=(
+                "Create or update one page. The frontmatter must conform to "
+                "the Page Pydantic union (entity / concept / source / "
+                "synthesis discriminated by the `type` field). The file is "
+                "written atomically (tmp-then-rename) at "
+                "`pages/<subdir>/<page_id>.md`, where <subdir> derives from "
+                "the page's type. After the write, an incremental indexer "
+                "pass refreshes the LanceDB tables; the response includes "
+                "the indexer's summary. Both write and index run inside the "
+                "corpus single-writer mutex."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "frontmatter": {
+                        "type": "object",
+                        "description": (
+                            "Full page frontmatter. Required keys: id, type, "
+                            "title. Other keys per the page-type schema "
+                            "(see smalt_mcp/schema.py)."
+                        ),
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Page body (everything after the frontmatter block).",
+                        "default": "",
+                    },
+                },
+                "required": ["frontmatter"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=write_page,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="write_pages",
+            description=(
+                "Batch-write a list of pages with a single indexer pass at "
+                "the end. Every page's frontmatter is validated up front; "
+                "if validation fails on entry N, no writes happen and the "
+                "error reports the offending index. After validation, "
+                "writes proceed sequentially under the corpus mutex; the "
+                "indexer runs once at the end (cheap incremental pass)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pages": {
+                        "type": "array",
+                        "description": "List of `{frontmatter, body?}` entries.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "frontmatter": {"type": "object"},
+                                "body": {"type": "string"},
+                            },
+                            "required": ["frontmatter"],
+                        },
+                    },
+                },
+                "required": ["pages"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=write_pages,
     ),
 ]
 
