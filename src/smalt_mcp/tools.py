@@ -25,7 +25,7 @@ from mcp import types
 from pydantic import TypeAdapter, ValidationError
 
 from smalt_mcp.permissions import Scope
-from smalt_mcp.schema import Page, PageType
+from smalt_mcp.schema import Page, PageType, ProposalKind, ProposalPage
 from smalt_mcp.storage import lance, paths
 
 if TYPE_CHECKING:
@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 PAGE_ADAPTER: TypeAdapter[Page] = TypeAdapter(Page)
+PROPOSAL_ADAPTER: TypeAdapter[ProposalPage] = TypeAdapter(ProposalPage)
+
+
+# Proposal kinds that go to `tasks/proposals/schema/` regardless of who proposed them.
+_SCHEMA_PROPOSAL_KINDS: frozenset[ProposalKind] = frozenset(
+    {
+        ProposalKind.SCHEMA_ADDITION,
+        ProposalKind.SCHEMA_DRIFT,
+        ProposalKind.SCHEMA_REMOVAL,
+    }
+)
 
 
 # Map a page's type to the subdirectory under `smalt/pages/` where its file lives.
@@ -425,6 +436,128 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"results": results, "count": len(results)}
 
 
+# ---- handler: list_domains (READ_ONLY) ----
+
+
+async def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List ConceptPages flagged `is_domain: true`.
+
+    Domain hierarchy itself (which domain is a subdomain of which) lives in
+    each domain's `subdomain_of` labeled links in `links_out`, NOT in this
+    response. Use `traverse(from_id=<domain>, label='subdomain_of')` to walk
+    the hierarchy.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"type = {lance.sql_str(PageType.CONCEPT.value)}")
+        .select(["id", "title", "path", "frontmatter_json"])
+        .limit(10_000)
+        .to_arrow()
+    )
+    domains: list[dict[str, Any]] = []
+    for i in range(arrow.num_rows):
+        fm_raw = arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            continue
+        if fm.get("is_domain") is not True:
+            continue
+        domains.append(
+            {
+                "id": arrow.column("id")[i].as_py(),
+                "title": arrow.column("title")[i].as_py(),
+                "path": arrow.column("path")[i].as_py(),
+            }
+        )
+    domains.sort(key=lambda d: d["id"])
+    return {"domains": domains, "count": len(domains)}
+
+
+# ---- handler: list_proposals (READ_ONLY) ----
+
+
+async def list_proposals(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List ProposalPages in `tasks/proposals/`, optionally filtered.
+
+    Proposals are NOT indexed in LanceDB — they live in the filesystem under
+    `tasks/proposals/<system or schema>/<id>.md`. This handler walks that
+    tree, parses frontmatter, applies the filters, and returns minimal
+    metadata per match.
+    """
+    if not app.smalt_exists():
+        return _not_initialized()
+
+    system = arguments.get("system")  # subdir match: cogitate / curate / research / schema / etc.
+    status = arguments.get("status")  # proposal lifecycle state
+    kind = arguments.get("kind")      # proposal_kind
+
+    proposals_root = paths.proposals_dir(app.cfg.smalt_dir)
+    if not proposals_root.exists():
+        return {"proposals": [], "count": 0}
+
+    import frontmatter as _fm  # local alias; module-level `frontmatter` is the python-frontmatter import
+
+    out: list[dict[str, Any]] = []
+    for f in sorted(proposals_root.rglob("*.md")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(proposals_root)
+        # System filter: subdir name
+        if system and (len(rel.parts) < 2 or rel.parts[0] != system):
+            continue
+        try:
+            post = _fm.load(str(f))
+        except Exception:  # noqa: BLE001 — skip unparseable
+            continue
+
+        # Resolve schema defaults at read time: if validation succeeds, use the
+        # validated model's effective values (status, test_status, test_cost
+        # etc. get their defaults). If a proposal is malformed, fall back to
+        # raw frontmatter so we don't silently drop it from listings.
+        md = post.metadata
+        try:
+            proposal = PROPOSAL_ADAPTER.validate_python(md)
+            eff_kind = proposal.proposal_kind.value
+            eff_status = proposal.status.value
+            eff_proposed_by = proposal.proposed_by
+            eff_id = proposal.id
+            eff_title = proposal.title
+            eff_proposed_at = proposal.proposed_at.isoformat()
+        except ValidationError:
+            eff_kind = md.get("proposal_kind")
+            eff_status = md.get("status")
+            eff_proposed_by = md.get("proposed_by")
+            eff_id = md.get("id")
+            eff_title = md.get("title")
+            eff_proposed_at = md.get("proposed_at")
+
+        if status and eff_status != status:
+            continue
+        if kind and eff_kind != kind:
+            continue
+
+        out.append(
+            {
+                "id": eff_id,
+                "title": eff_title,
+                "proposal_kind": eff_kind,
+                "status": eff_status,
+                "proposed_by": eff_proposed_by,
+                "proposed_at": eff_proposed_at,
+                "path": str(f.relative_to(app.cfg.smalt_dir)),
+                "subdir": rel.parts[0] if len(rel.parts) >= 2 else "",
+            }
+        )
+    return {"proposals": out, "count": len(out)}
+
+
 # ---- handler: bootstrap (READ_WRITE) ----
 
 
@@ -557,6 +690,60 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         index_result = _run_indexer(app)
 
     return {"written": written, "count": len(written), "index_result": index_result}
+
+
+# ---- handler: write_proposal (READ_WRITE) ----
+
+
+def _proposal_target_path(smalt_root: Path, proposal: ProposalPage) -> Path:
+    """Route a proposal to its on-disk path.
+
+    Schema-related kinds go to `tasks/proposals/schema/`; everything else
+    goes to `tasks/proposals/<proposed_by>/`. Per `cobalt-grinding/docs/
+    plan.md` → "Proposal document shape and lifecycle".
+    """
+    if proposal.proposal_kind in _SCHEMA_PROPOSAL_KINDS:
+        subdir = "schema"
+    else:
+        subdir = proposal.proposed_by
+    return paths.proposals_dir(smalt_root) / subdir / f"{proposal.id}.md"
+
+
+async def write_proposal(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Write a ProposalPage to `tasks/proposals/<subdir>/<id>.md`.
+
+    Subdir = `schema` for schema_addition / schema_drift / schema_removal
+    kinds; otherwise = `proposed_by`. Atomic at the filesystem level
+    (tmp-then-rename). Proposals are NOT projected into LanceDB — they're
+    queryable via `list_proposals`.
+    """
+    if not app.smalt_exists():
+        return _not_initialized()
+
+    fm = arguments.get("frontmatter")
+    if not fm:
+        return {"error": "missing_argument", "message": "frontmatter is required"}
+    body = arguments.get("body") or ""
+
+    try:
+        proposal = PROPOSAL_ADAPTER.validate_python(fm)
+    except ValidationError as e:
+        return {"error": "validation_error", "message": str(e)}
+
+    target = _proposal_target_path(app.cfg.smalt_dir, proposal)
+
+    # Proposals don't go through the corpus mutex — they're outside the
+    # indexed pages/ tree. Atomic write is still required so a reader never
+    # sees a half-written file.
+    _serialize_and_write_page(target, fm, body)
+
+    return {
+        "id": proposal.id,
+        "path": str(target.relative_to(app.cfg.smalt_dir)),
+        "subdir": target.parent.name,
+        "proposal_kind": proposal.proposal_kind.value,
+        "status": proposal.status.value,
+    }
 
 
 # ---- registry ----
@@ -699,6 +886,65 @@ TOOLS: list[ToolDef] = [
         scope=Scope.READ_ONLY,
         handler=search,
     ),
+    ToolDef(
+        spec=types.Tool(
+            name="list_domains",
+            description=(
+                "List ConceptPages flagged `is_domain: true` — the Smalt's "
+                "first-class domains. Domain hierarchy itself (which domain "
+                "is a subdomain of which) is not in this response; use "
+                "`traverse(from_id=<domain>, label='subdomain_of')` to walk "
+                "the hierarchy."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=list_domains,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="list_proposals",
+            description=(
+                "List ProposalPages in `tasks/proposals/`, optionally "
+                "filtered by `system` (subdir name — cogitate / curate / "
+                "research / schema / toolsmith / converse), `status` "
+                "(proposed / under_test / validated / rejected / applied / "
+                "superseded), and/or `kind` (proposal_kind value)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "system": {
+                        "type": "string",
+                        "description": "Filter by subdir / proposing system.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by lifecycle state.",
+                        "enum": [
+                            "proposed",
+                            "under_test",
+                            "validated",
+                            "rejected",
+                            "applied",
+                            "superseded",
+                        ],
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Filter by proposal_kind (e.g. schema_addition, source_adoption).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=list_proposals,
+    ),
     # ---- READ_WRITE ----
     ToolDef(
         spec=types.Tool(
@@ -789,6 +1035,47 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=write_pages,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="write_proposal",
+            description=(
+                "Write a ProposalPage to `tasks/proposals/<subdir>/<id>.md`. "
+                "Subdir = `schema` for the schema-related proposal kinds "
+                "(schema_addition / schema_drift / schema_removal); otherwise "
+                "= `proposed_by` (cogitate / curate / research / toolsmith / "
+                "converse). Atomic at the filesystem level. Proposals are NOT "
+                "projected into LanceDB — they're queryable via "
+                "`list_proposals`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "frontmatter": {
+                        "type": "object",
+                        "description": (
+                            "ProposalPage frontmatter. Required keys: id, "
+                            "type='proposal', title, proposal_kind, "
+                            "proposed_by, proposed_at. Optional: status, "
+                            "test_status, test_cost, related_pages, "
+                            "supersedes, superseded_by."
+                        ),
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": (
+                            "Markdown body with the standard "
+                            "Observation/Hypothesis/Prediction/Test/Reasoning "
+                            "sections."
+                        ),
+                        "default": "",
+                    },
+                },
+                "required": ["frontmatter"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=write_proposal,
     ),
 ]
 

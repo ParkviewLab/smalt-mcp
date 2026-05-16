@@ -140,18 +140,22 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     body, _ = _mcp(mcp_client, "tools/list", {}, req_id=2, session_id=sid)
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
-    # Server defaults to read_write scope; every tool (5 read-only + 3
-    # read-write) should be listed. If scope is tightened later via
-    # SMALT_SCOPE=read_only, the read-write set drops out.
+    # Server defaults to read_write scope; every tool (7 read-only + 4
+    # read-write) should be listed.
     assert names == {
+        # READ_ONLY
         "status",
         "list_pages",
         "read_page",
         "traverse",
         "search",
+        "list_domains",
+        "list_proposals",
+        # READ_WRITE
         "bootstrap",
         "write_page",
         "write_pages",
+        "write_proposal",
     }
 
 
@@ -159,10 +163,11 @@ def test_status_tool(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "status", {}, req_id=10)
     # smalt_dir was set by conftest.py before the server imported config; the
-    # seed-Smalt fixture also created the LanceDB tables and indexed 5 pages.
+    # seed-Smalt fixture also created the LanceDB tables and indexed 6 pages.
     assert result["exists"] is True
     assert set(result["tables"]) >= {"pages", "embeddings", "links", "claims", "sources"}
-    assert result["page_count"] == 5
+    # Lower bound — write_page / write_pages tests add more during the session.
+    assert result["page_count"] >= 6
     assert result["embedding"]["provider"] == "fake"
     assert result["embedding"]["dim"] == 384
 
@@ -180,16 +185,17 @@ def test_unknown_tool_returns_structured_error(mcp_client: TestClient):
 def test_list_pages_all(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "list_pages", {}, req_id=20)
-    assert result["count"] == 5
+    # Seed includes 6 pages; write_page tests can add more — assert seed subset.
     ids = {p["id"] for p in result["pages"]}
-    assert ids == {"ent-alice", "ent-bob", "con-embedding", "con-index", "src-doc1"}
+    assert {"ent-alice", "ent-bob", "con-cs", "con-embedding", "con-index", "src-doc1"} <= ids
 
 
 def test_list_pages_filter_by_type(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "list_pages", {"type": "entity"}, req_id=21)
     ids = {p["id"] for p in result["pages"]}
-    assert ids == {"ent-alice", "ent-bob"}
+    # ent-alice + ent-bob from seed; write_page tests may add more entities.
+    assert {"ent-alice", "ent-bob"} <= ids
     assert all(p["type"] == "entity" for p in result["pages"])
 
 
@@ -197,7 +203,7 @@ def test_list_pages_filter_by_prefix(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "list_pages", {"prefix": "con-"}, req_id=22)
     ids = {p["id"] for p in result["pages"]}
-    assert ids == {"con-embedding", "con-index"}
+    assert ids == {"con-cs", "con-embedding", "con-index"}
 
 
 # ---------------------------------------------------------------------------
@@ -457,3 +463,197 @@ def test_write_pages_validation_aborts_batch(mcp_client: TestClient):
         mcp_client, sid, "read_page", {"page_id": "ent-test-abort-ok"}, req_id=83
     )
     assert r.get("error") == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# list_domains
+
+
+def test_list_domains_finds_seed_domain(mcp_client: TestClient):
+    """The seed Smalt's con-cs concept is flagged is_domain: true."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "list_domains", {}, req_id=90)
+    ids = {d["id"] for d in result["domains"]}
+    assert "con-cs" in ids
+    for d in result["domains"]:
+        assert {"id", "title", "path"} <= d.keys()
+
+
+def test_list_domains_ignores_non_domain_concepts(mcp_client: TestClient):
+    """con-embedding has glossary: true but is_domain: false — must NOT appear."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(mcp_client, sid, "list_domains", {}, req_id=91)
+    ids = {d["id"] for d in result["domains"]}
+    assert "con-embedding" not in ids
+    assert "con-index" not in ids
+
+
+# ---------------------------------------------------------------------------
+# write_proposal + list_proposals
+
+
+def _proposal_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
+
+
+def test_write_proposal_routes_schema_kind_to_schema_subdir(mcp_client: TestClient):
+    """schema_addition proposals land in tasks/proposals/schema/, regardless of proposed_by."""
+    sid = _initialize(mcp_client)
+    fm = {
+        "id": "prop-test-schema-1",
+        "type": "proposal",
+        "title": "Add foo field to ConceptPage",
+        "proposal_kind": "schema_addition",
+        "proposed_by": "cogitate",
+        "proposed_at": _proposal_now(),
+    }
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_proposal",
+        {"frontmatter": fm, "body": "## Observation\n\nfoo"},
+        req_id=100,
+    )
+    assert result["id"] == "prop-test-schema-1"
+    assert result["subdir"] == "schema"
+    assert result["path"] == "tasks/proposals/schema/prop-test-schema-1.md"
+    assert result["proposal_kind"] == "schema_addition"
+    assert result["status"] == "proposed"
+
+
+def test_write_proposal_routes_other_kind_to_proposer_subdir(mcp_client: TestClient):
+    """Non-schema kinds land in tasks/proposals/<proposed_by>/."""
+    sid = _initialize(mcp_client)
+    fm = {
+        "id": "prop-test-research-1",
+        "type": "proposal",
+        "title": "Ingest the foo paper",
+        "proposal_kind": "source_adoption",
+        "proposed_by": "research",
+        "proposed_at": _proposal_now(),
+    }
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_proposal",
+        {"frontmatter": fm},
+        req_id=101,
+    )
+    assert result["subdir"] == "research"
+    assert result["path"] == "tasks/proposals/research/prop-test-research-1.md"
+
+
+def test_write_proposal_validation_error(mcp_client: TestClient):
+    """Missing required field → structured validation_error."""
+    sid = _initialize(mcp_client)
+    fm = {
+        "id": "prop-test-bad",
+        "type": "proposal",
+        "title": "Bad",
+        # missing proposal_kind, proposed_by, proposed_at
+    }
+    result = _call_tool(
+        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=102
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_list_proposals_includes_written(mcp_client: TestClient):
+    """After write_proposal, list_proposals should surface the new entry."""
+    sid = _initialize(mcp_client)
+    # Write a fresh proposal so we can find it by id below
+    proposal_id = "prop-test-list-1"
+    fm = {
+        "id": proposal_id,
+        "type": "proposal",
+        "title": "Listable proposal",
+        "proposal_kind": "wiki_edge",
+        "proposed_by": "cogitate",
+        "proposed_at": _proposal_now(),
+    }
+    _call_tool(mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=110)
+
+    result = _call_tool(mcp_client, sid, "list_proposals", {}, req_id=111)
+    by_id = {p["id"]: p for p in result["proposals"]}
+    assert proposal_id in by_id
+    entry = by_id[proposal_id]
+    assert entry["proposal_kind"] == "wiki_edge"
+    assert entry["proposed_by"] == "cogitate"
+    assert entry["subdir"] == "cogitate"
+    assert entry["status"] == "proposed"
+    assert entry["path"].endswith(f"cogitate/{proposal_id}.md")
+
+
+def test_list_proposals_filter_by_system(mcp_client: TestClient):
+    """system filter narrows to one subdir."""
+    sid = _initialize(mcp_client)
+    # Ensure at least one schema and one research proposal exist
+    for fm, body in [
+        (
+            {
+                "id": "prop-test-filter-schema",
+                "type": "proposal",
+                "title": "Schema add",
+                "proposal_kind": "schema_addition",
+                "proposed_by": "cogitate",
+                "proposed_at": _proposal_now(),
+            },
+            "",
+        ),
+        (
+            {
+                "id": "prop-test-filter-research",
+                "type": "proposal",
+                "title": "Source adopt",
+                "proposal_kind": "source_adoption",
+                "proposed_by": "research",
+                "proposed_at": _proposal_now(),
+            },
+            "",
+        ),
+    ]:
+        _call_tool(
+            mcp_client, sid, "write_proposal", {"frontmatter": fm, "body": body}, req_id=120
+        )
+
+    res_schema = _call_tool(
+        mcp_client, sid, "list_proposals", {"system": "schema"}, req_id=121
+    )
+    schema_ids = {p["id"] for p in res_schema["proposals"]}
+    assert "prop-test-filter-schema" in schema_ids
+    assert "prop-test-filter-research" not in schema_ids
+    assert all(p["subdir"] == "schema" for p in res_schema["proposals"])
+
+    res_research = _call_tool(
+        mcp_client, sid, "list_proposals", {"system": "research"}, req_id=122
+    )
+    research_ids = {p["id"] for p in res_research["proposals"]}
+    assert "prop-test-filter-research" in research_ids
+    assert "prop-test-filter-schema" not in research_ids
+
+
+def test_list_proposals_filter_by_kind(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_proposals", {"kind": "source_adoption"}, req_id=130
+    )
+    assert all(p["proposal_kind"] == "source_adoption" for p in result["proposals"])
+    # At least the research filter test wrote one of these.
+    assert result["count"] >= 1
+
+
+def test_list_proposals_filter_by_status(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    # Every test proposal has default status="proposed"
+    result = _call_tool(
+        mcp_client, sid, "list_proposals", {"status": "proposed"}, req_id=131
+    )
+    assert all(p["status"] == "proposed" for p in result["proposals"])
+    assert result["count"] >= 1
+    # No "applied" proposals exist in this test session
+    none_applied = _call_tool(
+        mcp_client, sid, "list_proposals", {"status": "applied"}, req_id=132
+    )
+    assert none_applied["count"] == 0

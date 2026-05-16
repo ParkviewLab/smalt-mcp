@@ -34,6 +34,7 @@ title: Alice
 aliases: [Alicia]
 tags: [person]
 entity_kind: person
+domains: [con-cs]
 ---
 Alice is a fictional person used in the seed Smalt for testing.
 """,
@@ -46,15 +47,29 @@ entity_kind: person
 ---
 Bob is another fictional person in the seed Smalt.
 """,
+    "pages/concepts/cs.md": """---
+id: con-cs
+type: concept
+title: Computer Science
+tags: [domain]
+is_domain: true
+---
+Computer Science — a seed domain ConceptPage for testing list_domains.
+""",
     "pages/concepts/embedding.md": """---
 id: con-embedding
 type: concept
 title: Embedding
 tags: [ml]
 parents: []
+domains: [con-cs]
+glossary: true
 links_out:
   - target: ent-alice
     label: example_of
+evidence:
+  - source_id: src-doc1
+    snippet: "embedding research"
 ---
 An embedding is a dense vector representation of structured data.
 Alice frequently appears in embedding research.
@@ -65,6 +80,8 @@ type: concept
 title: Index
 tags: [database, search]
 parents: []
+domains: [con-cs]
+glossary: true
 links_out:
   - target: con-embedding
     label: built_over
@@ -79,6 +96,7 @@ title: Seed Doc 1
 tags: [seed]
 location_uri: file:/tmp/seed/doc1.md
 location_kind: file
+domains: [con-cs]
 ---
 This is a seed source page. It mentions Alice and embedding by name so
 that search has something to match against.
