@@ -13,11 +13,60 @@ of these rules; this module is the machine-facing one.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# ---- id validation ----
+#
+# Page ids and proposal ids become path components on disk
+# (`pages/<subdir>/<id>.md`, `tasks/proposals/<subdir>/<id>.md`). The same is
+# true for `ProposalPage.proposed_by` (the subdir). Reject anything that:
+#
+#   - would escape its target directory (`..`, `/`, `\`, leading `.`)
+#   - is non-portable across Windows/macOS/Linux (`<>:"|?*`, whitespace,
+#     control chars, leading dash/underscore, Windows-reserved filenames
+#     like CON / NUL / COM1)
+#   - is empty or longer than ~250 chars (most filesystems cap filenames
+#     at 255 bytes; we leave headroom for the `.md` extension)
+#
+# The regex below enforces the structural rule; the reserved-name check
+# catches the names that fit the regex but break on Windows.
+#
+# **Section ids** (the planned `<source-id>::<rel-path>` shape from M3
+# ingest) are intentionally NOT permitted by this rule yet — they require
+# a different validator that allows `::` and `/`. When section pages land
+# the validator gets a second mode; for now everything must conform to
+# this stricter slug-shape.
+
+_PAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,253}$")
+
+_WINDOWS_RESERVED: frozenset[str] = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _validate_id(value: str) -> str:
+    """Validate a string that will become a path component (filename or subdir).
+
+    Returns the value unchanged on success; raises ValueError with a clear
+    message on failure (Pydantic surfaces this as the validation error).
+    """
+    if not _PAGE_ID_RE.match(value):
+        raise ValueError(
+            f"id must match {_PAGE_ID_RE.pattern!r}: alphanumeric start, "
+            f"alphanumeric / underscore / hyphen body, 1..254 chars; got {value!r}"
+        )
+    if value.lower() in _WINDOWS_RESERVED:
+        raise ValueError(
+            f"id {value!r} is a Windows-reserved filename; pick a different slug"
+        )
+    return value
 
 # ---- enums ----
 
@@ -171,6 +220,13 @@ class PageBase(BaseModel):
     id: str = Field(description="stable Smalt-internal id; usually a slug")
     type: PageType
     title: str
+
+    # Path-traversal + portability guard. Applied to every page type via
+    # inheritance. See `_validate_id` for the rule.
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, v: str) -> str:
+        return _validate_id(v)
     aliases: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
@@ -406,3 +462,11 @@ class ProposalPage(BaseModel):
         default=None,
         description="proposal id that supersedes this one (set when a later proposal lands)",
     )
+
+    # Both `id` and `proposed_by` become path components for the routing
+    # in `tools._proposal_target_path` (`tasks/proposals/<proposed_by>/<id>.md`).
+    # Apply the same path-traversal + portability guard as PageBase.id.
+    @field_validator("id", "proposed_by")
+    @classmethod
+    def _check_path_components(cls, v: str) -> str:
+        return _validate_id(v)

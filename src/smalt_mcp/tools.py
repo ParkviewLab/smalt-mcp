@@ -602,6 +602,54 @@ async def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- write mode + existence helpers ----
+
+
+_VALID_WRITE_MODES: frozenset[str] = frozenset({"create", "update", "upsert"})
+
+
+def _existing_page_path(app: App, page_id: str) -> str | None:
+    """Return the indexed relative path of a page, or None if not present.
+
+    Uses the LanceDB pages table. Caller must hold the corpus mutex if it
+    intends to use the result to decide a write (otherwise a concurrent
+    write could change reality before the decision lands).
+    """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"id = {lance.sql_str(page_id)}")
+        .select(["path"])
+        .limit(1)
+        .to_arrow()
+    )
+    if arrow.num_rows == 0:
+        return None
+    return arrow.column("path")[0].as_py()
+
+
+def _check_mode_against_existence(
+    mode: str, page_id: str, existing_path: str | None
+) -> dict[str, Any] | None:
+    """Compare requested write mode against current existence; return an error
+    payload if the mode contract is violated, else None."""
+    if mode == "create" and existing_path is not None:
+        return {
+            "error": "already_exists",
+            "id": page_id,
+            "existing_path": existing_path,
+            "message": f"page {page_id!r} already exists; use mode='update' or mode='upsert' to overwrite",
+        }
+    if mode == "update" and existing_path is None:
+        return {
+            "error": "not_found",
+            "id": page_id,
+            "message": f"page {page_id!r} does not exist; use mode='create' or mode='upsert' to insert",
+        }
+    return None
+
+
 # ---- handler: write_page (READ_WRITE) ----
 
 
@@ -610,8 +658,16 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
     Path is derived from the page's type + id: `pages/<subdir>/<page_id>.md`.
     Atomic at the filesystem level (tmp-then-rename). Wrapped in the corpus
-    mutex so the write + indexer pass form a single critical section. New ids
-    create files; existing ids overwrite.
+    mutex so the existence check + write + indexer pass form a single critical
+    section.
+
+    The `mode` arg controls whether the write is restricted:
+      - "create" (strict insert): fail if the id already exists
+      - "update" (strict update): fail if the id does NOT exist
+      - "upsert" (default; backward compatible): always proceed
+
+    Response includes `created: bool` so callers know which happened regardless
+    of mode.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -621,6 +677,12 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     if not fm:
         return {"error": "missing_argument", "message": "frontmatter is required"}
     body = arguments.get("body") or ""
+    mode = arguments.get("mode") or "upsert"
+    if mode not in _VALID_WRITE_MODES:
+        return {
+            "error": "invalid_argument",
+            "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
+        }
 
     try:
         page = PAGE_ADAPTER.validate_python(fm)
@@ -630,6 +692,11 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     target = _page_target_path(app.cfg.smalt_dir, page)
 
     with app.mutex.acquire("write_page"):
+        existing_path = _existing_page_path(app, page.id)
+        mode_err = _check_mode_against_existence(mode, page.id, existing_path)
+        if mode_err is not None:
+            return mode_err
+        created = existing_path is None
         _serialize_and_write_page(target, fm, body)
         index_result = _run_indexer(app)
 
@@ -637,6 +704,8 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         "id": page.id,
         "path": str(target.relative_to(app.cfg.smalt_dir)),
         "type": page.type.value,
+        "mode": mode,
+        "created": created,
         "index_result": index_result,
     }
 
@@ -647,11 +716,14 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Batch-write a list of pages with a single indexer pass at the end.
 
-    Validates every page's frontmatter before any write hits disk. If
-    validation fails on page N, no writes happen and the error reports the
-    offending index. After validation, writes proceed sequentially under the
-    corpus mutex; the indexer runs once at the end (cheap incremental pass
-    over the whole pages tree).
+    Validate-all-then-write contract:
+      1. Every page's frontmatter is validated against the Page Pydantic union.
+      2. If a `mode` is set ("create" or "update"), every entry's id is checked
+         against the existence table BEFORE any writes happen.
+      3. If any check fails, no writes occur; the response reports the
+         offending index.
+
+    The `mode` arg applies to every entry uniformly; default is "upsert".
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -660,8 +732,14 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     items = arguments.get("pages")
     if not items or not isinstance(items, list):
         return {"error": "missing_argument", "message": "pages must be a non-empty list"}
+    mode = arguments.get("mode") or "upsert"
+    if mode not in _VALID_WRITE_MODES:
+        return {
+            "error": "invalid_argument",
+            "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
+        }
 
-    # Validate every entry before we touch disk.
+    # Phase 1 (no disk touch): validate every entry's frontmatter.
     validated: list[tuple[Page, dict[str, Any], str]] = []
     for i, entry in enumerate(items):
         if not isinstance(entry, dict):
@@ -676,9 +754,21 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             return {"error": "validation_error", "index": i, "message": str(e)}
         validated.append((page, fm, body))
 
-    written: list[dict[str, str]] = []
+    written: list[dict[str, Any]] = []
     with app.mutex.acquire("write_pages"):
-        for page, fm, body in validated:
+        # Phase 2 (still no disk touch): mode-vs-existence checks, all-or-nothing.
+        existences: list[str | None] = []
+        for i, (page, _fm, _body) in enumerate(validated):
+            existing_path = _existing_page_path(app, page.id)
+            mode_err = _check_mode_against_existence(mode, page.id, existing_path)
+            if mode_err is not None:
+                # Annotate with which entry failed; abort the whole batch.
+                mode_err["index"] = i
+                return mode_err
+            existences.append(existing_path)
+
+        # Phase 3: commit. All checks passed; write every page.
+        for (page, fm, body), existing_path in zip(validated, existences, strict=True):
             target = _page_target_path(app.cfg.smalt_dir, page)
             _serialize_and_write_page(target, fm, body)
             written.append(
@@ -686,11 +776,17 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                     "id": page.id,
                     "path": str(target.relative_to(app.cfg.smalt_dir)),
                     "type": page.type.value,
+                    "created": existing_path is None,
                 }
             )
         index_result = _run_indexer(app)
 
-    return {"written": written, "count": len(written), "index_result": index_result}
+    return {
+        "written": written,
+        "count": len(written),
+        "mode": mode,
+        "index_result": index_result,
+    }
 
 
 # ---- handler: write_proposal (READ_WRITE) ----
@@ -1127,7 +1223,15 @@ TOOLS: list[ToolDef] = [
                 "the page's type. After the write, an incremental indexer "
                 "pass refreshes the LanceDB tables; the response includes "
                 "the indexer's summary. Both write and index run inside the "
-                "corpus single-writer mutex."
+                "corpus single-writer mutex.\n\n"
+                "The `mode` arg restricts what writes are allowed:\n"
+                "  - `create` (strict insert): fail with `{error: 'already_exists'}` "
+                "if the id is already indexed.\n"
+                "  - `update` (strict update): fail with `{error: 'not_found'}` "
+                "if the id is not already indexed.\n"
+                "  - `upsert` (default): always proceed; existing id overwrites.\n\n"
+                "The response includes `created: bool` so callers know which "
+                "happened regardless of mode."
             ),
             inputSchema={
                 "type": "object",
@@ -1137,13 +1241,27 @@ TOOLS: list[ToolDef] = [
                         "description": (
                             "Full page frontmatter. Required keys: id, type, "
                             "title. Other keys per the page-type schema "
-                            "(see smalt_mcp/schema.py)."
+                            "(see smalt_mcp/schema.py). Note: the id is "
+                            "validated for path-safety + portability "
+                            "(alphanumeric + underscore + hyphen, no leading "
+                            "dash/underscore, 1..254 chars, not a Windows-"
+                            "reserved name)."
                         ),
                     },
                     "body": {
                         "type": "string",
                         "description": "Page body (everything after the frontmatter block).",
                         "default": "",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "Write mode. `create` = strict insert (fail if id "
+                            "exists); `update` = strict update (fail if id "
+                            "doesn't exist); `upsert` = either."
+                        ),
+                        "enum": ["create", "update", "upsert"],
+                        "default": "upsert",
                     },
                 },
                 "required": ["frontmatter"],
@@ -1157,11 +1275,14 @@ TOOLS: list[ToolDef] = [
             name="write_pages",
             description=(
                 "Batch-write a list of pages with a single indexer pass at "
-                "the end. Every page's frontmatter is validated up front; "
-                "if validation fails on entry N, no writes happen and the "
-                "error reports the offending index. After validation, "
-                "writes proceed sequentially under the corpus mutex; the "
-                "indexer runs once at the end (cheap incremental pass)."
+                "the end. Validate-all-then-write contract:\n"
+                "  1. Every page's frontmatter is validated up front.\n"
+                "  2. If `mode` is `create` or `update`, every entry's id is "
+                "checked against the index BEFORE any writes happen.\n"
+                "  3. If any validation or mode check fails, no writes occur; "
+                "the response reports the offending index.\n\n"
+                "After all checks pass, writes proceed sequentially under the "
+                "corpus mutex; the indexer runs once at the end."
             ),
             inputSchema={
                 "type": "object",
@@ -1177,6 +1298,16 @@ TOOLS: list[ToolDef] = [
                             },
                             "required": ["frontmatter"],
                         },
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "Write mode applied uniformly to every entry. "
+                            "`create` = all must be new; `update` = all must "
+                            "already exist; `upsert` = either."
+                        ),
+                        "enum": ["create", "update", "upsert"],
+                        "default": "upsert",
                     },
                 },
                 "required": ["pages"],
