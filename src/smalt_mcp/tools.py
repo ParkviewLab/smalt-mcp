@@ -25,8 +25,9 @@ from mcp import types
 from pydantic import TypeAdapter, ValidationError
 
 from smalt_mcp.permissions import Scope
-from smalt_mcp.schema import Page, PageType, ProposalKind, ProposalPage
+from smalt_mcp.schema import Claim, Page, PageType, ProposalKind, ProposalPage
 from smalt_mcp.storage import lance, paths
+from smalt_mcp.storage.markdown import parse_page
 
 if TYPE_CHECKING:
     from smalt_mcp.app import App
@@ -746,6 +747,154 @@ async def write_proposal(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- handler: add_link (READ_WRITE) ----
+
+
+def _locate_page_file(app: App, page_id: str) -> Path | None:
+    """Return the on-disk path of a page by id, via the LanceDB pages table.
+
+    Returns None if the id isn't indexed. Caller must hold the corpus mutex
+    if it intends to mutate the file (the mutex serializes index reads with
+    concurrent writes; the LanceDB snapshot we read here may otherwise be
+    stale w.r.t. another in-flight write).
+    """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"id = {lance.sql_str(page_id)}")
+        .select(["path"])
+        .limit(1)
+        .to_arrow()
+    )
+    if arrow.num_rows == 0:
+        return None
+    rel = arrow.column("path")[0].as_py()
+    return app.cfg.smalt_dir / rel
+
+
+async def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Append an outgoing link to a page's `links_out` (read-modify-write).
+
+    Locates the page by id, reads its current frontmatter from disk (not
+    LanceDB — we want the latest), appends `{target, label?, via_source?}` to
+    `links_out`, writes back atomically, and runs an incremental indexer
+    pass. Skips duplicates: a link with the same `target` AND `label`
+    already in the list is a no-op and `added: false, reason: duplicate`.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    from_id = arguments.get("from_id")
+    to_id = arguments.get("to_id")
+    if not from_id:
+        return {"error": "missing_argument", "message": "from_id is required"}
+    if not to_id:
+        return {"error": "missing_argument", "message": "to_id is required"}
+    label = arguments.get("label")
+    via_source = arguments.get("via_source")
+
+    with app.mutex.acquire("add_link"):
+        page_path = _locate_page_file(app, from_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": from_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+
+        new_link: dict[str, Any] = {"target": to_id}
+        if label is not None:
+            new_link["label"] = label
+        if via_source is not None:
+            new_link["via_source"] = via_source
+
+        existing_links: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("links_out") or [])
+        for existing in existing_links:
+            if existing.get("target") == to_id and existing.get("label") == label:
+                return {
+                    "id": from_id,
+                    "added": False,
+                    "reason": "duplicate",
+                    "link": new_link,
+                }
+
+        new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
+        new_fm["links_out"] = existing_links + [new_link]
+
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": from_id,
+        "added": True,
+        "link": new_link,
+        "links_out_count": len(new_fm["links_out"]),
+        "index_result": index_result,
+    }
+
+
+# ---- handler: add_claim (READ_WRITE) ----
+
+
+async def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Append a Claim to a page's `claims` list (read-modify-write).
+
+    Locates the page by id, validates the claim against the `Claim` Pydantic
+    model, then reads the page's current frontmatter from disk, appends the
+    raw claim dict to `claims`, writes back atomically, and runs the
+    indexer. Skips duplicates: a claim with an id already present in the
+    list is a no-op and `added: false, reason: duplicate_claim_id`.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    claim = arguments.get("claim")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    if not claim or not isinstance(claim, dict):
+        return {"error": "missing_argument", "message": "claim object is required"}
+
+    try:
+        validated_claim = Claim.model_validate(claim)
+    except ValidationError as e:
+        return {"error": "validation_error", "message": str(e)}
+
+    with app.mutex.acquire("add_claim"):
+        page_path = _locate_page_file(app, page_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": page_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+
+        existing_claims: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("claims") or [])
+        for existing in existing_claims:
+            if existing.get("id") == validated_claim.id:
+                return {
+                    "id": page_id,
+                    "added": False,
+                    "reason": "duplicate_claim_id",
+                    "claim_id": validated_claim.id,
+                }
+
+        new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
+        # Store the user-provided dict so sparse-on-disk philosophy holds
+        # (don't auto-fill optional fields the user omitted).
+        new_fm["claims"] = existing_claims + [claim]
+
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page_id,
+        "added": True,
+        "claim_id": validated_claim.id,
+        "claims_count": len(new_fm["claims"]),
+        "index_result": index_result,
+    }
+
+
 # ---- registry ----
 
 
@@ -1076,6 +1225,94 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=write_proposal,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="add_link",
+            description=(
+                "Append an outgoing link to a page's `links_out` list. "
+                "Read-modify-write under the corpus mutex: reads the page "
+                "from disk, appends the link, writes back atomically, runs "
+                "the incremental indexer. Duplicate links (same `target` "
+                "and `label`) are detected and skipped — the response shape "
+                "`{added: false, reason: 'duplicate'}` makes this explicit."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_id": {
+                        "type": "string",
+                        "description": "Id of the page the edge originates from.",
+                    },
+                    "to_id": {
+                        "type": "string",
+                        "description": "Id of the target page (or wiki path).",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional edge label (e.g. 'subdomain_of', 'cites', 'example_of').",
+                    },
+                    "via_source": {
+                        "type": "string",
+                        "description": "Optional source-id this edge was derived from.",
+                    },
+                },
+                "required": ["from_id", "to_id"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=add_link,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="add_claim",
+            description=(
+                "Append a Claim to a page's `claims` list. The claim "
+                "object is validated against the `Claim` schema "
+                "(id + text required; value, value_type, unit, confidence, "
+                "source_ref optional). Read-modify-write under the corpus "
+                "mutex. Duplicate claim ids are detected and skipped: "
+                "response is `{added: false, reason: 'duplicate_claim_id'}`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "Id of the page to append the claim to.",
+                    },
+                    "claim": {
+                        "type": "object",
+                        "description": (
+                            "Claim shape: required `id` and `text`; optional "
+                            "`value_type`, `value`, `unit`, `confidence` (0..1), "
+                            "`confidence_label` (high/medium/low/unrated), "
+                            "`source_ref`."
+                        ),
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "value_type": {
+                                "type": "string",
+                                "enum": ["string", "number", "bool", "date"],
+                            },
+                            "value": {},
+                            "unit": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "confidence_label": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low", "unrated"],
+                            },
+                            "source_ref": {"type": "string"},
+                        },
+                        "required": ["id", "text"],
+                    },
+                },
+                "required": ["page_id", "claim"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=add_claim,
     ),
 ]
 
