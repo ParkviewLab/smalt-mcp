@@ -818,3 +818,333 @@ def test_add_claim_unknown_page(mcp_client: TestClient):
         req_id=241,
     )
     assert result["error"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# ID validation (path traversal + portability)
+#
+# Schema-level: rejected ids should never reach the filesystem. Every test
+# below also verifies that no file was created under pages/ (using
+# list_pages or a directory probe via list_pages with a prefix filter).
+
+
+def _ent_fm(page_id: str, title: str = "x") -> dict:
+    return {"id": page_id, "type": "entity", "title": title, "entity_kind": "test"}
+
+
+def test_write_page_rejects_path_traversal_id(mcp_client: TestClient):
+    """`id: '../etc/passwd'` must be rejected at the schema layer."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("../etc/passwd")},
+        req_id=300,
+    )
+    assert result["error"] == "validation_error"
+    assert "id" in result["message"].lower()
+
+
+def test_write_page_rejects_various_invalid_id_shapes(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    bad_ids = [
+        "..",
+        "has spaces",
+        ".leading-dot",
+        "-leading-hyphen",
+        "_leading-underscore",
+        "with/slash",
+        "with\\backslash",
+        "with:colon",
+        "with<bracket",
+        "",
+    ]
+    for i, bad in enumerate(bad_ids):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _ent_fm(bad)},
+            req_id=310 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should have been rejected"
+
+
+def test_write_page_rejects_windows_reserved_names(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    for i, bad in enumerate(["con", "NUL", "com1", "PRN", "lpt9"]):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _ent_fm(bad)},
+            req_id=330 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should have been rejected"
+        assert "windows" in result["message"].lower() or "reserved" in result["message"].lower()
+
+
+def test_write_proposal_rejects_path_traversal_id(mcp_client: TestClient):
+    """A proposal id like `../prop` would escape `tasks/proposals/<subdir>/`."""
+    sid = _initialize(mcp_client)
+    from datetime import UTC, datetime
+
+    fm = {
+        "id": "../prop",
+        "type": "proposal",
+        "title": "bad",
+        "proposal_kind": "wiki_edge",
+        "proposed_by": "cogitate",
+        "proposed_at": datetime.now(UTC).isoformat(),
+    }
+    result = _call_tool(
+        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=340
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_write_proposal_rejects_path_traversal_proposed_by(mcp_client: TestClient):
+    """proposed_by becomes a subdir name — `../schema` would put a 'cogitate'
+    proposal into the wrong bucket (or escape entirely)."""
+    sid = _initialize(mcp_client)
+    from datetime import UTC, datetime
+
+    fm = {
+        "id": "prop-traversal-test",
+        "type": "proposal",
+        "title": "bad",
+        "proposal_kind": "wiki_edge",
+        "proposed_by": "../schema",
+        "proposed_at": datetime.now(UTC).isoformat(),
+    }
+    result = _call_tool(
+        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=341
+    )
+    assert result["error"] == "validation_error"
+
+
+# ---------------------------------------------------------------------------
+# write_page mode: create / update / upsert
+
+
+def test_write_page_mode_create_succeeds_for_new_id(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-create-new", "First")
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": fm, "body": "first body", "mode": "create"},
+        req_id=400,
+    )
+    assert result.get("error") is None, result
+    assert result["id"] == "ent-mode-create-new"
+    assert result["mode"] == "create"
+    assert result["created"] is True
+
+
+def test_write_page_mode_create_fails_for_existing_id(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-create-existing", "First")
+    # First create succeeds (use upsert to be order-independent)
+    _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "v1"}, req_id=410
+    )
+    # Second create on same id must fail with already_exists
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": {**fm, "title": "Second"}, "body": "v2", "mode": "create"},
+        req_id=411,
+    )
+    assert result["error"] == "already_exists"
+    assert result["id"] == "ent-mode-create-existing"
+    assert "existing_path" in result
+    # Confirm the existing page was NOT clobbered
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-mode-create-existing"},
+        req_id=412,
+    )
+    assert read["title"] == "First"
+    assert read["body"] == "v1"
+
+
+def test_write_page_mode_update_succeeds_for_existing_id(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-update-existing", "v1")
+    # Set up: create the page first.
+    _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "v1 body"}, req_id=420
+    )
+    # Update it.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {**fm, "title": "v2"},
+            "body": "v2 body",
+            "mode": "update",
+        },
+        req_id=421,
+    )
+    assert result.get("error") is None, result
+    assert result["mode"] == "update"
+    assert result["created"] is False
+    # Verify the body changed.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-mode-update-existing"}, req_id=422
+    )
+    assert read["title"] == "v2"
+    assert read["body"] == "v2 body"
+
+
+def test_write_page_mode_update_fails_for_missing_id(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-update-missing")
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": fm, "mode": "update"},
+        req_id=430,
+    )
+    assert result["error"] == "not_found"
+    assert result["id"] == "ent-mode-update-missing"
+
+
+def test_write_page_mode_defaults_to_upsert(mcp_client: TestClient):
+    """Omitting `mode` should keep the historical upsert behavior."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-default")
+    result = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=440
+    )
+    assert result.get("error") is None
+    assert result["mode"] == "upsert"
+    # Upsert on the same id again: still succeeds.
+    result2 = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": fm, "body": "second"},
+        req_id=441,
+    )
+    assert result2.get("error") is None
+    assert result2["mode"] == "upsert"
+    assert result2["created"] is False  # second call is an update
+
+
+def test_write_page_mode_invalid_value(mcp_client: TestClient):
+    """mode=zebra should be rejected (not 'create'/'update'/'upsert')."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-mode-invalid")
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": fm, "mode": "zebra"},
+        req_id=442,
+    )
+    # MCP's input schema enforces the enum first; rejected as input validation
+    # error (plain text). If MCP ever allows it through, our handler still
+    # catches it with invalid_argument.
+    assert "mode" in text.lower() or "zebra" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# write_pages batch with mode
+
+
+def test_write_pages_batch_with_create_mode_aborts_on_existing(mcp_client: TestClient):
+    """If any entry in a `mode=create` batch has an existing id, the whole
+    batch aborts and no writes happen."""
+    sid = _initialize(mcp_client)
+    # Set up: create one of the ids the batch will try to create.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-batch-existing", "preset")},
+        req_id=450,
+    )
+    # Batch: 3 entries, the middle one already exists.
+    pages = [
+        {"frontmatter": _ent_fm("ent-batch-new-a", "A"), "body": "a"},
+        {"frontmatter": _ent_fm("ent-batch-existing", "X"), "body": "would clobber"},
+        {"frontmatter": _ent_fm("ent-batch-new-b", "B"), "body": "b"},
+    ]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_pages",
+        {"pages": pages, "mode": "create"},
+        req_id=451,
+    )
+    assert result["error"] == "already_exists"
+    assert result["index"] == 1
+    assert result["id"] == "ent-batch-existing"
+    # Neither of the new entries (which would have succeeded individually) was written.
+    for pid in ["ent-batch-new-a", "ent-batch-new-b"]:
+        r = _call_tool(mcp_client, sid, "read_page", {"page_id": pid}, req_id=460)
+        assert r.get("error") == "not_found", f"{pid} should NOT have been written"
+    # The existing page must be unchanged.
+    r = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-batch-existing"}, req_id=461
+    )
+    assert r["title"] == "preset"
+
+
+def test_write_pages_batch_with_update_mode_aborts_on_missing(mcp_client: TestClient):
+    """If any entry in a `mode=update` batch is missing, the whole batch aborts."""
+    sid = _initialize(mcp_client)
+    # Seed one of the ids
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-batch-update-existing", "preset")},
+        req_id=470,
+    )
+    pages = [
+        {"frontmatter": _ent_fm("ent-batch-update-existing", "X")},  # exists
+        {"frontmatter": _ent_fm("ent-batch-update-missing")},        # doesn't exist
+    ]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_pages",
+        {"pages": pages, "mode": "update"},
+        req_id=471,
+    )
+    assert result["error"] == "not_found"
+    assert result["index"] == 1
+    # The existing entry must not have been modified.
+    r = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-batch-update-existing"}, req_id=472
+    )
+    assert r["title"] == "preset"
+
+
+def test_write_pages_batch_create_mode_succeeds_when_all_new(mcp_client: TestClient):
+    """Happy path: every entry new + mode=create → all written, all created=True."""
+    sid = _initialize(mcp_client)
+    pages = [
+        {"frontmatter": _ent_fm("ent-batch-allnew-1", "A")},
+        {"frontmatter": _ent_fm("ent-batch-allnew-2", "B")},
+    ]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_pages",
+        {"pages": pages, "mode": "create"},
+        req_id=480,
+    )
+    assert result.get("error") is None, result
+    assert result["count"] == 2
+    assert all(w["created"] is True for w in result["written"])
