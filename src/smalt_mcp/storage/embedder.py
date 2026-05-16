@@ -64,12 +64,60 @@ class FastembedEmbedder:
         return [np.asarray(v, dtype=np.float32).tolist() for v in self._impl.embed(texts)]
 
 
+class FakeEmbedder:
+    """Deterministic hash-based embedder for tests.
+
+    Same `dim` as fastembed's bge-small (or whatever the test config picks).
+    The vector for a given text is fully determined by the text — re-running
+    the indexer produces the same vectors, so tests can rely on equality.
+    Quality is irrelevant; what matters is shape compatibility with the
+    LanceDB embeddings table and deterministic output.
+    """
+
+    def __init__(self, *, dim: int) -> None:
+        self._dim = dim
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def model_version(self) -> str:
+        return "fake:test"
+
+    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        return [_hash_to_vec(t, self._dim) for t in texts]
+
+
+def _hash_to_vec(text: str, dim: int) -> list[float]:
+    import hashlib
+    import struct
+
+    # Seed the rolling hash with the text; expand into `dim` floats by
+    # repeatedly hashing-and-unpacking. Floats are in [-1, 1] roughly, after
+    # normalizing each i32 to that range.
+    h = hashlib.sha256(text.encode("utf-8")).digest()
+    out: list[float] = []
+    seed = h
+    while len(out) < dim:
+        for i in range(0, len(seed), 4):
+            if len(out) >= dim:
+                break
+            i32 = struct.unpack("i", seed[i : i + 4])[0]
+            # Normalize i32 (range ~[-2^31, 2^31)) to [-1, 1].
+            out.append(max(-1.0, min(1.0, i32 / (2**31))))
+        seed = hashlib.sha256(seed).digest()  # extend if we need more bytes
+    return out
+
+
 def make_embedder(cfg: Config) -> Embedder:
     """Construct the embedder configured by `cfg.embedding`. Single source
     of truth for which provider gets used."""
     provider = cfg.embedding.provider.lower()
     if provider == "fastembed":
         return FastembedEmbedder(cfg.embedding.model, dim=cfg.embedding.dim)
+    if provider == "fake":
+        return FakeEmbedder(dim=cfg.embedding.dim)
     if provider in ("voyage", "openai"):
         raise NotImplementedError(
             f"embedding provider {provider!r} is supported in config schema "
