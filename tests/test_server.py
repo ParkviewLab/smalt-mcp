@@ -156,6 +156,8 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "write_page",
         "write_pages",
         "write_proposal",
+        "add_link",
+        "add_claim",
     }
 
 
@@ -657,3 +659,162 @@ def test_list_proposals_filter_by_status(mcp_client: TestClient):
         mcp_client, sid, "list_proposals", {"status": "applied"}, req_id=132
     )
     assert none_applied["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# add_link
+
+
+def test_add_link_to_existing_page_round_trips_via_traverse(mcp_client: TestClient):
+    """Adding a link from ent-alice → ent-bob should surface in traverse()."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-alice", "to_id": "ent-bob", "label": "friend_of"},
+        req_id=200,
+    )
+    # First time the friend_of edge is added in this session; should succeed.
+    # (If another test added it first, response is added=False/reason=duplicate;
+    # the post-condition — traverse sees the edge — still holds.)
+    assert result.get("added") is True or result.get("reason") == "duplicate"
+    # Round-trip via traverse with label filter.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "ent-alice", "label": "friend_of"},
+        req_id=201,
+    )
+    targets = {e["to_id"] for e in trav["edges"]}
+    assert "ent-bob" in targets
+
+
+def test_add_link_duplicate_is_no_op(mcp_client: TestClient):
+    """Same (target, label) twice → second call returns added=False, reason=duplicate."""
+    sid = _initialize(mcp_client)
+    # First add (may or may not be the first time, depending on test order).
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-alice", "to_id": "ent-bob", "label": "knows"},
+        req_id=210,
+    )
+    # Second add of the same edge — must be detected as duplicate.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-alice", "to_id": "ent-bob", "label": "knows"},
+        req_id=211,
+    )
+    assert result["added"] is False
+    assert result["reason"] == "duplicate"
+
+
+def test_add_link_unknown_page(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-does-not-exist", "to_id": "ent-bob", "label": "x"},
+        req_id=212,
+    )
+    assert result["error"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# add_claim
+
+
+def test_add_claim_to_existing_page_round_trips_via_read_page(mcp_client: TestClient):
+    """Adding a claim shows up in read_page's frontmatter.claims."""
+    sid = _initialize(mcp_client)
+    claim = {
+        "id": "claim-test-1",
+        "text": "Alice has a fictional age of 30",
+        "value_type": "number",
+        "value": 30,
+        "unit": "years",
+        "confidence": 0.5,
+        "confidence_label": "medium",
+    }
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-alice", "claim": claim},
+        req_id=220,
+    )
+    assert result.get("added") is True or result.get("reason") == "duplicate_claim_id"
+    # Round-trip via read_page — claim should be in frontmatter.
+    page = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-alice"}, req_id=221
+    )
+    claim_ids = {c.get("id") for c in (page["frontmatter"].get("claims") or [])}
+    assert "claim-test-1" in claim_ids
+
+
+def test_add_claim_duplicate_id_is_no_op(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    claim = {"id": "claim-dup-test", "text": "first"}
+    _call_tool(
+        mcp_client, sid, "add_claim", {"page_id": "ent-alice", "claim": claim}, req_id=230
+    )
+    # Same id, different text — still rejected as duplicate.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-alice", "claim": {"id": "claim-dup-test", "text": "second"}},
+        req_id=231,
+    )
+    assert result["added"] is False
+    assert result["reason"] == "duplicate_claim_id"
+
+
+def test_add_claim_mcp_rejects_missing_required(mcp_client: TestClient):
+    """MCP-side: the inner claim object's `required: [id, text]` is enforced
+    before dispatch. Missing `text` gets a plain-text MCP error."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-alice", "claim": {"id": "claim-bad-required"}},
+        req_id=240,
+    )
+    assert "text" in text and ("required" in text.lower() or "missing" in text.lower())
+
+
+def test_add_claim_handler_rejects_invalid_value(mcp_client: TestClient):
+    """Handler-side: Pydantic's Claim model enforces 0 <= confidence <= 1.
+    MCP's input schema doesn't check that — so this exercises the handler's
+    `Claim.model_validate` path and returns a structured validation_error."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {
+            "page_id": "ent-alice",
+            "claim": {"id": "claim-bad-conf", "text": "out of range", "confidence": 1.5},
+        },
+        req_id=245,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_add_claim_unknown_page(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-nope", "claim": {"id": "claim-x", "text": "x"}},
+        req_id=241,
+    )
+    assert result["error"] == "not_found"
