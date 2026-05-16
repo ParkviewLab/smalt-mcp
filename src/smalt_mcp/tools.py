@@ -12,9 +12,11 @@ entry to `TOOLS` plus a handler function. No edits to `server.py` needed.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,37 +246,61 @@ async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"pages": out_pages, "count": len(out_pages)}
 
 
-# ---- handler: read_page ----
+# ---- alias-lookup helpers (shared by find_by_alias + read_page fallback) ----
 
 
-async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Return the frontmatter (parsed) + body of a single page by id."""
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+def _find_pages_by_alias(app: App, alias: str) -> list[dict[str, Any]]:
+    """Return every indexed page whose `aliases` list contains `alias`.
 
-    page_id = arguments.get("page_id")
-    if not page_id:
-        return {"error": "missing_argument", "message": "page_id is required"}
-
+    Scans the pages table's `frontmatter_json` column — no LanceDB-side
+    index on aliases today, so this is O(pages). Fine for typical Smalts
+    (thousands of pages); when we hit limits we'll add an aliases table.
+    """
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
     arrow = (
         pages.search()
-        .where(f"id = {lance.sql_str(page_id)}")
+        .select(["id", "title", "type", "path", "frontmatter_json"])
+        .to_arrow()
+    )
+    matches: list[dict[str, Any]] = []
+    for i in range(arrow.num_rows):
+        fm_raw = arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            continue
+        aliases = fm.get("aliases") or []
+        if alias in aliases:
+            matches.append(
+                {
+                    "id": arrow.column("id")[i].as_py(),
+                    "title": arrow.column("title")[i].as_py(),
+                    "type": arrow.column("type")[i].as_py(),
+                    "path": arrow.column("path")[i].as_py(),
+                }
+            )
+    return matches
+
+
+def _fetch_page_row(app: App, canonical_id: str) -> dict[str, Any] | None:
+    """Return the full read_page payload for `canonical_id`, or None if not indexed."""
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"id = {lance.sql_str(canonical_id)}")
         .select(["id", "title", "type", "path", "body", "frontmatter_json"])
         .limit(1)
         .to_arrow()
     )
     if arrow.num_rows == 0:
-        return {"error": "not_found", "page_id": page_id}
-
+        return None
     fm_raw = arrow.column("frontmatter_json")[0].as_py()
     try:
         fm = json.loads(fm_raw) if fm_raw else {}
     except json.JSONDecodeError:
         fm = {}
-
     return {
         "id": arrow.column("id")[0].as_py(),
         "title": arrow.column("title")[0].as_py(),
@@ -283,6 +309,78 @@ async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         "body": arrow.column("body")[0].as_py(),
         "frontmatter": fm,
     }
+
+
+# ---- handler: read_page ----
+
+
+async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the frontmatter (parsed) + body of a single page.
+
+    Lookup order:
+      1. Exact match on the canonical `id`. If found, return.
+      2. Alias fallback: search every page's `aliases` for `page_id`.
+         - Exactly one match → return that page, with `resolved_via_alias: true`.
+         - Two or more matches → `{error: 'ambiguous_alias', matches: [...]}`.
+         - Zero matches → `{error: 'not_found', page_id: ...}`.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+
+    # 1. Exact id match
+    payload = _fetch_page_row(app, page_id)
+    if payload is not None:
+        return payload
+
+    # 2. Alias fallback
+    matches = _find_pages_by_alias(app, page_id)
+    if not matches:
+        return {"error": "not_found", "page_id": page_id}
+    if len(matches) > 1:
+        return {
+            "error": "ambiguous_alias",
+            "alias": page_id,
+            "matches": matches,
+            "message": (
+                f"alias {page_id!r} matches {len(matches)} pages; "
+                "address by canonical id (use the `id` field of one of the matches above)"
+            ),
+        }
+    # Exactly one match — fetch the full row.
+    canonical = matches[0]["id"]
+    payload = _fetch_page_row(app, canonical)
+    if payload is None:  # shouldn't happen — index just told us this exists
+        return {"error": "not_found", "page_id": canonical}
+    payload["resolved_via_alias"] = page_id
+    return payload
+
+
+# ---- handler: find_by_alias ----
+
+
+async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List every page whose `aliases` contains `alias`.
+
+    Use this when you have a memorable handle (the original caller-id
+    before mangling, or any hand-added alias) and want to find the page(s)
+    it maps to. Returns minimal metadata (id, title, type, path) per match
+    — call `read_page` with the canonical `id` to get the body.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    alias = arguments.get("alias")
+    if not alias:
+        return {"error": "missing_argument", "message": "alias is required"}
+
+    matches = _find_pages_by_alias(app, alias)
+    return {"alias": alias, "matches": matches, "count": len(matches)}
 
 
 # ---- handler: traverse ----
@@ -602,41 +700,169 @@ async def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- write mode + existence + canonical-id helpers ----
+#
+# Two write modes:
+#   create : ALWAYS produce a new page. The caller's id contributes to the
+#            slug-prefix; a 22-char URL-safe base64 UUID4 suffix gives
+#            structural uniqueness. The original id is preserved in the
+#            page's `aliases` list. Collision is impossible by construction.
+#   update : The caller's id must match an existing canonical id exactly.
+#            Fails {error: not_found} otherwise. No mangling.
+#
+# There's no `upsert` mode. The two semantics — "make a new thing" and
+# "modify a specific existing thing" — are deliberately distinct under
+# always-mangle, because the caller's id is no longer the canonical id for
+# create-writes. An upsert that sometimes-mangled-sometimes-didn't would
+# be ambiguous and dangerous.
+
+
+_VALID_WRITE_MODES: frozenset[str] = frozenset({"create", "update"})
+
+
+def _mangle_id(caller_id: str) -> str:
+    """Append a 22-char URL-safe base64 UUID4 suffix to `caller_id`.
+
+    URL-safe base64 uses [A-Za-z0-9_-], all of which pass our PAGE_ID_RE,
+    so the resulting canonical id re-validates cleanly.
+    """
+    suffix = base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode("ascii")
+    return f"{caller_id}-{suffix}"
+
+
+def _existing_page_path(app: App, page_id: str) -> str | None:
+    """Return the indexed relative path of a page, or None if not present.
+
+    Uses the LanceDB pages table. Caller must hold the corpus mutex if it
+    intends to use the result to decide a write (otherwise a concurrent
+    write could change reality before the decision lands).
+    """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"id = {lance.sql_str(page_id)}")
+        .select(["path"])
+        .limit(1)
+        .to_arrow()
+    )
+    if arrow.num_rows == 0:
+        return None
+    return arrow.column("path")[0].as_py()
+
+
+def _prepare_create_write(fm_in: dict[str, Any]) -> tuple[Page, dict[str, Any], str]:
+    """Prepare a create-mode write: mangle id, preserve original as alias,
+    re-validate, return (page, fm_out, original_id).
+
+    Caller passes the validated `fm_in` (already through PAGE_ADAPTER once).
+    We rebuild the dict with the canonical id + extended aliases, re-validate
+    so the returned `page` reflects the final on-disk shape.
+    """
+    original_id = fm_in["id"]
+    canonical_id = _mangle_id(original_id)
+    fm_out: dict[str, Any] = dict(fm_in)
+    fm_out["id"] = canonical_id
+    aliases = list(fm_out.get("aliases") or [])
+    if original_id not in aliases:
+        aliases.append(original_id)
+    fm_out["aliases"] = aliases
+    page = PAGE_ADAPTER.validate_python(fm_out)
+    return page, fm_out, original_id
+
+
 # ---- handler: write_page (READ_WRITE) ----
 
 
 async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Write one page (frontmatter + body) and trigger an incremental indexer pass.
 
-    Path is derived from the page's type + id: `pages/<subdir>/<page_id>.md`.
-    Atomic at the filesystem level (tmp-then-rename). Wrapped in the corpus
-    mutex so the write + indexer pass form a single critical section. New ids
-    create files; existing ids overwrite.
+    `mode='create'` (default): always produces a NEW page. The caller's id
+    becomes the slug-prefix; a 22-char URL-safe base64 UUID4 suffix makes the
+    canonical id structurally unique. The original id is preserved in
+    `aliases`. Returns `{id: <canonical>, original_id: <caller>, ...}` —
+    callers must store the canonical id to address the page later.
+
+    `mode='update'`: requires the caller's id to be an existing canonical id
+    (no mangling, no alias resolution). Fails `{error: 'not_found'}` if no
+    such page is indexed. Use this to modify a specific known page.
+
+    Path: `pages/<subdir>/<canonical-id>.md`. Atomic tmp-then-rename. Both
+    write + indexer pass run inside the corpus single-writer mutex; the
+    existence check (for update) is in the same critical section.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
         return err  # type: ignore[return-value]
 
-    fm = arguments.get("frontmatter")
-    if not fm:
+    fm_in = arguments.get("frontmatter")
+    if not fm_in:
         return {"error": "missing_argument", "message": "frontmatter is required"}
     body = arguments.get("body") or ""
+    mode = arguments.get("mode") or "create"
+    if mode not in _VALID_WRITE_MODES:
+        return {
+            "error": "invalid_argument",
+            "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
+        }
 
+    # First validation: caller's frontmatter must conform to the Page union.
     try:
-        page = PAGE_ADAPTER.validate_python(fm)
+        PAGE_ADAPTER.validate_python(fm_in)
     except ValidationError as e:
         return {"error": "validation_error", "message": str(e)}
 
-    target = _page_target_path(app.cfg.smalt_dir, page)
+    if mode == "create":
+        # Mangle and re-validate (re-validation is cheap and confirms the
+        # canonical id still passes _validate_id — URL-safe base64 is in the
+        # allowed character set).
+        try:
+            page, fm_out, original_id = _prepare_create_write(fm_in)
+        except ValidationError as e:
+            return {"error": "validation_error", "message": str(e)}
 
+        target = _page_target_path(app.cfg.smalt_dir, page)
+        with app.mutex.acquire("write_page"):
+            # Defensive: UUID4 collision is 2^-122 per pair — effectively zero
+            # — but check anyway so we never silently overwrite.
+            if _existing_page_path(app, page.id) is not None:
+                return {
+                    "error": "uuid_collision",
+                    "id": page.id,
+                    "message": "UUID4 collision (extraordinary); retry the call",
+                }
+            _serialize_and_write_page(target, fm_out, body)
+            index_result = _run_indexer(app)
+
+        return {
+            "id": page.id,
+            "original_id": original_id,
+            "path": str(target.relative_to(app.cfg.smalt_dir)),
+            "type": page.type.value,
+            "mode": "create",
+            "mangled": True,
+            "index_result": index_result,
+        }
+
+    # mode == "update"
+    page = PAGE_ADAPTER.validate_python(fm_in)  # re-validate (cheap) to bind .id/.type
+    target = _page_target_path(app.cfg.smalt_dir, page)
     with app.mutex.acquire("write_page"):
-        _serialize_and_write_page(target, fm, body)
+        if _existing_page_path(app, page.id) is None:
+            return {
+                "error": "not_found",
+                "id": page.id,
+                "message": f"page {page.id!r} does not exist; use mode='create' to insert (it will be mangled)",
+            }
+        _serialize_and_write_page(target, fm_in, body)
         index_result = _run_indexer(app)
 
     return {
         "id": page.id,
         "path": str(target.relative_to(app.cfg.smalt_dir)),
         "type": page.type.value,
+        "mode": "update",
+        "mangled": False,
         "index_result": index_result,
     }
 
@@ -647,11 +873,20 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Batch-write a list of pages with a single indexer pass at the end.
 
-    Validates every page's frontmatter before any write hits disk. If
-    validation fails on page N, no writes happen and the error reports the
-    offending index. After validation, writes proceed sequentially under the
-    corpus mutex; the indexer runs once at the end (cheap incremental pass
-    over the whole pages tree).
+    Same mode semantics as `write_page`: `create` mangles every id;
+    `update` requires every id to exist already. The mode applies uniformly
+    to the whole batch.
+
+    Validate-all-then-act contract:
+      1. Every entry's frontmatter is validated up front.
+      2. For `mode='update'`, every entry's id is checked for existence
+         before any writes happen.
+      3. Any validation or mode-check failure aborts the entire batch;
+         the response reports the offending index.
+
+    `mode='create'` cannot fail per-entry on collision (mangling makes
+    every id unique by construction), so phase 2's existence check is a
+    no-op in that mode.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -660,9 +895,15 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     items = arguments.get("pages")
     if not items or not isinstance(items, list):
         return {"error": "missing_argument", "message": "pages must be a non-empty list"}
+    mode = arguments.get("mode") or "create"
+    if mode not in _VALID_WRITE_MODES:
+        return {
+            "error": "invalid_argument",
+            "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
+        }
 
-    # Validate every entry before we touch disk.
-    validated: list[tuple[Page, dict[str, Any], str]] = []
+    # Phase 1: validate every entry's frontmatter (no disk).
+    validated: list[tuple[dict[str, Any], str]] = []
     for i, entry in enumerate(items):
         if not isinstance(entry, dict):
             return {"error": "validation_error", "index": i, "message": "each entry must be an object"}
@@ -671,26 +912,67 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             return {"error": "validation_error", "index": i, "message": "frontmatter is required"}
         body = entry.get("body") or ""
         try:
-            page = PAGE_ADAPTER.validate_python(fm)
+            PAGE_ADAPTER.validate_python(fm)
         except ValidationError as e:
             return {"error": "validation_error", "index": i, "message": str(e)}
-        validated.append((page, fm, body))
+        validated.append((fm, body))
 
-    written: list[dict[str, str]] = []
+    written: list[dict[str, Any]] = []
     with app.mutex.acquire("write_pages"):
-        for page, fm, body in validated:
-            target = _page_target_path(app.cfg.smalt_dir, page)
-            _serialize_and_write_page(target, fm, body)
-            written.append(
-                {
-                    "id": page.id,
-                    "path": str(target.relative_to(app.cfg.smalt_dir)),
-                    "type": page.type.value,
-                }
-            )
+        if mode == "update":
+            # Phase 2: every id must already exist (all-or-nothing).
+            for i, (fm, _body) in enumerate(validated):
+                if _existing_page_path(app, fm["id"]) is None:
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "id": fm["id"],
+                        "message": f"page {fm['id']!r} does not exist; batch aborted",
+                    }
+
+        # Phase 3: commit each entry.
+        for fm_in, body in validated:
+            if mode == "create":
+                page, fm_out, original_id = _prepare_create_write(fm_in)
+                target = _page_target_path(app.cfg.smalt_dir, page)
+                # UUID collision check (defensive)
+                if _existing_page_path(app, page.id) is not None:
+                    return {
+                        "error": "uuid_collision",
+                        "id": page.id,
+                        "message": "UUID4 collision (extraordinary); retry the batch",
+                    }
+                _serialize_and_write_page(target, fm_out, body)
+                written.append(
+                    {
+                        "id": page.id,
+                        "original_id": original_id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mangled": True,
+                    }
+                )
+            else:  # update
+                page = PAGE_ADAPTER.validate_python(fm_in)
+                target = _page_target_path(app.cfg.smalt_dir, page)
+                _serialize_and_write_page(target, fm_in, body)
+                written.append(
+                    {
+                        "id": page.id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mangled": False,
+                    }
+                )
+
         index_result = _run_indexer(app)
 
-    return {"written": written, "count": len(written), "index_result": index_result}
+    return {
+        "written": written,
+        "count": len(written),
+        "mode": mode,
+        "index_result": index_result,
+    }
 
 
 # ---- handler: write_proposal (READ_WRITE) ----
@@ -957,15 +1239,30 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="read_page",
             description=(
-                "Return one page's full body + parsed frontmatter, looked up "
-                "by id. Returns `{error: 'not_found'}` if the id isn't indexed."
+                "Return one page's full body + parsed frontmatter.\n\n"
+                "Lookup order:\n"
+                "  1. Exact match on the canonical `id`.\n"
+                "  2. Alias fallback: if no exact match, search every "
+                "page's `aliases` for `page_id`.\n"
+                "      - 1 match → return that page; response includes "
+                "`resolved_via_alias: <the alias>`.\n"
+                "      - 2+ matches → `{error: 'ambiguous_alias', "
+                "matches: [...]}` (caller must pick a canonical id).\n"
+                "      - 0 matches → `{error: 'not_found'}`.\n\n"
+                "Use `find_by_alias` if you want the full match list "
+                "without picking one."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "page_id": {
                         "type": "string",
-                        "description": "The page id, e.g. 'ent-alice' or 'con-embedding'.",
+                        "description": (
+                            "Canonical page id (e.g. 'ent-alice-XYZ…') or a "
+                            "known alias (e.g. 'ent-alice'). Exact-id "
+                            "lookup runs first; alias fallback is "
+                            "automatic."
+                        ),
                     },
                 },
                 "required": ["page_id"],
@@ -973,6 +1270,32 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=read_page,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="find_by_alias",
+            description=(
+                "List every page whose `aliases` contains `alias`. "
+                "Returns minimal metadata per match (id, title, type, "
+                "path); call `read_page` on a canonical id to get the "
+                "body. Useful when you have a memorable handle (the "
+                "original caller-id before write_page mangling, or any "
+                "hand-added alias) and want to see which page(s) it maps "
+                "to."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alias": {
+                        "type": "string",
+                        "description": "The alias to look up.",
+                    },
+                },
+                "required": ["alias"],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=find_by_alias,
     ),
     ToolDef(
         spec=types.Tool(
@@ -1119,15 +1442,25 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="write_page",
             description=(
-                "Create or update one page. The frontmatter must conform to "
-                "the Page Pydantic union (entity / concept / source / "
-                "synthesis discriminated by the `type` field). The file is "
-                "written atomically (tmp-then-rename) at "
-                "`pages/<subdir>/<page_id>.md`, where <subdir> derives from "
-                "the page's type. After the write, an incremental indexer "
-                "pass refreshes the LanceDB tables; the response includes "
-                "the indexer's summary. Both write and index run inside the "
-                "corpus single-writer mutex."
+                "Write one page (frontmatter + body) and trigger an "
+                "incremental indexer pass.\n\n"
+                "Two modes:\n"
+                "  - `create` (DEFAULT): always produces a NEW page. The "
+                "caller's id becomes the slug-prefix; a 22-char URL-safe "
+                "base64 UUID4 suffix is appended to make the canonical id "
+                "structurally unique (collision is impossible). The "
+                "original id is preserved in the page's `aliases` list. "
+                "Response includes `id` (canonical), `original_id` (what "
+                "the caller sent), and `mangled: true`. Callers must store "
+                "the canonical id to address the page later.\n"
+                "  - `update`: the caller's id must be an existing canonical "
+                "id (no mangling, no alias resolution). Fails "
+                "`{error: 'not_found'}` if no such page is indexed. Use "
+                "this to modify a specific known page.\n\n"
+                "Path: `pages/<subdir>/<canonical-id>.md`. Atomic "
+                "tmp-then-rename. Write + indexer run inside the corpus "
+                "single-writer mutex; the existence check (for update) is "
+                "in the same critical section."
             ),
             inputSchema={
                 "type": "object",
@@ -1135,15 +1468,31 @@ TOOLS: list[ToolDef] = [
                     "frontmatter": {
                         "type": "object",
                         "description": (
-                            "Full page frontmatter. Required keys: id, type, "
-                            "title. Other keys per the page-type schema "
-                            "(see smalt_mcp/schema.py)."
+                            "Full page frontmatter. Required keys: id, "
+                            "type, title. Other keys per the page-type "
+                            "schema (see smalt_mcp/schema.py). The id is "
+                            "validated for path-safety + portability "
+                            "(alphanumeric + underscore + hyphen, no "
+                            "leading dash/underscore, 1..254 chars, not a "
+                            "Windows-reserved name)."
                         ),
                     },
                     "body": {
                         "type": "string",
                         "description": "Page body (everything after the frontmatter block).",
                         "default": "",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "Write mode. `create` (default) always creates "
+                            "a new page with a mangled canonical id. "
+                            "`update` requires the caller's id to be an "
+                            "existing canonical id and modifies that page "
+                            "in place."
+                        ),
+                        "enum": ["create", "update"],
+                        "default": "create",
                     },
                 },
                 "required": ["frontmatter"],
@@ -1157,11 +1506,19 @@ TOOLS: list[ToolDef] = [
             name="write_pages",
             description=(
                 "Batch-write a list of pages with a single indexer pass at "
-                "the end. Every page's frontmatter is validated up front; "
-                "if validation fails on entry N, no writes happen and the "
-                "error reports the offending index. After validation, "
-                "writes proceed sequentially under the corpus mutex; the "
-                "indexer runs once at the end (cheap incremental pass)."
+                "the end. Same mode semantics as `write_page`: `create` "
+                "mangles every id; `update` requires every id to exist "
+                "already.\n\n"
+                "Validate-all-then-act contract:\n"
+                "  1. Every entry's frontmatter is validated up front.\n"
+                "  2. For `mode='update'`, every entry's id is checked "
+                "for existence before any writes happen. Missing id "
+                "aborts the entire batch with `{error: 'not_found', "
+                "index: N}`.\n"
+                "  3. For `mode='create'`, no existence check is needed "
+                "(mangling makes each id unique by construction).\n\n"
+                "After all checks pass, writes proceed sequentially under "
+                "the corpus mutex; the indexer runs once at the end."
             ),
             inputSchema={
                 "type": "object",
@@ -1177,6 +1534,16 @@ TOOLS: list[ToolDef] = [
                             },
                             "required": ["frontmatter"],
                         },
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "Write mode applied uniformly to every entry. "
+                            "`create` (default) mangles each id; "
+                            "`update` requires each id to already exist."
+                        ),
+                        "enum": ["create", "update"],
+                        "default": "create",
                     },
                 },
                 "required": ["pages"],
