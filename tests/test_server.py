@@ -345,7 +345,9 @@ def test_bootstrap_idempotent(mcp_client: TestClient):
 
 
 def test_write_page_round_trip(mcp_client: TestClient):
-    """write_page → read_page returns the same content."""
+    """write_page (default mode=create) mangles the id, preserves the caller's
+    id as an alias, and read_page on the canonical id round-trips the
+    content. The path embeds the mangled canonical id."""
     sid = _initialize(mcp_client)
     fm = {
         "id": "ent-test-write-rt",
@@ -360,20 +362,24 @@ def test_write_page_round_trip(mcp_client: TestClient):
         {"frontmatter": fm, "body": "roundtrip body content"},
         req_id=70,
     )
-    assert result["id"] == "ent-test-write-rt"
-    assert result["path"] == "pages/entities/ent-test-write-rt.md"
+    # Canonical id is mangled: caller-id + '-' + 22-char base64.
+    assert result["original_id"] == "ent-test-write-rt"
+    assert result["id"].startswith("ent-test-write-rt-")
+    assert len(result["id"]) == len("ent-test-write-rt") + 1 + 22
+    assert result["mode"] == "create"
+    assert result["mangled"] is True
     assert result["type"] == "entity"
-    assert "index_result" in result
-    # Indexer should have picked up exactly one new page.
-    idx = result["index_result"]
-    assert idx["inserted"] >= 1
-    # Round-trip via read_page.
+    assert result["path"] == f"pages/entities/{result['id']}.md"
+    assert result["index_result"]["inserted"] >= 1
+    # Round-trip via read_page using the canonical id.
     read = _call_tool(
-        mcp_client, sid, "read_page", {"page_id": "ent-test-write-rt"}, req_id=71
+        mcp_client, sid, "read_page", {"page_id": result["id"]}, req_id=71
     )
     assert read["title"] == "Test Write Roundtrip"
     assert read["body"] == "roundtrip body content"
     assert read["type"] == "entity"
+    # Caller's original id is preserved as an alias.
+    assert "ent-test-write-rt" in read["frontmatter"].get("aliases", [])
 
 
 def test_write_page_validation_error(mcp_client: TestClient):
@@ -390,16 +396,63 @@ def test_write_page_validation_error(mcp_client: TestClient):
     assert result["error"] == "validation_error"
 
 
-def test_write_page_overwrite_updates(mcp_client: TestClient):
-    """Writing the same id twice updates the page; the second body wins."""
+def test_two_creates_with_same_caller_id_produce_distinct_canonical_ids(mcp_client: TestClient):
+    """Always-mangle: two create calls with identical caller-id frontmatter
+    produce two pages with different canonical ids; neither overwrites the
+    other."""
     sid = _initialize(mcp_client)
-    fm = {"id": "ent-test-write-ow", "type": "entity", "title": "v1", "entity_kind": "test"}
-    _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm, "body": "first"}, req_id=73)
-    fm2 = {**fm, "title": "v2"}
-    _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm2, "body": "second"}, req_id=74)
-    read = _call_tool(
-        mcp_client, sid, "read_page", {"page_id": "ent-test-write-ow"}, req_id=75
+    fm = {"id": "ent-test-twin", "type": "entity", "title": "v1", "entity_kind": "test"}
+    r1 = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "first"}, req_id=73
     )
+    r2 = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": {**fm, "title": "v2"}, "body": "second"},
+        req_id=74,
+    )
+    assert r1["original_id"] == r2["original_id"] == "ent-test-twin"
+    assert r1["id"] != r2["id"], "two creates must produce distinct canonical ids"
+    # Both files exist; both readable independently.
+    read1 = _call_tool(mcp_client, sid, "read_page", {"page_id": r1["id"]}, req_id=75)
+    read2 = _call_tool(mcp_client, sid, "read_page", {"page_id": r2["id"]}, req_id=76)
+    assert read1["title"] == "v1"
+    assert read1["body"] == "first"
+    assert read2["title"] == "v2"
+    assert read2["body"] == "second"
+    # Both share the original id as an alias.
+    assert "ent-test-twin" in read1["frontmatter"].get("aliases", [])
+    assert "ent-test-twin" in read2["frontmatter"].get("aliases", [])
+
+
+def test_write_page_update_overwrites_existing(mcp_client: TestClient):
+    """Update mode against the canonical id from a prior create modifies that
+    specific page in place."""
+    sid = _initialize(mcp_client)
+    fm = {"id": "ent-test-update", "type": "entity", "title": "v1", "entity_kind": "test"}
+    create = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "first"}, req_id=77
+    )
+    canonical = create["id"]
+    # Update mode requires the canonical id in the frontmatter.
+    update = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {**fm, "id": canonical, "title": "v2"},
+            "body": "second",
+            "mode": "update",
+        },
+        req_id=78,
+    )
+    assert update.get("error") is None, update
+    assert update["mode"] == "update"
+    assert update["mangled"] is False
+    assert update["id"] == canonical
+    # Body changed in place.
+    read = _call_tool(mcp_client, sid, "read_page", {"page_id": canonical}, req_id=79)
     assert read["title"] == "v2"
     assert read["body"] == "second"
 
@@ -409,7 +462,8 @@ def test_write_page_overwrite_updates(mcp_client: TestClient):
 
 
 def test_write_pages_batch(mcp_client: TestClient):
-    """Two pages written in one batch are both indexed and readable."""
+    """Two pages written in one batch (mode=create by default) get mangled
+    canonical ids; both are independently readable by their canonical ids."""
     sid = _initialize(mcp_client)
     pages = [
         {
@@ -433,12 +487,18 @@ def test_write_pages_batch(mcp_client: TestClient):
     ]
     result = _call_tool(mcp_client, sid, "write_pages", {"pages": pages}, req_id=80)
     assert result["count"] == 2
-    written_ids = {w["id"] for w in result["written"]}
-    assert written_ids == {"ent-test-batch-1", "ent-test-batch-2"}
-    # Both readable.
-    for pid in written_ids:
-        r = _call_tool(mcp_client, sid, "read_page", {"page_id": pid}, req_id=81)
-        assert r["id"] == pid
+    originals = {w["original_id"] for w in result["written"]}
+    assert originals == {"ent-test-batch-1", "ent-test-batch-2"}
+    # All canonical ids are mangled and distinct.
+    canonical_ids = {w["id"] for w in result["written"]}
+    assert len(canonical_ids) == 2
+    for w in result["written"]:
+        assert w["mangled"] is True
+        assert w["id"].startswith(w["original_id"] + "-")
+    # Both readable by canonical id.
+    for canonical in canonical_ids:
+        r = _call_tool(mcp_client, sid, "read_page", {"page_id": canonical}, req_id=81)
+        assert r["id"] == canonical
 
 
 def test_write_pages_validation_aborts_batch(mcp_client: TestClient):
@@ -925,195 +985,174 @@ def test_write_proposal_rejects_path_traversal_proposed_by(mcp_client: TestClien
 
 
 # ---------------------------------------------------------------------------
-# write_page mode: create / update / upsert
+# write_page mode: create (always-mangle) / update (canonical id required)
 
 
-def test_write_page_mode_create_succeeds_for_new_id(mcp_client: TestClient):
+def test_write_page_default_mode_is_create_and_mangles(mcp_client: TestClient):
+    """Omitting `mode` defaults to `create` and produces a mangled canonical id."""
     sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-create-new", "First")
-    result = _call_tool(
-        mcp_client,
-        sid,
-        "write_page",
-        {"frontmatter": fm, "body": "first body", "mode": "create"},
-        req_id=400,
-    )
-    assert result.get("error") is None, result
-    assert result["id"] == "ent-mode-create-new"
+    fm = _ent_fm("ent-mode-default")
+    result = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=440)
+    assert result.get("error") is None
     assert result["mode"] == "create"
-    assert result["created"] is True
+    assert result["mangled"] is True
+    assert result["original_id"] == "ent-mode-default"
+    assert result["id"] != "ent-mode-default"
 
 
-def test_write_page_mode_create_fails_for_existing_id(mcp_client: TestClient):
+def test_write_page_create_preserves_caller_id_in_aliases(mcp_client: TestClient):
+    """The caller's id is added to `aliases` even if it was already
+    populated; existing aliases are kept."""
     sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-create-existing", "First")
-    # First create succeeds (use upsert to be order-independent)
-    _call_tool(
-        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "v1"}, req_id=410
+    fm = dict(_ent_fm("ent-alias-preserve"), aliases=["pre-existing-alias"])
+    result = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=400)
+    assert result.get("error") is None
+    # Read back; both the original id and the pre-existing alias should be present.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": result["id"]}, req_id=401
     )
-    # Second create on same id must fail with already_exists
-    result = _call_tool(
+    aliases = read["frontmatter"].get("aliases", [])
+    assert "ent-alias-preserve" in aliases
+    assert "pre-existing-alias" in aliases
+
+
+def test_write_page_canonical_id_re_validates(mcp_client: TestClient):
+    """The mangled canonical id (caller-id + '-' + 22-char base64) must pass
+    the same _PAGE_ID_RE used for caller-supplied ids — so the canonical id
+    is structurally consistent."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-revalidate-test")
+    result = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=402)
+    canonical = result["id"]
+    # 22 chars of URL-safe base64 = [A-Za-z0-9_-], all valid for our regex.
+    # The whole id must conform.
+    import re
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,253}", canonical)
+
+
+def test_write_page_mode_update_requires_canonical_id(mcp_client: TestClient):
+    """Update mode against the caller-id (not the canonical id) of a prior
+    create fails with not_found — there is no alias resolution in `update`."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-update-caller-id", "v1")
+    create = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=420)
+    assert create.get("error") is None
+    # Update by the caller's original id (NOT the canonical id) must fail.
+    update = _call_tool(
         mcp_client,
         sid,
         "write_page",
-        {"frontmatter": {**fm, "title": "Second"}, "body": "v2", "mode": "create"},
-        req_id=411,
+        {"frontmatter": {**fm, "title": "v2"}, "body": "x", "mode": "update"},
+        req_id=421,
     )
-    assert result["error"] == "already_exists"
-    assert result["id"] == "ent-mode-create-existing"
-    assert "existing_path" in result
-    # Confirm the existing page was NOT clobbered
-    read = _call_tool(
-        mcp_client,
-        sid,
-        "read_page",
-        {"page_id": "ent-mode-create-existing"},
-        req_id=412,
-    )
-    assert read["title"] == "First"
-    assert read["body"] == "v1"
+    assert update["error"] == "not_found"
+    assert update["id"] == "ent-update-caller-id"
 
 
-def test_write_page_mode_update_succeeds_for_existing_id(mcp_client: TestClient):
+def test_write_page_mode_update_with_canonical_id_modifies_in_place(mcp_client: TestClient):
+    """Update with the canonical id succeeds; the on-disk page is overwritten
+    and no new page is created."""
     sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-update-existing", "v1")
-    # Set up: create the page first.
-    _call_tool(
-        mcp_client, sid, "write_page", {"frontmatter": fm, "body": "v1 body"}, req_id=420
-    )
-    # Update it.
-    result = _call_tool(
+    fm = _ent_fm("ent-update-canon", "v1")
+    create = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=430)
+    canonical = create["id"]
+    # Update using the canonical id.
+    update = _call_tool(
         mcp_client,
         sid,
         "write_page",
         {
-            "frontmatter": {**fm, "title": "v2"},
-            "body": "v2 body",
+            "frontmatter": {**fm, "id": canonical, "title": "v2"},
+            "body": "updated body",
             "mode": "update",
         },
-        req_id=421,
+        req_id=431,
     )
-    assert result.get("error") is None, result
-    assert result["mode"] == "update"
-    assert result["created"] is False
-    # Verify the body changed.
-    read = _call_tool(
-        mcp_client, sid, "read_page", {"page_id": "ent-mode-update-existing"}, req_id=422
-    )
+    assert update.get("error") is None, update
+    assert update["mode"] == "update"
+    assert update["mangled"] is False
+    assert update["id"] == canonical
+    # Read back: changes are present.
+    read = _call_tool(mcp_client, sid, "read_page", {"page_id": canonical}, req_id=432)
     assert read["title"] == "v2"
-    assert read["body"] == "v2 body"
+    assert read["body"] == "updated body"
 
 
-def test_write_page_mode_update_fails_for_missing_id(mcp_client: TestClient):
+def test_write_page_mode_update_fails_for_missing_canonical_id(mcp_client: TestClient):
     sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-update-missing")
+    # Construct a plausible-but-nonexistent canonical id.
+    fake_canonical = "ent-not-there-AbCdEfGhIjKlMnOpQrStUv"
+    fm = _ent_fm(fake_canonical)
     result = _call_tool(
         mcp_client,
         sid,
         "write_page",
         {"frontmatter": fm, "mode": "update"},
-        req_id=430,
+        req_id=433,
     )
     assert result["error"] == "not_found"
-    assert result["id"] == "ent-mode-update-missing"
+    assert result["id"] == fake_canonical
 
 
-def test_write_page_mode_defaults_to_upsert(mcp_client: TestClient):
-    """Omitting `mode` should keep the historical upsert behavior."""
+def test_write_page_mode_upsert_is_rejected(mcp_client: TestClient):
+    """`upsert` is no longer a valid mode under always-mangle semantics."""
     sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-default")
-    result = _call_tool(
-        mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=440
-    )
-    assert result.get("error") is None
-    assert result["mode"] == "upsert"
-    # Upsert on the same id again: still succeeds.
-    result2 = _call_tool(
-        mcp_client,
-        sid,
-        "write_page",
-        {"frontmatter": fm, "body": "second"},
-        req_id=441,
-    )
-    assert result2.get("error") is None
-    assert result2["mode"] == "upsert"
-    assert result2["created"] is False  # second call is an update
-
-
-def test_write_page_mode_invalid_value(mcp_client: TestClient):
-    """mode=zebra should be rejected (not 'create'/'update'/'upsert')."""
-    sid = _initialize(mcp_client)
-    fm = _ent_fm("ent-mode-invalid")
+    fm = _ent_fm("ent-no-upsert")
     text = _call_tool_raw_text(
         mcp_client,
         sid,
         "write_page",
-        {"frontmatter": fm, "mode": "zebra"},
-        req_id=442,
+        {"frontmatter": fm, "mode": "upsert"},
+        req_id=434,
     )
-    # MCP's input schema enforces the enum first; rejected as input validation
-    # error (plain text). If MCP ever allows it through, our handler still
-    # catches it with invalid_argument.
-    assert "mode" in text.lower() or "zebra" in text.lower()
+    # MCP's input schema enforces the enum (only create/update now).
+    assert "mode" in text.lower() or "upsert" in text.lower()
 
 
 # ---------------------------------------------------------------------------
 # write_pages batch with mode
 
 
-def test_write_pages_batch_with_create_mode_aborts_on_existing(mcp_client: TestClient):
-    """If any entry in a `mode=create` batch has an existing id, the whole
-    batch aborts and no writes happen."""
+def test_write_pages_batch_create_mangles_each_entry(mcp_client: TestClient):
+    """Every entry in a create batch gets its own mangled canonical id; same
+    caller-id used twice produces two distinct canonical ids."""
     sid = _initialize(mcp_client)
-    # Set up: create one of the ids the batch will try to create.
-    _call_tool(
-        mcp_client,
-        sid,
-        "write_page",
-        {"frontmatter": _ent_fm("ent-batch-existing", "preset")},
-        req_id=450,
-    )
-    # Batch: 3 entries, the middle one already exists.
     pages = [
-        {"frontmatter": _ent_fm("ent-batch-new-a", "A"), "body": "a"},
-        {"frontmatter": _ent_fm("ent-batch-existing", "X"), "body": "would clobber"},
-        {"frontmatter": _ent_fm("ent-batch-new-b", "B"), "body": "b"},
+        {"frontmatter": _ent_fm("ent-batch-mangle-twin", "A"), "body": "a"},
+        {"frontmatter": _ent_fm("ent-batch-mangle-twin", "B"), "body": "b"},
     ]
     result = _call_tool(
         mcp_client,
         sid,
         "write_pages",
         {"pages": pages, "mode": "create"},
-        req_id=451,
+        req_id=450,
     )
-    assert result["error"] == "already_exists"
-    assert result["index"] == 1
-    assert result["id"] == "ent-batch-existing"
-    # Neither of the new entries (which would have succeeded individually) was written.
-    for pid in ["ent-batch-new-a", "ent-batch-new-b"]:
-        r = _call_tool(mcp_client, sid, "read_page", {"page_id": pid}, req_id=460)
-        assert r.get("error") == "not_found", f"{pid} should NOT have been written"
-    # The existing page must be unchanged.
-    r = _call_tool(
-        mcp_client, sid, "read_page", {"page_id": "ent-batch-existing"}, req_id=461
-    )
-    assert r["title"] == "preset"
+    assert result.get("error") is None, result
+    assert result["count"] == 2
+    canonical_ids = {w["id"] for w in result["written"]}
+    assert len(canonical_ids) == 2, "two creates with same caller id must produce distinct canonical ids"
+    for w in result["written"]:
+        assert w["mangled"] is True
+        assert w["original_id"] == "ent-batch-mangle-twin"
 
 
-def test_write_pages_batch_with_update_mode_aborts_on_missing(mcp_client: TestClient):
-    """If any entry in a `mode=update` batch is missing, the whole batch aborts."""
+def test_write_pages_batch_update_aborts_on_missing_id(mcp_client: TestClient):
+    """Update mode requires every entry's id to be a valid existing
+    canonical id; missing → entire batch aborts."""
     sid = _initialize(mcp_client)
-    # Seed one of the ids
-    _call_tool(
+    # Seed one canonical id first.
+    seed = _call_tool(
         mcp_client,
         sid,
         "write_page",
-        {"frontmatter": _ent_fm("ent-batch-update-existing", "preset")},
+        {"frontmatter": _ent_fm("ent-batch-update-seed", "preset")},
         req_id=470,
     )
+    canonical = seed["id"]
     pages = [
-        {"frontmatter": _ent_fm("ent-batch-update-existing", "X")},  # exists
-        {"frontmatter": _ent_fm("ent-batch-update-missing")},        # doesn't exist
+        {"frontmatter": _ent_fm(canonical, "new title")},   # exists
+        {"frontmatter": _ent_fm("ent-batch-update-nope-AbCdEfGhIjKlMnOpQrStUv")},  # doesn't exist
     ]
     result = _call_tool(
         mcp_client,
@@ -1124,27 +1163,22 @@ def test_write_pages_batch_with_update_mode_aborts_on_missing(mcp_client: TestCl
     )
     assert result["error"] == "not_found"
     assert result["index"] == 1
-    # The existing entry must not have been modified.
-    r = _call_tool(
-        mcp_client, sid, "read_page", {"page_id": "ent-batch-update-existing"}, req_id=472
-    )
+    # The existing entry must NOT have been modified (validate-all-then-act).
+    r = _call_tool(mcp_client, sid, "read_page", {"page_id": canonical}, req_id=472)
     assert r["title"] == "preset"
 
 
-def test_write_pages_batch_create_mode_succeeds_when_all_new(mcp_client: TestClient):
-    """Happy path: every entry new + mode=create → all written, all created=True."""
+def test_write_pages_batch_create_default_mode(mcp_client: TestClient):
+    """Default mode is `create`; every entry gets mangled by default."""
     sid = _initialize(mcp_client)
     pages = [
-        {"frontmatter": _ent_fm("ent-batch-allnew-1", "A")},
-        {"frontmatter": _ent_fm("ent-batch-allnew-2", "B")},
+        {"frontmatter": _ent_fm("ent-batch-default-1", "A")},
+        {"frontmatter": _ent_fm("ent-batch-default-2", "B")},
     ]
     result = _call_tool(
-        mcp_client,
-        sid,
-        "write_pages",
-        {"pages": pages, "mode": "create"},
-        req_id=480,
+        mcp_client, sid, "write_pages", {"pages": pages}, req_id=480
     )
     assert result.get("error") is None, result
+    assert result["mode"] == "create"
     assert result["count"] == 2
-    assert all(w["created"] is True for w in result["written"])
+    assert all(w["mangled"] is True for w in result["written"])

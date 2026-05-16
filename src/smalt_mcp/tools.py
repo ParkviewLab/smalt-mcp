@@ -12,9 +12,11 @@ entry to `TOOLS` plus a handler function. No edits to `server.py` needed.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -602,10 +604,34 @@ async def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ---- write mode + existence helpers ----
+# ---- write mode + existence + canonical-id helpers ----
+#
+# Two write modes:
+#   create : ALWAYS produce a new page. The caller's id contributes to the
+#            slug-prefix; a 22-char URL-safe base64 UUID4 suffix gives
+#            structural uniqueness. The original id is preserved in the
+#            page's `aliases` list. Collision is impossible by construction.
+#   update : The caller's id must match an existing canonical id exactly.
+#            Fails {error: not_found} otherwise. No mangling.
+#
+# There's no `upsert` mode. The two semantics — "make a new thing" and
+# "modify a specific existing thing" — are deliberately distinct under
+# always-mangle, because the caller's id is no longer the canonical id for
+# create-writes. An upsert that sometimes-mangled-sometimes-didn't would
+# be ambiguous and dangerous.
 
 
-_VALID_WRITE_MODES: frozenset[str] = frozenset({"create", "update", "upsert"})
+_VALID_WRITE_MODES: frozenset[str] = frozenset({"create", "update"})
+
+
+def _mangle_id(caller_id: str) -> str:
+    """Append a 22-char URL-safe base64 UUID4 suffix to `caller_id`.
+
+    URL-safe base64 uses [A-Za-z0-9_-], all of which pass our PAGE_ID_RE,
+    so the resulting canonical id re-validates cleanly.
+    """
+    suffix = base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode("ascii")
+    return f"{caller_id}-{suffix}"
 
 
 def _existing_page_path(app: App, page_id: str) -> str | None:
@@ -629,25 +655,24 @@ def _existing_page_path(app: App, page_id: str) -> str | None:
     return arrow.column("path")[0].as_py()
 
 
-def _check_mode_against_existence(
-    mode: str, page_id: str, existing_path: str | None
-) -> dict[str, Any] | None:
-    """Compare requested write mode against current existence; return an error
-    payload if the mode contract is violated, else None."""
-    if mode == "create" and existing_path is not None:
-        return {
-            "error": "already_exists",
-            "id": page_id,
-            "existing_path": existing_path,
-            "message": f"page {page_id!r} already exists; use mode='update' or mode='upsert' to overwrite",
-        }
-    if mode == "update" and existing_path is None:
-        return {
-            "error": "not_found",
-            "id": page_id,
-            "message": f"page {page_id!r} does not exist; use mode='create' or mode='upsert' to insert",
-        }
-    return None
+def _prepare_create_write(fm_in: dict[str, Any]) -> tuple[Page, dict[str, Any], str]:
+    """Prepare a create-mode write: mangle id, preserve original as alias,
+    re-validate, return (page, fm_out, original_id).
+
+    Caller passes the validated `fm_in` (already through PAGE_ADAPTER once).
+    We rebuild the dict with the canonical id + extended aliases, re-validate
+    so the returned `page` reflects the final on-disk shape.
+    """
+    original_id = fm_in["id"]
+    canonical_id = _mangle_id(original_id)
+    fm_out: dict[str, Any] = dict(fm_in)
+    fm_out["id"] = canonical_id
+    aliases = list(fm_out.get("aliases") or [])
+    if original_id not in aliases:
+        aliases.append(original_id)
+    fm_out["aliases"] = aliases
+    page = PAGE_ADAPTER.validate_python(fm_out)
+    return page, fm_out, original_id
 
 
 # ---- handler: write_page (READ_WRITE) ----
@@ -656,56 +681,92 @@ def _check_mode_against_existence(
 async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Write one page (frontmatter + body) and trigger an incremental indexer pass.
 
-    Path is derived from the page's type + id: `pages/<subdir>/<page_id>.md`.
-    Atomic at the filesystem level (tmp-then-rename). Wrapped in the corpus
-    mutex so the existence check + write + indexer pass form a single critical
-    section.
+    `mode='create'` (default): always produces a NEW page. The caller's id
+    becomes the slug-prefix; a 22-char URL-safe base64 UUID4 suffix makes the
+    canonical id structurally unique. The original id is preserved in
+    `aliases`. Returns `{id: <canonical>, original_id: <caller>, ...}` —
+    callers must store the canonical id to address the page later.
 
-    The `mode` arg controls whether the write is restricted:
-      - "create" (strict insert): fail if the id already exists
-      - "update" (strict update): fail if the id does NOT exist
-      - "upsert" (default; backward compatible): always proceed
+    `mode='update'`: requires the caller's id to be an existing canonical id
+    (no mangling, no alias resolution). Fails `{error: 'not_found'}` if no
+    such page is indexed. Use this to modify a specific known page.
 
-    Response includes `created: bool` so callers know which happened regardless
-    of mode.
+    Path: `pages/<subdir>/<canonical-id>.md`. Atomic tmp-then-rename. Both
+    write + indexer pass run inside the corpus single-writer mutex; the
+    existence check (for update) is in the same critical section.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
         return err  # type: ignore[return-value]
 
-    fm = arguments.get("frontmatter")
-    if not fm:
+    fm_in = arguments.get("frontmatter")
+    if not fm_in:
         return {"error": "missing_argument", "message": "frontmatter is required"}
     body = arguments.get("body") or ""
-    mode = arguments.get("mode") or "upsert"
+    mode = arguments.get("mode") or "create"
     if mode not in _VALID_WRITE_MODES:
         return {
             "error": "invalid_argument",
             "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
         }
 
+    # First validation: caller's frontmatter must conform to the Page union.
     try:
-        page = PAGE_ADAPTER.validate_python(fm)
+        PAGE_ADAPTER.validate_python(fm_in)
     except ValidationError as e:
         return {"error": "validation_error", "message": str(e)}
 
-    target = _page_target_path(app.cfg.smalt_dir, page)
+    if mode == "create":
+        # Mangle and re-validate (re-validation is cheap and confirms the
+        # canonical id still passes _validate_id — URL-safe base64 is in the
+        # allowed character set).
+        try:
+            page, fm_out, original_id = _prepare_create_write(fm_in)
+        except ValidationError as e:
+            return {"error": "validation_error", "message": str(e)}
 
+        target = _page_target_path(app.cfg.smalt_dir, page)
+        with app.mutex.acquire("write_page"):
+            # Defensive: UUID4 collision is 2^-122 per pair — effectively zero
+            # — but check anyway so we never silently overwrite.
+            if _existing_page_path(app, page.id) is not None:
+                return {
+                    "error": "uuid_collision",
+                    "id": page.id,
+                    "message": "UUID4 collision (extraordinary); retry the call",
+                }
+            _serialize_and_write_page(target, fm_out, body)
+            index_result = _run_indexer(app)
+
+        return {
+            "id": page.id,
+            "original_id": original_id,
+            "path": str(target.relative_to(app.cfg.smalt_dir)),
+            "type": page.type.value,
+            "mode": "create",
+            "mangled": True,
+            "index_result": index_result,
+        }
+
+    # mode == "update"
+    page = PAGE_ADAPTER.validate_python(fm_in)  # re-validate (cheap) to bind .id/.type
+    target = _page_target_path(app.cfg.smalt_dir, page)
     with app.mutex.acquire("write_page"):
-        existing_path = _existing_page_path(app, page.id)
-        mode_err = _check_mode_against_existence(mode, page.id, existing_path)
-        if mode_err is not None:
-            return mode_err
-        created = existing_path is None
-        _serialize_and_write_page(target, fm, body)
+        if _existing_page_path(app, page.id) is None:
+            return {
+                "error": "not_found",
+                "id": page.id,
+                "message": f"page {page.id!r} does not exist; use mode='create' to insert (it will be mangled)",
+            }
+        _serialize_and_write_page(target, fm_in, body)
         index_result = _run_indexer(app)
 
     return {
         "id": page.id,
         "path": str(target.relative_to(app.cfg.smalt_dir)),
         "type": page.type.value,
-        "mode": mode,
-        "created": created,
+        "mode": "update",
+        "mangled": False,
         "index_result": index_result,
     }
 
@@ -716,14 +777,20 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Batch-write a list of pages with a single indexer pass at the end.
 
-    Validate-all-then-write contract:
-      1. Every page's frontmatter is validated against the Page Pydantic union.
-      2. If a `mode` is set ("create" or "update"), every entry's id is checked
-         against the existence table BEFORE any writes happen.
-      3. If any check fails, no writes occur; the response reports the
-         offending index.
+    Same mode semantics as `write_page`: `create` mangles every id;
+    `update` requires every id to exist already. The mode applies uniformly
+    to the whole batch.
 
-    The `mode` arg applies to every entry uniformly; default is "upsert".
+    Validate-all-then-act contract:
+      1. Every entry's frontmatter is validated up front.
+      2. For `mode='update'`, every entry's id is checked for existence
+         before any writes happen.
+      3. Any validation or mode-check failure aborts the entire batch;
+         the response reports the offending index.
+
+    `mode='create'` cannot fail per-entry on collision (mangling makes
+    every id unique by construction), so phase 2's existence check is a
+    no-op in that mode.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -732,15 +799,15 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     items = arguments.get("pages")
     if not items or not isinstance(items, list):
         return {"error": "missing_argument", "message": "pages must be a non-empty list"}
-    mode = arguments.get("mode") or "upsert"
+    mode = arguments.get("mode") or "create"
     if mode not in _VALID_WRITE_MODES:
         return {
             "error": "invalid_argument",
             "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
         }
 
-    # Phase 1 (no disk touch): validate every entry's frontmatter.
-    validated: list[tuple[Page, dict[str, Any], str]] = []
+    # Phase 1: validate every entry's frontmatter (no disk).
+    validated: list[tuple[dict[str, Any], str]] = []
     for i, entry in enumerate(items):
         if not isinstance(entry, dict):
             return {"error": "validation_error", "index": i, "message": "each entry must be an object"}
@@ -749,36 +816,59 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             return {"error": "validation_error", "index": i, "message": "frontmatter is required"}
         body = entry.get("body") or ""
         try:
-            page = PAGE_ADAPTER.validate_python(fm)
+            PAGE_ADAPTER.validate_python(fm)
         except ValidationError as e:
             return {"error": "validation_error", "index": i, "message": str(e)}
-        validated.append((page, fm, body))
+        validated.append((fm, body))
 
     written: list[dict[str, Any]] = []
     with app.mutex.acquire("write_pages"):
-        # Phase 2 (still no disk touch): mode-vs-existence checks, all-or-nothing.
-        existences: list[str | None] = []
-        for i, (page, _fm, _body) in enumerate(validated):
-            existing_path = _existing_page_path(app, page.id)
-            mode_err = _check_mode_against_existence(mode, page.id, existing_path)
-            if mode_err is not None:
-                # Annotate with which entry failed; abort the whole batch.
-                mode_err["index"] = i
-                return mode_err
-            existences.append(existing_path)
+        if mode == "update":
+            # Phase 2: every id must already exist (all-or-nothing).
+            for i, (fm, _body) in enumerate(validated):
+                if _existing_page_path(app, fm["id"]) is None:
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "id": fm["id"],
+                        "message": f"page {fm['id']!r} does not exist; batch aborted",
+                    }
 
-        # Phase 3: commit. All checks passed; write every page.
-        for (page, fm, body), existing_path in zip(validated, existences, strict=True):
-            target = _page_target_path(app.cfg.smalt_dir, page)
-            _serialize_and_write_page(target, fm, body)
-            written.append(
-                {
-                    "id": page.id,
-                    "path": str(target.relative_to(app.cfg.smalt_dir)),
-                    "type": page.type.value,
-                    "created": existing_path is None,
-                }
-            )
+        # Phase 3: commit each entry.
+        for fm_in, body in validated:
+            if mode == "create":
+                page, fm_out, original_id = _prepare_create_write(fm_in)
+                target = _page_target_path(app.cfg.smalt_dir, page)
+                # UUID collision check (defensive)
+                if _existing_page_path(app, page.id) is not None:
+                    return {
+                        "error": "uuid_collision",
+                        "id": page.id,
+                        "message": "UUID4 collision (extraordinary); retry the batch",
+                    }
+                _serialize_and_write_page(target, fm_out, body)
+                written.append(
+                    {
+                        "id": page.id,
+                        "original_id": original_id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mangled": True,
+                    }
+                )
+            else:  # update
+                page = PAGE_ADAPTER.validate_python(fm_in)
+                target = _page_target_path(app.cfg.smalt_dir, page)
+                _serialize_and_write_page(target, fm_in, body)
+                written.append(
+                    {
+                        "id": page.id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mangled": False,
+                    }
+                )
+
         index_result = _run_indexer(app)
 
     return {
@@ -1215,23 +1305,25 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="write_page",
             description=(
-                "Create or update one page. The frontmatter must conform to "
-                "the Page Pydantic union (entity / concept / source / "
-                "synthesis discriminated by the `type` field). The file is "
-                "written atomically (tmp-then-rename) at "
-                "`pages/<subdir>/<page_id>.md`, where <subdir> derives from "
-                "the page's type. After the write, an incremental indexer "
-                "pass refreshes the LanceDB tables; the response includes "
-                "the indexer's summary. Both write and index run inside the "
-                "corpus single-writer mutex.\n\n"
-                "The `mode` arg restricts what writes are allowed:\n"
-                "  - `create` (strict insert): fail with `{error: 'already_exists'}` "
-                "if the id is already indexed.\n"
-                "  - `update` (strict update): fail with `{error: 'not_found'}` "
-                "if the id is not already indexed.\n"
-                "  - `upsert` (default): always proceed; existing id overwrites.\n\n"
-                "The response includes `created: bool` so callers know which "
-                "happened regardless of mode."
+                "Write one page (frontmatter + body) and trigger an "
+                "incremental indexer pass.\n\n"
+                "Two modes:\n"
+                "  - `create` (DEFAULT): always produces a NEW page. The "
+                "caller's id becomes the slug-prefix; a 22-char URL-safe "
+                "base64 UUID4 suffix is appended to make the canonical id "
+                "structurally unique (collision is impossible). The "
+                "original id is preserved in the page's `aliases` list. "
+                "Response includes `id` (canonical), `original_id` (what "
+                "the caller sent), and `mangled: true`. Callers must store "
+                "the canonical id to address the page later.\n"
+                "  - `update`: the caller's id must be an existing canonical "
+                "id (no mangling, no alias resolution). Fails "
+                "`{error: 'not_found'}` if no such page is indexed. Use "
+                "this to modify a specific known page.\n\n"
+                "Path: `pages/<subdir>/<canonical-id>.md`. Atomic "
+                "tmp-then-rename. Write + indexer run inside the corpus "
+                "single-writer mutex; the existence check (for update) is "
+                "in the same critical section."
             ),
             inputSchema={
                 "type": "object",
@@ -1239,13 +1331,13 @@ TOOLS: list[ToolDef] = [
                     "frontmatter": {
                         "type": "object",
                         "description": (
-                            "Full page frontmatter. Required keys: id, type, "
-                            "title. Other keys per the page-type schema "
-                            "(see smalt_mcp/schema.py). Note: the id is "
+                            "Full page frontmatter. Required keys: id, "
+                            "type, title. Other keys per the page-type "
+                            "schema (see smalt_mcp/schema.py). The id is "
                             "validated for path-safety + portability "
-                            "(alphanumeric + underscore + hyphen, no leading "
-                            "dash/underscore, 1..254 chars, not a Windows-"
-                            "reserved name)."
+                            "(alphanumeric + underscore + hyphen, no "
+                            "leading dash/underscore, 1..254 chars, not a "
+                            "Windows-reserved name)."
                         ),
                     },
                     "body": {
@@ -1256,12 +1348,14 @@ TOOLS: list[ToolDef] = [
                     "mode": {
                         "type": "string",
                         "description": (
-                            "Write mode. `create` = strict insert (fail if id "
-                            "exists); `update` = strict update (fail if id "
-                            "doesn't exist); `upsert` = either."
+                            "Write mode. `create` (default) always creates "
+                            "a new page with a mangled canonical id. "
+                            "`update` requires the caller's id to be an "
+                            "existing canonical id and modifies that page "
+                            "in place."
                         ),
-                        "enum": ["create", "update", "upsert"],
-                        "default": "upsert",
+                        "enum": ["create", "update"],
+                        "default": "create",
                     },
                 },
                 "required": ["frontmatter"],
@@ -1275,14 +1369,19 @@ TOOLS: list[ToolDef] = [
             name="write_pages",
             description=(
                 "Batch-write a list of pages with a single indexer pass at "
-                "the end. Validate-all-then-write contract:\n"
-                "  1. Every page's frontmatter is validated up front.\n"
-                "  2. If `mode` is `create` or `update`, every entry's id is "
-                "checked against the index BEFORE any writes happen.\n"
-                "  3. If any validation or mode check fails, no writes occur; "
-                "the response reports the offending index.\n\n"
-                "After all checks pass, writes proceed sequentially under the "
-                "corpus mutex; the indexer runs once at the end."
+                "the end. Same mode semantics as `write_page`: `create` "
+                "mangles every id; `update` requires every id to exist "
+                "already.\n\n"
+                "Validate-all-then-act contract:\n"
+                "  1. Every entry's frontmatter is validated up front.\n"
+                "  2. For `mode='update'`, every entry's id is checked "
+                "for existence before any writes happen. Missing id "
+                "aborts the entire batch with `{error: 'not_found', "
+                "index: N}`.\n"
+                "  3. For `mode='create'`, no existence check is needed "
+                "(mangling makes each id unique by construction).\n\n"
+                "After all checks pass, writes proceed sequentially under "
+                "the corpus mutex; the indexer runs once at the end."
             ),
             inputSchema={
                 "type": "object",
@@ -1303,11 +1402,11 @@ TOOLS: list[ToolDef] = [
                         "type": "string",
                         "description": (
                             "Write mode applied uniformly to every entry. "
-                            "`create` = all must be new; `update` = all must "
-                            "already exist; `upsert` = either."
+                            "`create` (default) mangles each id; "
+                            "`update` requires each id to already exist."
                         ),
-                        "enum": ["create", "update", "upsert"],
-                        "default": "upsert",
+                        "enum": ["create", "update"],
+                        "default": "create",
                     },
                 },
                 "required": ["pages"],
