@@ -246,37 +246,61 @@ async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"pages": out_pages, "count": len(out_pages)}
 
 
-# ---- handler: read_page ----
+# ---- alias-lookup helpers (shared by find_by_alias + read_page fallback) ----
 
 
-async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Return the frontmatter (parsed) + body of a single page by id."""
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+def _find_pages_by_alias(app: App, alias: str) -> list[dict[str, Any]]:
+    """Return every indexed page whose `aliases` list contains `alias`.
 
-    page_id = arguments.get("page_id")
-    if not page_id:
-        return {"error": "missing_argument", "message": "page_id is required"}
-
+    Scans the pages table's `frontmatter_json` column — no LanceDB-side
+    index on aliases today, so this is O(pages). Fine for typical Smalts
+    (thousands of pages); when we hit limits we'll add an aliases table.
+    """
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
     arrow = (
         pages.search()
-        .where(f"id = {lance.sql_str(page_id)}")
+        .select(["id", "title", "type", "path", "frontmatter_json"])
+        .to_arrow()
+    )
+    matches: list[dict[str, Any]] = []
+    for i in range(arrow.num_rows):
+        fm_raw = arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            continue
+        aliases = fm.get("aliases") or []
+        if alias in aliases:
+            matches.append(
+                {
+                    "id": arrow.column("id")[i].as_py(),
+                    "title": arrow.column("title")[i].as_py(),
+                    "type": arrow.column("type")[i].as_py(),
+                    "path": arrow.column("path")[i].as_py(),
+                }
+            )
+    return matches
+
+
+def _fetch_page_row(app: App, canonical_id: str) -> dict[str, Any] | None:
+    """Return the full read_page payload for `canonical_id`, or None if not indexed."""
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .where(f"id = {lance.sql_str(canonical_id)}")
         .select(["id", "title", "type", "path", "body", "frontmatter_json"])
         .limit(1)
         .to_arrow()
     )
     if arrow.num_rows == 0:
-        return {"error": "not_found", "page_id": page_id}
-
+        return None
     fm_raw = arrow.column("frontmatter_json")[0].as_py()
     try:
         fm = json.loads(fm_raw) if fm_raw else {}
     except json.JSONDecodeError:
         fm = {}
-
     return {
         "id": arrow.column("id")[0].as_py(),
         "title": arrow.column("title")[0].as_py(),
@@ -285,6 +309,78 @@ async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         "body": arrow.column("body")[0].as_py(),
         "frontmatter": fm,
     }
+
+
+# ---- handler: read_page ----
+
+
+async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the frontmatter (parsed) + body of a single page.
+
+    Lookup order:
+      1. Exact match on the canonical `id`. If found, return.
+      2. Alias fallback: search every page's `aliases` for `page_id`.
+         - Exactly one match → return that page, with `resolved_via_alias: true`.
+         - Two or more matches → `{error: 'ambiguous_alias', matches: [...]}`.
+         - Zero matches → `{error: 'not_found', page_id: ...}`.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+
+    # 1. Exact id match
+    payload = _fetch_page_row(app, page_id)
+    if payload is not None:
+        return payload
+
+    # 2. Alias fallback
+    matches = _find_pages_by_alias(app, page_id)
+    if not matches:
+        return {"error": "not_found", "page_id": page_id}
+    if len(matches) > 1:
+        return {
+            "error": "ambiguous_alias",
+            "alias": page_id,
+            "matches": matches,
+            "message": (
+                f"alias {page_id!r} matches {len(matches)} pages; "
+                "address by canonical id (use the `id` field of one of the matches above)"
+            ),
+        }
+    # Exactly one match — fetch the full row.
+    canonical = matches[0]["id"]
+    payload = _fetch_page_row(app, canonical)
+    if payload is None:  # shouldn't happen — index just told us this exists
+        return {"error": "not_found", "page_id": canonical}
+    payload["resolved_via_alias"] = page_id
+    return payload
+
+
+# ---- handler: find_by_alias ----
+
+
+async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List every page whose `aliases` contains `alias`.
+
+    Use this when you have a memorable handle (the original caller-id
+    before mangling, or any hand-added alias) and want to find the page(s)
+    it maps to. Returns minimal metadata (id, title, type, path) per match
+    — call `read_page` with the canonical `id` to get the body.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    alias = arguments.get("alias")
+    if not alias:
+        return {"error": "missing_argument", "message": "alias is required"}
+
+    matches = _find_pages_by_alias(app, alias)
+    return {"alias": alias, "matches": matches, "count": len(matches)}
 
 
 # ---- handler: traverse ----
@@ -1143,15 +1239,30 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="read_page",
             description=(
-                "Return one page's full body + parsed frontmatter, looked up "
-                "by id. Returns `{error: 'not_found'}` if the id isn't indexed."
+                "Return one page's full body + parsed frontmatter.\n\n"
+                "Lookup order:\n"
+                "  1. Exact match on the canonical `id`.\n"
+                "  2. Alias fallback: if no exact match, search every "
+                "page's `aliases` for `page_id`.\n"
+                "      - 1 match → return that page; response includes "
+                "`resolved_via_alias: <the alias>`.\n"
+                "      - 2+ matches → `{error: 'ambiguous_alias', "
+                "matches: [...]}` (caller must pick a canonical id).\n"
+                "      - 0 matches → `{error: 'not_found'}`.\n\n"
+                "Use `find_by_alias` if you want the full match list "
+                "without picking one."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "page_id": {
                         "type": "string",
-                        "description": "The page id, e.g. 'ent-alice' or 'con-embedding'.",
+                        "description": (
+                            "Canonical page id (e.g. 'ent-alice-XYZ…') or a "
+                            "known alias (e.g. 'ent-alice'). Exact-id "
+                            "lookup runs first; alias fallback is "
+                            "automatic."
+                        ),
                     },
                 },
                 "required": ["page_id"],
@@ -1159,6 +1270,32 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=read_page,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="find_by_alias",
+            description=(
+                "List every page whose `aliases` contains `alias`. "
+                "Returns minimal metadata per match (id, title, type, "
+                "path); call `read_page` on a canonical id to get the "
+                "body. Useful when you have a memorable handle (the "
+                "original caller-id before write_page mangling, or any "
+                "hand-added alias) and want to see which page(s) it maps "
+                "to."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "alias": {
+                        "type": "string",
+                        "description": "The alias to look up.",
+                    },
+                },
+                "required": ["alias"],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=find_by_alias,
     ),
     ToolDef(
         spec=types.Tool(

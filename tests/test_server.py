@@ -147,6 +147,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "status",
         "list_pages",
         "read_page",
+        "find_by_alias",
         "traverse",
         "search",
         "list_domains",
@@ -1182,3 +1183,147 @@ def test_write_pages_batch_create_default_mode(mcp_client: TestClient):
     assert result["mode"] == "create"
     assert result["count"] == 2
     assert all(w["mangled"] is True for w in result["written"])
+
+
+# ---------------------------------------------------------------------------
+# find_by_alias + read_page alias fallback
+
+
+def test_find_by_alias_finds_post_mangle_caller_id(mcp_client: TestClient):
+    """After write_page creates a mangled page, find_by_alias on the caller's
+    original id returns the canonical match."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-alias-find-test")
+    create = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=500
+    )
+    canonical = create["id"]
+    # Look up by caller's original id (which is in aliases).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-alias-find-test"},
+        req_id=501,
+    )
+    assert result["count"] >= 1
+    canonical_ids = {m["id"] for m in result["matches"]}
+    assert canonical in canonical_ids
+    # The matched row has the expected shape.
+    for m in result["matches"]:
+        assert {"id", "title", "type", "path"} <= m.keys()
+
+
+def test_find_by_alias_returns_empty_for_unknown(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "no-such-alias-anywhere"},
+        req_id=502,
+    )
+    assert result["count"] == 0
+    assert result["matches"] == []
+
+
+def test_find_by_alias_returns_all_matches_for_collision(mcp_client: TestClient):
+    """Two creates with the same caller id produce two pages sharing one
+    alias; find_by_alias returns both."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-alias-twin", "A")
+    a = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=503)
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": {**fm, "title": "B"}},
+        req_id=504,
+    )
+    result = _call_tool(
+        mcp_client, sid, "find_by_alias", {"alias": "ent-alias-twin"}, req_id=505
+    )
+    assert result["count"] >= 2
+    ids = {m["id"] for m in result["matches"]}
+    assert a["id"] in ids
+    assert b["id"] in ids
+
+
+def test_read_page_falls_back_to_alias_when_single_match(mcp_client: TestClient):
+    """A page created via write_page has a mangled canonical id; calling
+    read_page with the caller's id (now an alias) resolves to that page
+    and the response includes `resolved_via_alias`."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-alias-readback", "Read via alias")
+    create = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=510
+    )
+    canonical = create["id"]
+    # Call read_page with the caller's original id (not the canonical).
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-alias-readback"},
+        req_id=511,
+    )
+    assert read.get("error") is None, read
+    assert read["id"] == canonical
+    assert read["title"] == "Read via alias"
+    assert read.get("resolved_via_alias") == "ent-alias-readback"
+
+
+def test_read_page_exact_id_wins_over_alias(mcp_client: TestClient):
+    """If the page_id is itself a canonical id, exact match returns first
+    (no `resolved_via_alias` field)."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-alias-exact-wins")
+    create = _call_tool(
+        mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=520
+    )
+    canonical = create["id"]
+    # Exact-id read: no alias resolution should happen.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": canonical}, req_id=521
+    )
+    assert read["id"] == canonical
+    assert "resolved_via_alias" not in read
+
+
+def test_read_page_ambiguous_alias_returns_match_list(mcp_client: TestClient):
+    """When the page_id matches multiple pages' aliases, read_page errors
+    with {error: 'ambiguous_alias', matches: [...]} so the caller can pick
+    one by canonical id."""
+    sid = _initialize(mcp_client)
+    fm = _ent_fm("ent-alias-ambig", "First")
+    a = _call_tool(mcp_client, sid, "write_page", {"frontmatter": fm}, req_id=530)
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": {**fm, "title": "Second"}},
+        req_id=531,
+    )
+    # Now `ent-alias-ambig` is an alias on two distinct canonical ids.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-alias-ambig"},
+        req_id=532,
+    )
+    assert read["error"] == "ambiguous_alias"
+    assert read["alias"] == "ent-alias-ambig"
+    match_ids = {m["id"] for m in read["matches"]}
+    assert a["id"] in match_ids
+    assert b["id"] in match_ids
+
+
+def test_read_page_unknown_id_or_alias_still_returns_not_found(mcp_client: TestClient):
+    """Truly missing id/alias still returns the existing not_found error."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-truly-missing"}, req_id=540
+    )
+    assert result["error"] == "not_found"
+    assert result["page_id"] == "ent-truly-missing"
