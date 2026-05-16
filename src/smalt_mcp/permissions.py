@@ -1,0 +1,50 @@
+"""Read-only vs. read-write scope filter.
+
+Tools are tagged with a `Scope` at registration time. The server's tool
+registry consults this when listing or dispatching tools, so:
+
+- External (untrusted) clients see only `READ_ONLY` tools.
+- Internal SME agents (clients that present the configured shared token) see
+  both `READ_ONLY` and `READ_WRITE`.
+
+The token check is intentionally trivial today — a single shared secret in
+the `SMALT_INTERNAL_TOKEN` env var. If unset, all clients are treated as
+internal (single-user dev mode). This gets tightened when smalt-mcp grows up:
+- Per-agent tokens (e.g., one for the ingest SME, one for retrieve).
+- Optional mTLS or OAuth front-ends for hosted deployments.
+"""
+
+from __future__ import annotations
+
+import os
+from enum import StrEnum
+
+
+class Scope(StrEnum):
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+
+
+# Single shared secret for v0. Internal clients present this token; external
+# clients don't. If unset (dev mode), everyone is internal.
+_INTERNAL_TOKEN_ENV = "SMALT_INTERNAL_TOKEN"
+
+
+def expected_internal_token() -> str | None:
+    """Return the configured internal token, or None if not set (dev mode)."""
+    return os.environ.get(_INTERNAL_TOKEN_ENV) or None
+
+
+def scope_for_token(presented: str | None) -> Scope:
+    """Map a presented token to a scope.
+
+    Dev mode (no token configured): every client is treated as internal.
+    Configured: only callers presenting the matching token get READ_WRITE;
+    everyone else is READ_ONLY.
+    """
+    expected = expected_internal_token()
+    if expected is None:
+        return Scope.READ_WRITE
+    if presented and presented == expected:
+        return Scope.READ_WRITE
+    return Scope.READ_ONLY
