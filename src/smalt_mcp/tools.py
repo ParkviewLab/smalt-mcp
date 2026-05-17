@@ -568,10 +568,19 @@ async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
     Lookup order:
       1. Exact match on the canonical `id`. If found, return.
-      2. Alias fallback: search every page's `aliases` for `page_id`.
-         - Exactly one match → return that page, with `resolved_via_alias: true`.
+      2. Exact alias fallback: search every page's `aliases` for `page_id`.
+         - Exactly one match → return that page, with `resolved_via_alias`.
          - Two or more matches → `{error: 'ambiguous_alias', matches: [...]}`.
-         - Zero matches → `{error: 'not_found', page_id: ...}`.
+         - Zero matches → fall through to step 3.
+      3. Fuzzy alias fallback (C-11; opt-out via `fuzzy=false`): trigram-
+         Jaccard match `page_id` against every page's aliases.
+         - Exactly one match → return that page, with
+           `resolved_via_alias` + `fuzzy: true` + `fuzzy_score` +
+           `matched_alias`.
+         - Two or more matches → `{error: 'ambiguous_alias',
+           matches: [...], fuzzy: true}`.
+         - Zero matches → `{error: 'not_found', page_id: ..., fuzzy: true}`
+           (the `fuzzy: true` here signals we tried but didn't find).
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -580,32 +589,67 @@ async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     page_id = arguments.get("page_id")
     if not page_id:
         return {"error": "missing_argument", "message": "page_id is required"}
+    fuzzy = arguments.get("fuzzy", True)
 
     # 1. Exact id match
     payload = _fetch_page_row(app, page_id)
     if payload is not None:
         return payload
 
-    # 2. Alias fallback
+    # 2. Exact alias fallback
     matches = _find_pages_by_alias(app, page_id)
-    if not matches:
+    if matches:
+        if len(matches) > 1:
+            return {
+                "error": "ambiguous_alias",
+                "alias": page_id,
+                "matches": matches,
+                "fuzzy": False,
+                "message": (
+                    f"alias {page_id!r} matches {len(matches)} pages; "
+                    "address by canonical id (use the `id` field of one of the matches above)"
+                ),
+            }
+        # Exactly one exact match — fetch the full row.
+        canonical = matches[0]["id"]
+        payload = _fetch_page_row(app, canonical)
+        if payload is None:  # shouldn't happen — index just told us this exists
+            return {"error": "not_found", "page_id": canonical}
+        payload["resolved_via_alias"] = page_id
+        return payload
+
+    # 3. Fuzzy alias fallback (opt-out via fuzzy=false).
+    if not fuzzy:
         return {"error": "not_found", "page_id": page_id}
-    if len(matches) > 1:
+    fuzzy_matches = _find_pages_by_alias_fuzzy(app, page_id)
+    if not fuzzy_matches:
+        return {
+            "error": "not_found",
+            "page_id": page_id,
+            "fuzzy": True,
+            "fuzzy_threshold": _fuzzy_alias_threshold(),
+        }
+    if len(fuzzy_matches) > 1:
         return {
             "error": "ambiguous_alias",
             "alias": page_id,
-            "matches": matches,
+            "matches": fuzzy_matches,
+            "fuzzy": True,
+            "fuzzy_threshold": _fuzzy_alias_threshold(),
             "message": (
-                f"alias {page_id!r} matches {len(matches)} pages; "
-                "address by canonical id (use the `id` field of one of the matches above)"
+                f"alias {page_id!r} fuzzy-matches {len(fuzzy_matches)} pages "
+                f"at threshold {_fuzzy_alias_threshold()}; address by canonical id "
+                "(use the `id` field of one of the matches above)"
             ),
         }
-    # Exactly one match — fetch the full row.
-    canonical = matches[0]["id"]
+    canonical = fuzzy_matches[0]["id"]
     payload = _fetch_page_row(app, canonical)
     if payload is None:  # shouldn't happen — index just told us this exists
         return {"error": "not_found", "page_id": canonical}
     payload["resolved_via_alias"] = page_id
+    payload["fuzzy"] = True
+    payload["fuzzy_score"] = fuzzy_matches[0]["fuzzy_score"]
+    payload["matched_alias"] = fuzzy_matches[0]["matched_alias"]
     return payload
 
 
@@ -619,6 +663,15 @@ async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     before mangling, or any hand-added alias) and want to find the page(s)
     it maps to. Returns minimal metadata (id, title, type, path) per match
     — call `read_page` with the canonical `id` to get the body.
+
+    Resolution order (C-11):
+      1. Exact alias match. If any matches, return them — `fuzzy: false`.
+      2. If `fuzzy` arg is true (default) and step 1 returned zero
+         matches, fall back to trigram-Jaccard fuzzy match. Returned rows
+         include `fuzzy_score` (Jaccard sim ∈ [threshold, 1.0]) and
+         `matched_alias` (the alias string that scored highest for that
+         page). Top-level `fuzzy: true` flags the fallback fired.
+      3. If still zero, return `count: 0` (no error).
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -627,9 +680,26 @@ async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     alias = arguments.get("alias")
     if not alias:
         return {"error": "missing_argument", "message": "alias is required"}
+    fuzzy = arguments.get("fuzzy", True)
 
     matches = _find_pages_by_alias(app, alias)
-    return {"alias": alias, "matches": matches, "count": len(matches)}
+    if matches:
+        return {
+            "alias": alias,
+            "matches": matches,
+            "count": len(matches),
+            "fuzzy": False,
+        }
+    if not fuzzy:
+        return {"alias": alias, "matches": [], "count": 0, "fuzzy": False}
+    fuzzy_matches = _find_pages_by_alias_fuzzy(app, alias)
+    return {
+        "alias": alias,
+        "matches": fuzzy_matches,
+        "count": len(fuzzy_matches),
+        "fuzzy": bool(fuzzy_matches),
+        "fuzzy_threshold": _fuzzy_alias_threshold(),
+    }
 
 
 # ---- handler: traverse ----
@@ -875,6 +945,167 @@ def _find_alias_matches_legacy_scan(app: App, query: str) -> list[str]:
         if aliases & needles:
             matches.append(arrow.column("id")[i].as_py())
     return matches
+
+
+# ---- fuzzy alias match (C-11) ----
+#
+# Trigram-set Jaccard similarity over the alias strings. Used as a
+# fallback by `find_by_alias` and `read_page` when exact match returns
+# zero hits. Search retrieval (`_find_alias_matches` above) stays
+# exact-only — fuzzy noise in the RRF set would degrade ranking quality
+# more than it'd help with typo tolerance.
+#
+# Why trigrams + Jaccard? Slug-shape aliases ("ent-alice",
+# "domain-cogitate-methodology") are short and structured; trigrams
+# capture local character order well, Jaccard penalizes length mismatch
+# heavily so unrelated short strings don't drag in spuriously. The
+# tradeoff vs. Levenshtein: Jaccard is set-based (no edit-distance
+# matrix), evaluates in O(|a| + |b|) per pair, and scores ~equivalently
+# on the typo / near-miss cases we care about.
+#
+# Threshold: 0.6 default. "ent-alic" vs "ent-alice" ≈ 0.857 (passes);
+# "ent-alice" vs "ent-bob" ≈ 0.2 (correctly excluded); "ent-alice" vs
+# "ent-alicia" ≈ 0.667 (passes — both spellings near-match). Tightening
+# above ~0.7 starts missing common typos; loosening below ~0.5 starts
+# dragging in unrelated slugs. Override via env for ops tuning.
+_FUZZY_ALIAS_THRESHOLD_ENV = "SMALT_FUZZY_ALIAS_THRESHOLD"
+_DEFAULT_FUZZY_ALIAS_THRESHOLD = 0.6
+
+
+def _fuzzy_alias_threshold() -> float:
+    """Read the fuzzy-match threshold from env, falling back to the default.
+
+    Invalid env values (non-numeric, out of `(0, 1]`) log a warning and
+    fall back to default so a typo in deployment config doesn't silently
+    disable the fallback.
+    """
+    raw = os.environ.get(_FUZZY_ALIAS_THRESHOLD_ENV)
+    if raw is None or raw == "":
+        return _DEFAULT_FUZZY_ALIAS_THRESHOLD
+    try:
+        v = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not numeric; using default %s",
+            _FUZZY_ALIAS_THRESHOLD_ENV,
+            raw,
+            _DEFAULT_FUZZY_ALIAS_THRESHOLD,
+        )
+        return _DEFAULT_FUZZY_ALIAS_THRESHOLD
+    if not (0.0 < v <= 1.0):
+        logger.warning(
+            "%s=%r is out of range (need float in (0, 1]); using default %s",
+            _FUZZY_ALIAS_THRESHOLD_ENV,
+            raw,
+            _DEFAULT_FUZZY_ALIAS_THRESHOLD,
+        )
+        return _DEFAULT_FUZZY_ALIAS_THRESHOLD
+    return v
+
+
+def _trigram_set(s: str) -> set[str]:
+    """Char-trigram (3-gram) set of `s`, lower-cased.
+
+    Returns empty for strings shorter than 3 chars (caller treats that
+    as "can't fuzzy match — must be exact"). No padding chars: slug
+    aliases are short enough that boundary padding would dominate the
+    intersection and inflate scores misleadingly.
+    """
+    s = s.lower()
+    if len(s) < 3:
+        return set()
+    return {s[i : i + 3] for i in range(len(s) - 2)}
+
+
+def _jaccard_trigram(a: str, b: str) -> float:
+    """Trigram-set Jaccard similarity: |A ∩ B| / |A ∪ B|.
+
+    Returns 0.0 if either operand's trigram set is empty (string < 3
+    chars) or if both are empty (so the union is empty too).
+    """
+    sa = _trigram_set(a)
+    sb = _trigram_set(b)
+    if not sa or not sb:
+        return 0.0
+    union = sa | sb
+    if not union:
+        return 0.0
+    return len(sa & sb) / len(union)
+
+
+def _find_pages_by_alias_fuzzy(
+    app: App, query: str, *, threshold: float | None = None
+) -> list[dict[str, Any]]:
+    """Fuzzy-match `query` against every page's aliases via trigram Jaccard.
+
+    Returns matches sorted by similarity (highest first). Each row carries
+    the standard `{id, title, type, path}` shape plus:
+      - `fuzzy_score`: float in [threshold, 1.0], the alias's best score
+      - `matched_alias`: the alias string that scored highest for this page
+
+    Implementation note: O(N pages × M aliases per page) score evaluations.
+    Acceptable at hundreds-to-low-thousands of pages — at our current
+    scale a 1k-page Smalt with ~3 aliases per page scores in ms. If this
+    becomes a bottleneck, materialize a trigram inverted index (separate
+    Lance table keyed by trigram); defer that until a real-world Smalt
+    is large enough to feel it.
+
+    Tie-breaking: rows with equal `fuzzy_score` ordered by `id`
+    (deterministic; doesn't depend on scan order, so callers see a
+    stable list across runs).
+    """
+    threshold = (
+        threshold if threshold is not None else _fuzzy_alias_threshold()
+    )
+    query_set = _trigram_set(query)
+    if not query_set:
+        return []
+
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    has_col = "aliases" in pages.schema.names
+    cols = ["id", "title", "type", "path"]
+    if has_col:
+        cols.append("aliases")
+    else:
+        cols.append("frontmatter_json")
+    arrow = pages.search().select(cols).limit(10_000).to_arrow()
+
+    results: list[tuple[float, str, dict[str, Any]]] = []
+    for i in range(arrow.num_rows):
+        if has_col:
+            aliases = arrow.column("aliases")[i].as_py() or []
+        else:
+            fm_raw = arrow.column("frontmatter_json")[i].as_py()
+            try:
+                fm = json.loads(fm_raw) if fm_raw else {}
+            except json.JSONDecodeError:
+                continue
+            aliases = fm.get("aliases") or []
+        if not aliases:
+            continue
+        best_score = 0.0
+        best_alias: str | None = None
+        for alias in aliases:
+            score = _jaccard_trigram(query, alias)
+            if score > best_score:
+                best_score = score
+                best_alias = alias
+        if best_score >= threshold and best_alias is not None:
+            pid = arrow.column("id")[i].as_py()
+            row = {
+                "id": pid,
+                "title": arrow.column("title")[i].as_py(),
+                "type": arrow.column("type")[i].as_py(),
+                "path": arrow.column("path")[i].as_py(),
+                "fuzzy_score": round(best_score, 4),
+                "matched_alias": best_alias,
+            }
+            results.append((best_score, pid, row))
+
+    # Sort by score desc, then id asc for deterministic ordering on ties.
+    results.sort(key=lambda triple: (-triple[0], triple[1]))
+    return [row for _, _, row in results]
 
 
 async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2807,13 +3038,25 @@ TOOLS: list[ToolDef] = [
                 "Return one page's full body + parsed frontmatter.\n\n"
                 "Lookup order:\n"
                 "  1. Exact match on the canonical `id`.\n"
-                "  2. Alias fallback: if no exact match, search every "
-                "page's `aliases` for `page_id`.\n"
+                "  2. Exact alias fallback: if no exact match, search "
+                "every page's `aliases` for `page_id`.\n"
                 "      - 1 match → return that page; response includes "
                 "`resolved_via_alias: <the alias>`.\n"
                 "      - 2+ matches → `{error: 'ambiguous_alias', "
                 "matches: [...]}` (caller must pick a canonical id).\n"
-                "      - 0 matches → `{error: 'not_found'}`.\n\n"
+                "      - 0 matches → fall through to step 3.\n"
+                "  3. **Fuzzy alias fallback** (C-11; default on, opt-out "
+                "via `fuzzy: false`): trigram-Jaccard match `page_id` "
+                "against every page's aliases.\n"
+                "      - 1 match → return that page; response includes "
+                "`resolved_via_alias` + `fuzzy: true` + `fuzzy_score` + "
+                "`matched_alias`.\n"
+                "      - 2+ matches → `{error: 'ambiguous_alias', "
+                "matches: [...], fuzzy: true}`.\n"
+                "      - 0 matches → `{error: 'not_found', "
+                "fuzzy: true}` (the flag confirms the fuzzy pass ran).\n\n"
+                "Threshold for the fuzzy step is configurable via the "
+                "`SMALT_FUZZY_ALIAS_THRESHOLD` env var (default 0.6). "
                 "Use `find_by_alias` if you want the full match list "
                 "without picking one."
             ),
@@ -2823,11 +3066,23 @@ TOOLS: list[ToolDef] = [
                     "page_id": {
                         "type": "string",
                         "description": (
-                            "Canonical page id (e.g. 'ent-alice-XYZ…') or a "
-                            "known alias (e.g. 'ent-alice'). Exact-id "
-                            "lookup runs first; alias fallback is "
-                            "automatic."
+                            "Canonical page id (e.g. 'ent-alice-XYZ…'), "
+                            "a known alias (e.g. 'ent-alice'), or a "
+                            "close-but-misspelled handle (e.g. "
+                            "'ent-alic'). Exact-id → exact-alias → "
+                            "fuzzy-alias resolution runs automatically."
                         ),
+                    },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "description": (
+                            "Opt out of the fuzzy alias fallback. "
+                            "Default true. Set false for callers that "
+                            "need exact-only resolution (e.g. "
+                            "automation that distinguishes typo from "
+                            "true-not-found)."
+                        ),
+                        "default": True,
                     },
                 },
                 "required": ["page_id"],
@@ -2846,14 +3101,34 @@ TOOLS: list[ToolDef] = [
                 "body. Useful when you have a memorable handle (the "
                 "original caller-id before write_page mangling, or any "
                 "hand-added alias) and want to see which page(s) it maps "
-                "to."
+                "to.\n\n"
+                "Resolution (C-11):\n"
+                "  1. Exact alias match. If any → return with "
+                "`fuzzy: false`.\n"
+                "  2. If `fuzzy: true` (default) and step 1 found "
+                "nothing → trigram-Jaccard fuzzy match. Returned rows "
+                "carry `fuzzy_score` (∈ [threshold, 1.0]) and "
+                "`matched_alias` (the alias that scored highest for that "
+                "page). Top-level `fuzzy: true` plus `fuzzy_threshold` "
+                "report the fallback fired and at what bar.\n"
+                "  3. If still none → `count: 0` (no error).\n\n"
+                "Threshold via `SMALT_FUZZY_ALIAS_THRESHOLD` env var "
+                "(default 0.6)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "alias": {
                         "type": "string",
-                        "description": "The alias to look up.",
+                        "description": "The alias (or near-alias) to look up.",
+                    },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "description": (
+                            "Opt out of the fuzzy fallback (exact-only "
+                            "match). Default true."
+                        ),
+                        "default": True,
                     },
                 },
                 "required": ["alias"],

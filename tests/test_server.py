@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from fastapi.testclient import TestClient
 
@@ -3480,6 +3481,334 @@ def test_read_page_unknown_id_or_alias_still_returns_not_found(mcp_client: TestC
     )
     assert result["error"] == "not_found"
     assert result["page_id"] == "ent-truly-missing"
+
+
+# ---------------------------------------------------------------------------
+# C-11: fuzzy alias match (trigram-Jaccard fallback on find_by_alias +
+# read_page). Search retrieval stays exact-only.
+
+
+def test_c11_trigram_set_helper():
+    """Unit test of the trigram helper: short strings → empty set,
+    long strings → all 3-grams."""
+    from smalt_mcp.tools import _trigram_set
+
+    assert _trigram_set("") == set()
+    assert _trigram_set("a") == set()
+    assert _trigram_set("ab") == set()
+    assert _trigram_set("abc") == {"abc"}
+    assert _trigram_set("abcd") == {"abc", "bcd"}
+    # Case-insensitive: same trigrams for upper/lower variants.
+    assert _trigram_set("ABC") == {"abc"}
+    assert _trigram_set("AbCd") == _trigram_set("abcd")
+
+
+def test_c11_jaccard_known_cases():
+    """Unit test of the Jaccard scoring on cases the docstring promises."""
+    from smalt_mcp.tools import _jaccard_trigram
+
+    # Identical strings: 1.0.
+    assert _jaccard_trigram("ent-alice", "ent-alice") == 1.0
+    # Empty operand: 0.0.
+    assert _jaccard_trigram("", "ent-alice") == 0.0
+    assert _jaccard_trigram("ab", "ent-alice") == 0.0  # both < 3 chars
+
+    # Near-miss "ent-alic" vs "ent-alice" — docstring claims ~0.857.
+    score = _jaccard_trigram("ent-alic", "ent-alice")
+    assert 0.8 < score < 0.9
+
+    # Unrelated "ent-bob" vs "ent-alice" — docstring claims well below 0.6.
+    score = _jaccard_trigram("ent-bob", "ent-alice")
+    assert score < 0.4
+
+
+def test_c11_find_by_alias_fuzzy_finds_near_miss(mcp_client: TestClient):
+    """Misspelled query finds the page via fuzzy fallback when exact match
+    returns zero. Response includes fuzzy=true, fuzzy_score, matched_alias."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-alice-readback", "Fuzzy Alice")},
+        req_id=600,
+    )
+    canonical = create["id"]
+    # Query a typo of the original caller-id (the alias).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-alice-readbak"},  # missing the 'c' before 'k'
+        req_id=601,
+    )
+    assert result["fuzzy"] is True, result
+    assert result["count"] >= 1
+    assert "fuzzy_threshold" in result
+    ids = {m["id"] for m in result["matches"]}
+    assert canonical in ids
+    # Per-row fuzzy fields populated.
+    target = next(m for m in result["matches"] if m["id"] == canonical)
+    assert target["matched_alias"] == "ent-fuzzy-alice-readback"
+    assert 0.6 <= target["fuzzy_score"] <= 1.0
+
+
+def test_c11_find_by_alias_exact_match_does_not_trigger_fuzzy(mcp_client: TestClient):
+    """Exact alias match returns fuzzy=false — fuzzy fallback is only
+    invoked when exact returns zero."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-exact-only", "Exact only")},
+        req_id=610,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-exact-only"},
+        req_id=611,
+    )
+    assert result["fuzzy"] is False
+    assert result["count"] >= 1
+    # Exact-match rows don't carry the fuzzy_score field.
+    for m in result["matches"]:
+        assert "fuzzy_score" not in m
+        assert "matched_alias" not in m
+
+
+def test_c11_find_by_alias_fuzzy_can_be_disabled(mcp_client: TestClient):
+    """fuzzy=false disables the fallback — a near-miss returns count=0
+    even though the fuzzy path would have found something."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-optout-target", "Opt out")},
+        req_id=620,
+    )
+    # Near-miss with fuzzy disabled → empty result.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-optout-targt", "fuzzy": False},  # missing 'e'
+        req_id=621,
+    )
+    assert result["fuzzy"] is False
+    assert result["count"] == 0
+    assert result["matches"] == []
+
+
+def test_c11_find_by_alias_fuzzy_skips_unrelated(mcp_client: TestClient):
+    """Trigram threshold keeps unrelated strings out of the result —
+    a query string with no near-match returns count=0 with fuzzy=false
+    (the fuzzy pass ran but found nothing above threshold)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "xyzzy-cryptic-incantation-no-overlap"},
+        req_id=630,
+    )
+    # The fuzzy path ran but yielded zero matches; `fuzzy` flag is
+    # False because the response includes no fuzzy-matched rows.
+    assert result["count"] == 0
+    assert result["matches"] == []
+    assert result["fuzzy"] is False
+
+
+def test_c11_read_page_fuzzy_resolves_typo(mcp_client: TestClient):
+    """read_page with a misspelled alias finds the page via fuzzy fallback;
+    response includes resolved_via_alias + fuzzy=true + score + matched_alias."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-readpage", "Fuzzy read")},
+        req_id=640,
+    )
+    canonical = create["id"]
+    # Typo: drop the 'p' from 'readpage' → 'readage'.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-readage"},
+        req_id=641,
+    )
+    assert read.get("error") is None, read
+    assert read["id"] == canonical
+    assert read["title"] == "Fuzzy read"
+    assert read["resolved_via_alias"] == "ent-fuzzy-readage"
+    assert read["fuzzy"] is True
+    assert read["matched_alias"] == "ent-fuzzy-readpage"
+    assert 0.6 <= read["fuzzy_score"] <= 1.0
+
+
+def test_c11_read_page_fuzzy_ambiguous_returns_match_list(mcp_client: TestClient):
+    """When the typo near-matches two distinct canonical pages, read_page
+    returns ambiguous_alias with fuzzy=true and the candidate list."""
+    sid = _initialize(mcp_client)
+    a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-ambig-target-one", "One")},
+        req_id=650,
+    )
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-ambig-target-two", "Two")},
+        req_id=651,
+    )
+    # Typo close to BOTH aliases — drop the last token entirely.
+    # Both "ent-fuzzy-ambig-target-one" and "ent-fuzzy-ambig-target-two"
+    # share the "ent-fuzzy-ambig-target-" prefix; the trigram intersection
+    # is large enough that a query for the shared prefix lands above threshold
+    # for both.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-ambig-target-on"},  # near-miss to both
+        req_id=652,
+    )
+    assert read["error"] == "ambiguous_alias"
+    assert read["fuzzy"] is True
+    assert "fuzzy_threshold" in read
+    ids = {m["id"] for m in read["matches"]}
+    assert a["id"] in ids
+    assert b["id"] in ids
+    # All matches in the list carry fuzzy scoring fields.
+    for m in read["matches"]:
+        assert "fuzzy_score" in m
+        assert "matched_alias" in m
+
+
+def test_c11_read_page_fuzzy_can_be_disabled(mcp_client: TestClient):
+    """read_page with fuzzy=false sees only exact resolution — a near-miss
+    returns not_found instead of fuzzy-resolving."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-readpage-noopt", "No opt-in")},
+        req_id=660,
+    )
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-readpage-nopt", "fuzzy": False},  # near-miss
+        req_id=661,
+    )
+    assert read["error"] == "not_found"
+    # When fuzzy is disabled, response shouldn't claim a fuzzy pass ran.
+    assert "fuzzy" not in read or read.get("fuzzy") is not True
+
+
+def test_c11_read_page_fuzzy_unknown_returns_not_found_with_flag(mcp_client: TestClient):
+    """An unknown id with no near-matches returns not_found, but with
+    fuzzy=true to signal the fuzzy pass was attempted (so callers
+    distinguish 'no match at any threshold' from 'fuzzy was disabled')."""
+    sid = _initialize(mcp_client)
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "xyzzy-no-such-handle-anywhere-in-smalt"},
+        req_id=670,
+    )
+    assert read["error"] == "not_found"
+    assert read["fuzzy"] is True
+    assert "fuzzy_threshold" in read
+
+
+def test_c11_fuzzy_threshold_env_var_tunable(mcp_client: TestClient):
+    """Setting SMALT_FUZZY_ALIAS_THRESHOLD=0.99 (very strict) makes a
+    typo that previously matched stop matching. Resetting restores
+    default behavior. Verifies the env-var knob actually moves the bar."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-threshold-tunable", "Tunable")},
+        req_id=680,
+    )
+    typo = "ent-fuzzy-threshold-tunabl"  # missing trailing 'e'
+
+    # Sanity: default threshold matches the typo.
+    default_result = _call_tool(
+        mcp_client, sid, "find_by_alias", {"alias": typo}, req_id=681
+    )
+    assert default_result["fuzzy"] is True
+    assert default_result["count"] >= 1
+
+    # Crank threshold above any realistic match → fuzzy stops finding.
+    os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "0.99"
+    try:
+        strict_result = _call_tool(
+            mcp_client, sid, "find_by_alias", {"alias": typo}, req_id=682
+        )
+        assert strict_result["count"] == 0
+        assert strict_result["fuzzy"] is False  # nothing fuzzy-matched
+        assert strict_result["fuzzy_threshold"] == 0.99
+    finally:
+        del os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"]
+
+
+def test_c11_fuzzy_threshold_env_var_invalid_falls_back(mcp_client: TestClient):
+    """Garbage env values don't break resolution — invalid values fall
+    back to the default 0.6 (and log a warning, but tests don't capture
+    logs)."""
+    from smalt_mcp.tools import _fuzzy_alias_threshold, _DEFAULT_FUZZY_ALIAS_THRESHOLD
+
+    os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "not-a-number"
+    try:
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "2.5"  # out of range
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "-0.1"  # out of range
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = ""  # empty
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+    finally:
+        os.environ.pop("SMALT_FUZZY_ALIAS_THRESHOLD", None)
+
+
+def test_c11_search_alias_retrieval_stays_exact_only(mcp_client: TestClient):
+    """Search's alias retrieval must NOT fuzzy-match (per the plan: 'fuzzy
+    in search would noise the RRF'). A typo in the search query should not
+    surface the near-matched page via the alias path."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-search-fuzzy-isolated-token-xyz", "Isolated")},
+        req_id=690,
+    )
+    # Typo of the unique token. If alias retrieval fuzzy-matched, this
+    # would surface in the search results via the alias path. It must
+    # not — search alias matching stays exact-only.
+    from smalt_mcp.tools import _find_alias_matches
+    from smalt_mcp.server import _app_instance
+
+    typo = "ent-search-fuzzy-isolated-token-xy"  # missing trailing 'z'
+    alias_hits = _find_alias_matches(_app_instance, typo)
+    # No exact alias match for the typo; the helper must return empty
+    # rather than fuzzy-promoting the close alias.
+    assert alias_hits == []
 
 
 # ---------------------------------------------------------------------------
