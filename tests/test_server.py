@@ -296,7 +296,10 @@ def test_traverse_no_outgoing(mcp_client: TestClient):
 
 
 def test_search_finds_relevant_pages(mcp_client: TestClient):
-    """The word 'embedding' appears in 3 of 5 seed pages — FTS finds them."""
+    """The word 'embedding' appears in 3 of 5 seed pages — FTS finds them.
+
+    Every hit must carry id, aliases, title, type, snippet, score.
+    """
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "search", {"query": "embedding"}, req_id=50)
     ids = {r["id"] for r in result["results"]}
@@ -304,11 +307,39 @@ def test_search_finds_relevant_pages(mcp_client: TestClient):
     # The fake embedder may pull in others via random vector similarity, so
     # we assert subset rather than equality.
     assert {"con-embedding", "con-index", "src-doc1"} <= ids
-    # Snippet + score shape:
+    # Per-hit shape: required fields present.
     for r in result["results"]:
-        assert "snippet" in r
-        assert "score" in r
+        assert {"id", "aliases", "title", "type", "snippet", "score"} <= r.keys()
+        assert isinstance(r["aliases"], list)  # may be empty, but present
         assert r["score"] > 0
+
+
+def test_search_includes_aliases_for_mangled_pages(mcp_client: TestClient):
+    """A page created via write_page (always-mangle) has its caller-id in
+    aliases; that alias must appear in search hits so a caller can find
+    the page by its memorable handle."""
+    sid = _initialize(mcp_client)
+    # Create a page with a distinctive body so FTS will rank it.
+    fm = _ent_fm("ent-search-alias-probe", "Search-Alias-Probe Entity")
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": fm,
+            "body": "search-alias-probe distinctive body content for FTS",
+        },
+        req_id=53,
+    )
+    canonical = create["id"]
+    # Search by a distinctive word from the body.
+    result = _call_tool(
+        mcp_client, sid, "search", {"query": "search-alias-probe"}, req_id=54
+    )
+    # The mangled page should be in the results, with the caller-id in aliases.
+    matched = next((r for r in result["results"] if r["id"] == canonical), None)
+    assert matched is not None, f"expected canonical {canonical} in search results"
+    assert "ent-search-alias-probe" in matched["aliases"]
 
 
 def test_search_top_k_caps_results(mcp_client: TestClient):

@@ -549,22 +549,31 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     top = fused[:top_k]
     top_ids = [pid for pid, _ in top]
 
-    # Hydrate with page metadata in one query.
+    # Hydrate with page metadata in one query. Pull frontmatter_json too so we
+    # can surface aliases per hit — callers often want to render results by a
+    # memorable handle (the caller-id-now-alias) rather than the canonical id.
     quoted = ", ".join(lance.sql_str(p) for p in top_ids)
     meta_arrow = (
         pages.search()
         .where(f"id IN ({quoted})")
-        .select(["id", "title", "type", "body"])
+        .select(["id", "title", "type", "body", "frontmatter_json"])
         .limit(len(top_ids))
         .to_arrow()
     )
     by_id: dict[str, dict[str, Any]] = {}
     for i in range(meta_arrow.num_rows):
         pid = meta_arrow.column("id")[i].as_py()
+        fm_raw = meta_arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            fm = {}
+        aliases = list(fm.get("aliases") or [])
         by_id[pid] = {
             "title": meta_arrow.column("title")[i].as_py(),
             "type": meta_arrow.column("type")[i].as_py(),
             "body": meta_arrow.column("body")[i].as_py() or "",
+            "aliases": aliases,
         }
 
     results = []
@@ -577,6 +586,7 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         results.append(
             {
                 "id": pid,
+                "aliases": meta["aliases"],
                 "title": meta["title"],
                 "type": meta["type"],
                 "snippet": snippet,
@@ -1659,9 +1669,12 @@ TOOLS: list[ToolDef] = [
             description=(
                 "Hybrid search over the Smalt's pages: FTS (body) + vector "
                 "(summary embedding), fused via Reciprocal Rank Fusion. "
-                "Returns top-`top_k` matches with id, title, type, snippet, "
-                "and an RRF score. If the FTS index isn't built yet (very "
-                "small Smalts), falls back to vector-only ranking."
+                "Returns top-`top_k` matches; each hit carries `id` "
+                "(canonical), `aliases` (list of known aliases — often "
+                "includes the original pre-mangling caller-id), `title`, "
+                "`type`, `snippet`, and `score` (RRF). If the FTS index "
+                "isn't built yet (very small Smalts), falls back to "
+                "vector-only ranking."
             ),
             inputSchema={
                 "type": "object",
