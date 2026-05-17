@@ -370,3 +370,157 @@ async def test_e2_thread_pool_default_when_unset(monkeypatch):
     monkeypatch.delenv("SMALT_THREAD_POOL_WORKERS", raising=False)
     cfg = load_config()
     assert cfg.thread_pool_workers == 32
+
+
+# ---- E-3 tests: writes serialize at the mutex; reads overlap writes ----
+
+
+@pytest.mark.asyncio
+async def test_e3_writes_serialize_at_mutex(async_client):
+    """Two concurrent `write_page` requests with a slow indexer step
+    MUST run sequentially — the corpus mutex (single-writer) enforces
+    that. We swap `write_page` with a slow stub that records
+    start/end timestamps in shared state, fire two in parallel via
+    gather, and assert the intervals don't overlap.
+
+    This proves: (a) the to_thread wrap let both writes get scheduled
+    immediately, (b) the threading.Lock corpus mutex serialized them
+    correctly inside the threads.
+    """
+    intervals: list[tuple[str, float, float]] = []
+    intervals_lock = __import__("threading").Lock()
+
+    def _slow_write_page(app, arguments):
+        # Acquire the corpus mutex like the real write_page does —
+        # without this, the test would prove nothing about mutex
+        # behavior, only about the thread pool.
+        with app.mutex.acquire("e3_test_write_page"):
+            tag = arguments.get("frontmatter", {}).get("id", "?")
+            start = time.perf_counter()
+            time.sleep(0.2)
+            end = time.perf_counter()
+            with intervals_lock:
+                intervals.append((tag, start, end))
+        return {"id": tag, "_test": True}
+
+    with _swap_tool_handler("write_page", _slow_write_page):
+        sid = await _mcp_init(async_client)
+        results = await asyncio.gather(
+            _call_tool(
+                async_client, sid, "write_page",
+                {"frontmatter": {"id": "ent-e3-a", "type": "entity", "title": "A", "entity_kind": "test"}},
+                req_id=301,
+            ),
+            _call_tool(
+                async_client, sid, "write_page",
+                {"frontmatter": {"id": "ent-e3-b", "type": "entity", "title": "B", "entity_kind": "test"}},
+                req_id=302,
+            ),
+        )
+
+    assert len(intervals) == 2, f"expected 2 intervals, got {len(intervals)}"
+    # Sort by start time. The two intervals must be strictly
+    # non-overlapping (second.start >= first.end).
+    intervals.sort(key=lambda t: t[1])
+    first_tag, first_start, first_end = intervals[0]
+    second_tag, second_start, second_end = intervals[1]
+    assert second_start >= first_end, (
+        f"writes overlapped! first {first_tag}:[{first_start:.3f},{first_end:.3f}] "
+        f"second {second_tag}:[{second_start:.3f},{second_end:.3f}] — mutex didn't serialize"
+    )
+    for r in results:
+        assert r.get("_test") is True
+
+
+@pytest.mark.asyncio
+async def test_e3_read_overlaps_with_in_flight_write(async_client):
+    """While a slow `write_page` holds the corpus mutex, a concurrent
+    `search` read MUST complete (reads don't acquire the mutex).
+    Proves the event loop isn't blocked by the write thread."""
+    write_started = __import__("threading").Event()
+
+    def _slow_write_page(app, arguments):
+        with app.mutex.acquire("e3_test_overlap_write"):
+            write_started.set()
+            time.sleep(0.5)
+        return {"id": "ent-e3-overlap", "_test": True}
+
+    def _fast_search(app, arguments):
+        return {"results": [], "count": 0, "_overlap_test": True}
+
+    with _swap_tool_handler("write_page", _slow_write_page), \
+         _swap_tool_handler("search", _fast_search):
+        sid = await _mcp_init(async_client)
+        # Start the write; wait for it to actually acquire the mutex
+        # (so we know the search runs DURING the write, not before).
+        write_task = asyncio.create_task(
+            _call_tool(
+                async_client, sid, "write_page",
+                {"frontmatter": {"id": "ent-e3-overlap", "type": "entity", "title": "x", "entity_kind": "test"}},
+                req_id=311,
+            )
+        )
+        # Poll for write_started flag (set inside the mutex).
+        for _ in range(50):
+            if write_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert write_started.is_set(), "write didn't enter the mutex in time"
+
+        # Now fire the search. It should return quickly even though
+        # the write is still holding the mutex (reads don't acquire it).
+        search_start = time.perf_counter()
+        search_result = await _call_tool(async_client, sid, "search", {"query": "x"}, req_id=312)
+        search_latency = time.perf_counter() - search_start
+
+        # Wait for the write to finish so we don't leak the task.
+        write_result = await write_task
+
+    assert search_result.get("_overlap_test") is True
+    assert search_latency < 0.3, (
+        f"search took {search_latency:.3f}s during in-flight write — "
+        "loop was blocked or reads are serializing on the mutex (regression)"
+    )
+    assert write_result.get("_test") is True
+
+
+@pytest.mark.asyncio
+async def test_e3_mutex_contention_counters_advance(async_client):
+    """After two concurrent writes serialize on the mutex,
+    `index_status.mutex.acquire_count` advances by at least 2 and
+    `mean_wait_ms` is > 0 (the second write actually waited)."""
+    def _slow_write_page(app, arguments):
+        with app.mutex.acquire("e3_test_contention"):
+            time.sleep(0.15)
+        return {"id": arguments.get("frontmatter", {}).get("id", "?"), "_test": True}
+
+    with _swap_tool_handler("write_page", _slow_write_page):
+        sid = await _mcp_init(async_client)
+
+        # Read baseline contention counters.
+        before = await _call_tool(async_client, sid, "index_status", {}, req_id=320)
+        baseline_count = before["mutex"]["acquire_count"]
+
+        await asyncio.gather(
+            _call_tool(
+                async_client, sid, "write_page",
+                {"frontmatter": {"id": "ent-e3-ctn-a", "type": "entity", "title": "A", "entity_kind": "test"}},
+                req_id=321,
+            ),
+            _call_tool(
+                async_client, sid, "write_page",
+                {"frontmatter": {"id": "ent-e3-ctn-b", "type": "entity", "title": "B", "entity_kind": "test"}},
+                req_id=322,
+            ),
+        )
+
+        after = await _call_tool(async_client, sid, "index_status", {}, req_id=323)
+
+    delta = after["mutex"]["acquire_count"] - baseline_count
+    assert delta >= 2, f"acquire_count advanced by {delta}, expected ≥ 2"
+    # mean_wait_ms across all acquires (including any past ones from
+    # earlier tests in same module) should be > 0 because at least
+    # one of our two writes had to wait.
+    assert after["mutex"]["mean_wait_ms"] > 0, (
+        "mean_wait_ms is 0 — contention counters not tracking, or no actual contention"
+    )

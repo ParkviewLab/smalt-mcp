@@ -1676,7 +1676,8 @@ def task_list(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: bootstrap (READ_WRITE) ----
 
 
-async def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def bootstrap(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Initialize an empty Smalt at the configured `SMALT_DIR`.
 
     Creates the canonical directory layout, drops in SCHEMA.md / POLICY.md
@@ -1802,7 +1803,8 @@ def _prepare_create_write(fm_in: dict[str, Any]) -> tuple[Page, dict[str, Any], 
 # ---- handler: write_page (READ_WRITE) ----
 
 
-async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Write one page (frontmatter + body) and trigger an incremental indexer pass.
 
     `mode='create'` (default): always produces a NEW page. The caller's id
@@ -1937,7 +1939,8 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: write_pages (READ_WRITE) — batch ----
 
 
-async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Batch-write a list of pages with a single indexer pass at the end.
 
     Same mode semantics as `write_page`: `create` mangles every id;
@@ -2098,7 +2101,8 @@ def _locate_page_file(app: App, page_id: str) -> Path | None:
     return app.cfg.smalt_dir / rel
 
 
-async def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Append an outgoing link to a page's `links_out` (read-modify-write).
 
     Locates the page by id, reads its current frontmatter from disk (not
@@ -2161,7 +2165,8 @@ async def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: add_claim (READ_WRITE) ----
 
 
-async def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Append a Claim to a page's `claims` list (read-modify-write).
 
     Locates the page by id, validates the claim against the `Claim` Pydantic
@@ -2223,7 +2228,8 @@ async def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: add_links (READ_WRITE) — batch ----
 
 
-async def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Append multiple outgoing links to a page's `links_out` in one batch.
 
     Validate-all-then-act contract:
@@ -2333,7 +2339,8 @@ async def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: add_claims (READ_WRITE) — batch ----
 
 
-async def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Append multiple Claims to a page's `claims` list in one batch.
 
     Same validate-all-then-act contract as `add_links`:
@@ -2438,7 +2445,8 @@ _WRITE_BATCH_OP_KINDS: frozenset[str] = frozenset({
 })
 
 
-async def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Mixed-op atomic transaction: pages + links + claims + claim-updates
     in one MCP call. Single indexer pass at the end.
 
@@ -2877,7 +2885,8 @@ def _find_page_file_by_id(smalt_root: Path, page_id: str) -> Path | None:
     return None
 
 
-async def reindex_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def reindex_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Force-re-index a single page from disk.
 
     Locates the page (LanceDB lookup first, filesystem walk as
@@ -3058,7 +3067,8 @@ async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: task_cancel (READ_WRITE, C-13) ----
 
 
-async def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Request cancellation of a scheduled task by `task_id`.
 
     Cancellation is **cooperative** — the work function must check
@@ -3105,7 +3115,8 @@ async def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
 
 
-async def remove_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def remove_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Cascading delete of a page by canonical id.
 
     Removes, all under the corpus mutex:
@@ -3176,7 +3187,8 @@ async def remove_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: update_claim (REMOVE_DESTRUCTIVE) ----
 
 
-async def update_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def update_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Replace one claim on a page, identified by `claim_id` within the
     page's `claims` list. Read-modify-write under the corpus mutex.
 
@@ -3239,7 +3251,8 @@ async def update_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: remove_claim (REMOVE_DESTRUCTIVE) ----
 
 
-async def remove_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def remove_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Remove one claim from a page by `claim_id`. RMW under the mutex.
 
     Returns `{error: 'claim_not_found'}` if the claim id isn't on the page.
@@ -3287,7 +3300,8 @@ async def remove_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: remove_link (REMOVE_DESTRUCTIVE) ----
 
 
-async def remove_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def remove_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Remove an outgoing link from a page, matched by (target, label).
 
     If `label` is omitted, removes EVERY edge from `from_id` to `to_id`
