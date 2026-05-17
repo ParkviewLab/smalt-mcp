@@ -4725,6 +4725,236 @@ def test_c13_reindex_all_unblocked_with_uninitialized_smalt():
 
 
 # ---------------------------------------------------------------------------
+# E-1: concurrency-init hardening. Tests fire N threads at the lazy-init
+# code paths and assert exactly one initialization runs (not N). Also
+# tests the observability-state lock prevents torn reads.
+
+
+def test_e1_db_init_race_serialized(tmp_path, monkeypatch):
+    """N threads concurrently calling app.db() invoke `lancedb.connect`
+    exactly once. Without the init lock, two racing threads can both
+    pass the `if self._db is None` check and both construct connections."""
+    import threading
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+
+    # Set up a smalt_dir so the existence check passes.
+    smalt_dir = tmp_path / "smalt"
+    smalt_dir.mkdir()
+
+    cfg = Config(
+        smalt_dir=smalt_dir,
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+
+    # Monkeypatch lance.connect to record call count.
+    from smalt_mcp.storage import lance as lance_mod
+
+    call_count = 0
+    real_connect = lance_mod.connect
+
+    def _counting_connect(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # Sleep briefly to widen the race window — without a lock, more
+        # than one thread will get past the `is None` check during this
+        # sleep and both will land here.
+        import time
+        time.sleep(0.05)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(lance_mod, "connect", _counting_connect)
+
+    # Fire 10 threads simultaneously.
+    barrier = threading.Barrier(10)
+    errors: list[Exception] = []
+
+    def _worker():
+        try:
+            barrier.wait()
+            app.db()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"threads raised: {errors}"
+    assert call_count == 1, (
+        f"expected exactly one lance.connect call, got {call_count} "
+        "(init lock failed — concurrent first-callers raced)"
+    )
+
+
+def test_e1_embedder_init_race_serialized(monkeypatch):
+    """Same shape as the db test, but for App.embedder()."""
+    import threading
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+    from pathlib import Path
+
+    cfg = Config(
+        smalt_dir=Path("/tmp/e1-embedder-test"),
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+
+    from smalt_mcp.storage import embedder as embedder_mod
+
+    call_count = 0
+    real_make_embedder = embedder_mod.make_embedder
+
+    def _counting_make_embedder(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        import time
+        time.sleep(0.05)
+        return real_make_embedder(*args, **kwargs)
+
+    monkeypatch.setattr(embedder_mod, "make_embedder", _counting_make_embedder)
+
+    barrier = threading.Barrier(10)
+    errors: list[Exception] = []
+
+    def _worker():
+        try:
+            barrier.wait()
+            app.embedder()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"threads raised: {errors}"
+    assert call_count == 1, (
+        f"expected exactly one make_embedder call, got {call_count}"
+    )
+
+
+def test_e1_record_indexer_run_concurrent_reads_atomic():
+    """Two threads pounding `record_indexer_run` while a third polls
+    `index_status_payload` — no torn snapshots (the four obs fields
+    must always reflect a consistent single-run state)."""
+    import threading
+    import time
+    from pathlib import Path
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+    from smalt_mcp.storage.indexer import IndexResult
+
+    cfg = Config(
+        smalt_dir=Path("/tmp/e1-obs-test"),
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+
+    # Two distinct "runs" with disjoint markers. The obs lock should
+    # ensure that any reader sees fully-run-A or fully-run-B, never
+    # half-and-half.
+    def _result_a() -> IndexResult:
+        r = IndexResult()
+        r.duration_seconds = 1.0
+        r.scanned = 100
+        r.fts_status = {"body": {"status": "ok", "error": None, "marker": "A"}}
+        r.vector_status = {"status": "ok", "error": None, "reason": None, "marker": "A"}
+        return r
+
+    def _result_b() -> IndexResult:
+        r = IndexResult()
+        r.duration_seconds = 2.0
+        r.scanned = 200
+        r.fts_status = {"body": {"status": "ok", "error": None, "marker": "B"}}
+        r.vector_status = {"status": "ok", "error": None, "reason": None, "marker": "B"}
+        return r
+
+    stop = threading.Event()
+    torn_reads: list[dict] = []
+
+    def _writer_a():
+        while not stop.is_set():
+            app.record_indexer_run(_result_a())
+            time.sleep(0.001)
+
+    def _writer_b():
+        while not stop.is_set():
+            app.record_indexer_run(_result_b())
+            time.sleep(0.001)
+
+    def _reader():
+        for _ in range(200):
+            payload = app.index_status_payload()
+            fts_marker = (payload["indexes"]["fts"] or {}).get("body", {}).get("marker")
+            vec_marker = (payload["indexes"]["vector"] or {}).get("marker")
+            duration = payload["indexer"]["last_run_duration_seconds"]
+            scanned = (payload["indexer"]["last_result"] or {}).get("scanned")
+            # A consistent snapshot: all four markers either all-A or all-B.
+            snapshot = (fts_marker, vec_marker, duration, scanned)
+            valid = snapshot in {
+                ("A", "A", 1.0, 100),
+                ("B", "B", 2.0, 200),
+            }
+            if not valid:
+                torn_reads.append(payload)
+            time.sleep(0.001)
+
+    threads = [
+        threading.Thread(target=_writer_a),
+        threading.Thread(target=_writer_b),
+        threading.Thread(target=_reader),
+    ]
+    for t in threads:
+        t.start()
+    threads[2].join()  # wait for reader to finish 200 polls
+    stop.set()
+    for t in threads[:2]:
+        t.join()
+
+    assert not torn_reads, (
+        f"observed {len(torn_reads)} torn reads (obs lock failed); "
+        f"first torn: {torn_reads[0]}"
+    )
+
+
+def test_e1_db_init_no_lock_taken_after_first_init():
+    """Fast-path: once `_db` is set, `db()` returns without taking the
+    lock. We verify by replacing the lock with one that raises if
+    acquired."""
+    import threading
+    from pathlib import Path
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+
+    cfg = Config(
+        smalt_dir=Path("/tmp/e1-fastpath-test"),
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+    # Manually set _db to bypass the cold-init path.
+    app._db = object()  # type: ignore[assignment]
+
+    class _AngryLock:
+        def __enter__(self):
+            raise AssertionError("fast path took the lock — regression")
+
+        def __exit__(self, *a):
+            pass
+
+    app._db_init_lock = _AngryLock()  # type: ignore[assignment]
+
+    # Should not raise — fast path returns without acquiring the lock.
+    result = app.db()
+    assert result is app._db
+
+
+# ---------------------------------------------------------------------------
 # Scope-tier filtering (unit-level — exercising the helpers directly)
 
 
