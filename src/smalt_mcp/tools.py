@@ -128,8 +128,24 @@ def _serialize_and_write_page(target: Path, fm_dict: dict[str, Any], body: str) 
 
 
 def _page_target_path(smalt_root: Path, page: Page) -> Path:
-    """Compute the canonical on-disk path for `page` inside `smalt_root`."""
+    """Compute the canonical on-disk path for `page` inside `smalt_root`.
+
+    Two id shapes (see `schema._validate_id`):
+
+    - **Slug id** (e.g., `ent-alice`, `con-cs`, `src-doc1`): path is
+      `pages/<subdir>/<id>.md`. The v0 shape.
+
+    - **Section id** (e.g., `src-foo::src/utils.py`): the M3 hybrid
+      layout. `::` translates to `/` to produce a nested file path:
+      `pages/sources/src-foo/src/utils.py.md`. The source file's
+      original extension (`.py` here) is preserved in the path; the
+      `.md` wrapper extension is appended. Use `src-foo::index` for
+      the multi-file source's index page → `pages/sources/src-foo/index.md`.
+    """
     subdir = _TYPE_TO_SUBDIR[page.type]
+    if "::" in page.id:
+        rel = page.id.replace("::", "/")
+        return paths.pages_dir(smalt_root) / subdir / (rel + ".md")
     return paths.pages_dir(smalt_root) / subdir / f"{page.id}.md"
 
 
@@ -1126,9 +1142,33 @@ async def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         }
 
     if mode == "create":
-        # Mangle and re-validate (re-validation is cheap and confirms the
-        # canonical id still passes _validate_id — URL-safe base64 is in the
-        # allowed character set).
+        # Section ids (`<source-id>::<rel-path>`) take the upsert path:
+        # the id encodes a real-world location (source + rel-path tuple)
+        # and is canonical by construction — mangling would break that
+        # identity and produce a section file at a UUID-suffixed path
+        # nothing else can find. Upsert: write the page, overwriting if
+        # an existing section page lives at the same id. M3 ingest's
+        # natural "re-process this file" behavior.
+        if "::" in fm_in["id"]:
+            page = PAGE_ADAPTER.validate_python(fm_in)
+            target = _page_target_path(app.cfg.smalt_dir, page)
+            with app.mutex.acquire("write_page"):
+                already_existed = _existing_page_path(app, page.id) is not None
+                _serialize_and_write_page(target, fm_in, body)
+                index_result = _run_indexer(app)
+            return {
+                "id": page.id,
+                "path": str(target.relative_to(app.cfg.smalt_dir)),
+                "type": page.type.value,
+                "mode": "create",
+                "mangled": False,
+                "upserted": already_existed,
+                "index_result": index_result,
+            }
+
+        # Slug ids: always-mangle create. Re-validate (cheap; confirms the
+        # canonical id still passes _validate_id — URL-safe base64 is in
+        # the allowed character set).
         try:
             page, fm_out, original_id = _prepare_create_write(fm_in)
         except ValidationError as e:
@@ -1260,6 +1300,22 @@ async def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         # Phase 3: commit each entry.
         for fm_in, body in validated:
             if mode == "create":
+                if "::" in fm_in["id"]:
+                    # Section-id upsert path (same as write_page).
+                    page = PAGE_ADAPTER.validate_python(fm_in)
+                    target = _page_target_path(app.cfg.smalt_dir, page)
+                    already_existed = _existing_page_path(app, page.id) is not None
+                    _serialize_and_write_page(target, fm_in, body)
+                    written.append(
+                        {
+                            "id": page.id,
+                            "path": str(target.relative_to(app.cfg.smalt_dir)),
+                            "type": page.type.value,
+                            "mangled": False,
+                            "upserted": already_existed,
+                        }
+                    )
+                    continue
                 page, fm_out, original_id = _prepare_create_write(fm_in)
                 target = _page_target_path(app.cfg.smalt_dir, page)
                 # UUID collision check (defensive)
