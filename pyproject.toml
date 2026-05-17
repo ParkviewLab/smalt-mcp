@@ -1,6 +1,6 @@
 [project]
 name = "smalt-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server wrapping the Smalt's storage surface (read/write/link/claim/search) for ParkviewLab's CoGrind project."
 readme = "README.md"
 requires-python = ">=3.13"
