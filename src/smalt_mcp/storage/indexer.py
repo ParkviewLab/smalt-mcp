@@ -484,6 +484,14 @@ def _page_row(
 ) -> dict[str, Any]:
     fm = parsed.frontmatter
     created = existing_created_at.get(fm.id, now)
+    # C-10: project `aliases` into its own list<string> column so the
+    # find_by_alias / read_page-alias-fallback / search-alias-retrieval
+    # paths can use `array_has(aliases, X)` — O(1) — rather than scanning
+    # frontmatter_json for every page. Empty list (rather than NULL) when
+    # the page has no aliases — keeps the column "indexer-touched" so
+    # operators can distinguish "indexed but no aliases" from "row
+    # pre-dates the migration."
+    aliases = list(fm.aliases) if fm.aliases else []
     return {
         "id": fm.id,
         "path": parsed.rel_path,
@@ -494,6 +502,7 @@ def _page_row(
         "content_hash": parsed.content_hash,
         "created_at": created,
         "updated_at": now,
+        "aliases": aliases,
     }
 
 

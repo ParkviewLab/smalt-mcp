@@ -54,6 +54,13 @@ def pages_schema() -> pa.Schema:
             pa.field("content_hash", pa.string()),
             pa.field("created_at", pa.timestamp("us", tz="UTC")),
             pa.field("updated_at", pa.timestamp("us", tz="UTC")),
+            # C-10: aliases promoted to a first-class indexed column so
+            # find_by_alias / read_page-alias-fallback / search-alias
+            # retrieval become O(1) via `array_has(aliases, 'X')` rather
+            # than O(N) frontmatter_json parses. Nullable: rows from
+            # pre-C-10 Smalts have NULL until they're re-projected (via
+            # reindex_all from C-9 or natural rewrites).
+            pa.field("aliases", pa.list_(pa.string())),
         ]
     )
 
@@ -141,7 +148,11 @@ def _existing_table_names(db: lancedb.DBConnection) -> list[str]:
 def ensure_tables(smalt_root: Path, *, embedding_dim: int) -> list[str]:
     """Create any missing tables. Returns the list of tables that were created.
 
-    Idempotent: existing tables are left untouched.
+    Idempotent: existing tables are left untouched (schema-wise) — but if
+    a column was added in a later schema version (e.g., C-10's `aliases`
+    on the pages table), the additive migration runs to bring the
+    existing table in line. Existing data is preserved; new columns are
+    NULL until the indexer re-projects them.
     """
     db = connect(smalt_root)
     existing = set(_existing_table_names(db))
@@ -158,7 +169,34 @@ def ensure_tables(smalt_root: Path, *, embedding_dim: int) -> list[str]:
             continue
         db.create_table(name, schema=schema, mode="create")
         created.append(name)
+
+    # Additive schema migrations on existing tables. Each migration is
+    # idempotent (no-op if the column is already present), so this is
+    # safe to call on every ensure_tables.
+    if TABLE_PAGES not in created:
+        _migrate_pages_aliases_column(db)
+
     return created
+
+
+def _migrate_pages_aliases_column(db: lancedb.DBConnection) -> bool:
+    """Add the `aliases` column to the pages table if missing (C-10).
+
+    No-op if the column already exists. When added, existing rows get
+    NULL — operators run `reindex_all` (C-9) to populate from disk, or
+    the column fills in progressively as pages get re-projected by
+    natural rewrites.
+
+    Returns True if the migration ran, False if the column was already
+    present.
+    """
+    table = _open_table(db, TABLE_PAGES)
+    if "aliases" in table.schema.names:
+        return False
+    # LanceDB's add_columns accepts a pa.Field; nullable list-of-string
+    # initialized to NULL on existing rows.
+    table.add_columns(pa.field("aliases", pa.list_(pa.string())))
+    return True
 
 
 def list_tables(smalt_root: Path) -> list[str]:

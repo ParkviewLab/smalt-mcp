@@ -461,10 +461,50 @@ async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 def _find_pages_by_alias(app: App, alias: str) -> list[dict[str, Any]]:
     """Return every indexed page whose `aliases` list contains `alias`.
 
-    Scans the pages table's `frontmatter_json` column — no LanceDB-side
-    index on aliases today, so this is O(pages). Fine for typical Smalts
-    (thousands of pages); when we hit limits we'll add an aliases table.
+    Uses the first-class `pages.aliases` list-of-string column via
+    LanceDB's `array_has` SQL predicate — O(1) at the LanceDB layer
+    rather than the O(N) frontmatter_json scan we used pre-C-10.
+
+    On a pre-C-10 Smalt (column-missing or NULL for un-reprojected
+    rows), `array_has(NULL, ...)` returns NULL → those rows simply
+    don't match. Operators run `reindex_all` (C-9) to populate the
+    column for legacy rows, or the column fills in progressively as
+    pages get re-projected by natural rewrites.
     """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    if "aliases" not in pages.schema.names:
+        # Pre-C-10 Smalt where the additive migration didn't run. Bail
+        # back to the legacy scan path so existing callers don't break
+        # during upgrade. Operators should call ensure_tables /
+        # reindex_all to migrate, after which this branch is dead.
+        return _find_pages_by_alias_legacy_scan(app, alias)
+    arrow = (
+        pages.search()
+        .where(f"array_has(aliases, {lance.sql_str(alias)})")
+        .select(["id", "title", "type", "path"])
+        .limit(10_000)
+        .to_arrow()
+    )
+    matches: list[dict[str, Any]] = []
+    for i in range(arrow.num_rows):
+        matches.append(
+            {
+                "id": arrow.column("id")[i].as_py(),
+                "title": arrow.column("title")[i].as_py(),
+                "type": arrow.column("type")[i].as_py(),
+                "path": arrow.column("path")[i].as_py(),
+            }
+        )
+    return matches
+
+
+def _find_pages_by_alias_legacy_scan(app: App, alias: str) -> list[dict[str, Any]]:
+    """Pre-C-10 frontmatter_json scan path. Kept as a defensive fallback
+    for Smalts whose pages table predates the aliases-column migration
+    (the migration runs on every ensure_tables, so this should only fire
+    if migration was skipped or failed). Same shape as
+    `_find_pages_by_alias`."""
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
     arrow = (
@@ -775,11 +815,46 @@ def _find_alias_matches(app: App, query: str) -> list[str]:
     alias directly" case (`search('ent-alice')`) and the embedded case
     (`search('tell me about ent-alice')`).
 
-    Returns the page_ids in `pages`-table-scan order. The downstream RRF
+    Implementation (C-10): builds a single SQL expression of OR'd
+    `array_has(aliases, <needle>)` predicates, one per distinct needle
+    (the whole-query string + each whitespace-separated token). The
+    LanceDB query engine evaluates this in one pass over the indexed
+    column — O(1) per row at the engine level rather than the O(N)
+    frontmatter_json scan we used pre-C-10.
+
+    Returns page_ids in `pages`-table-scan order. The downstream RRF
     treats them as a single ranked list — pages that match earlier in
     the scan get slightly higher rank, but the ranking signal is weak.
-    The point is presence in the input set, not relative ordering inside it.
+    The point is presence in the input set, not relative ordering.
     """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    if "aliases" not in pages.schema.names:
+        # Legacy scan fallback for pre-C-10 Smalts (see
+        # _find_pages_by_alias for the same defensive pattern).
+        return _find_alias_matches_legacy_scan(app, query)
+
+    needles: set[str] = {query}
+    needles.update(t.strip() for t in query.split() if t.strip())
+    if not needles:
+        return []
+    # OR together one array_has predicate per needle.
+    where = " OR ".join(
+        f"array_has(aliases, {lance.sql_str(n)})" for n in needles
+    )
+    arrow = (
+        pages.search()
+        .where(where)
+        .select(["id"])
+        .limit(10_000)
+        .to_arrow()
+    )
+    return arrow.column("id").to_pylist()
+
+
+def _find_alias_matches_legacy_scan(app: App, query: str) -> list[str]:
+    """Pre-C-10 frontmatter_json scan fallback. See
+    `_find_pages_by_alias_legacy_scan` for the rationale."""
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
     arrow = (
