@@ -141,11 +141,11 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (9 read-only + 8 read-write + 4 remove-destructive = 21) should be
-    # listed. Proposal / experiment / gap tools moved to ebony-enriching.
-    # C-5 added: add_links + add_claims (bulk variants). C-6 added:
-    # write_batch (mixed-op transaction). C-8 added: index_status
-    # (observability).
+    # (9 read-only + 10 read-write + 4 remove-destructive = 23) should
+    # be listed. Proposal / experiment / gap tools moved to
+    # ebony-enriching. C-5 added: add_links + add_claims (bulk
+    # variants). C-6 added: write_batch. C-8 added: index_status. C-9
+    # added: reindex_page + reindex_all.
     assert names == {
         # READ_ONLY (9)
         "status",
@@ -157,7 +157,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
-        # READ_WRITE (8)
+        # READ_WRITE (10)
         "bootstrap",
         "write_page",
         "write_pages",
@@ -166,6 +166,8 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "add_claim",
         "add_claims",
         "write_batch",
+        "reindex_page",
+        "reindex_all",
         # REMOVE_DESTRUCTIVE (4)
         "remove_page",
         "update_claim",
@@ -2369,6 +2371,202 @@ def test_write_batch_rejects_index_page_in_write_op(mcp_client: TestClient):
     )
     assert result["error"] == "forbidden_page_type"
     assert result["index"] == 0
+
+
+# ---------------------------------------------------------------------------
+# reindex_page + reindex_all (C-9)
+
+
+def test_reindex_page_reflects_disk_edit(mcp_client: TestClient):
+    """Edit a page file on disk (bypassing the MCP write path); call
+    reindex_page; verify read_page returns the new content. Uses a
+    section page (no mangling — id stable + predictable path)."""
+    sid = _initialize(mcp_client)
+    # Write a section page so we have a predictable id + path.
+    section_id = "src-rxp-disk::test.py"
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(section_id, "before"),
+            "body": "before body",
+        },
+        req_id=1300,
+    )
+    assert write.get("error") is None, write
+    rel_path = write["path"]
+
+    # Edit the file directly on disk.
+    from smalt_mcp.server import _app_instance
+    abs_path = _app_instance.cfg.smalt_dir / rel_path
+    import frontmatter
+
+    post = frontmatter.load(str(abs_path))
+    post.metadata["title"] = "after edit"
+    post.content = "after edit body"
+    abs_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    # Before reindex_page: LanceDB still has the OLD title (we bypassed
+    # the indexer).
+    pre = _call_tool(mcp_client, sid, "read_page", {"page_id": section_id}, req_id=1301)
+    assert pre["title"] == "before"
+
+    # reindex_page picks up the change.
+    rxr = _call_tool(
+        mcp_client, sid, "reindex_page", {"page_id": section_id}, req_id=1302
+    )
+    assert rxr.get("error") is None, rxr
+    assert rxr["page_id"] == section_id
+    assert rxr["path"] == rel_path
+    # `index_result` is the per-page IndexResult summary.
+    assert isinstance(rxr["index_result"], dict)
+
+    # After reindex_page: read_page reflects the edit.
+    after = _call_tool(mcp_client, sid, "read_page", {"page_id": section_id}, req_id=1303)
+    assert after["title"] == "after edit"
+    assert after["body"] == "after edit body"
+
+
+def test_reindex_page_finds_file_not_in_lancedb(mcp_client: TestClient):
+    """A page exists on disk but has never been indexed (e.g., restored
+    from a Restic backup that excluded `index/lance/`, or manually
+    placed by an operator). reindex_page walks the filesystem and
+    projects it."""
+    sid = _initialize(mcp_client)
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import paths as smalt_paths
+
+    # Hand-write a markdown file directly into pages/entities/ —
+    # bypass write_page entirely, so it's never in LanceDB.
+    page_id = "ent-rxp-disk-only"
+    rel = f"pages/entities/{page_id}.md"
+    abs_path = _app_instance.cfg.smalt_dir / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(
+        f"---\nid: {page_id}\ntype: entity\ntitle: Disk Only\nentity_kind: test\n---\n"
+        "body content for disk-only test\n",
+        encoding="utf-8",
+    )
+
+    # Confirm: read_page can't find it yet (LanceDB has no row).
+    miss = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1310)
+    assert miss.get("error") == "not_found"
+
+    # reindex_page falls back to filesystem walk.
+    rxr = _call_tool(mcp_client, sid, "reindex_page", {"page_id": page_id}, req_id=1311)
+    assert rxr.get("error") is None, rxr
+    assert rxr["page_id"] == page_id
+
+    # Now read_page works.
+    hit = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1312)
+    assert hit["id"] == page_id
+    assert hit["title"] == "Disk Only"
+    # Clean up the hand-written file so subsequent tests' filesystem
+    # state is unaffected.
+    abs_path.unlink()
+
+
+def test_reindex_page_not_found(mcp_client: TestClient):
+    """Unknown id (neither in LanceDB nor on disk) returns structured not_found."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "reindex_page",
+        {"page_id": "ent-genuinely-missing-AbCdEfGhIjKlMnOpQrStUv"},
+        req_id=1320,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_reindex_page_file_gone_returns_specific_error(mcp_client: TestClient):
+    """A page is indexed in LanceDB but the file was deleted from disk.
+    reindex_page returns file_not_found (distinct from plain not_found)
+    so the caller knows to use remove_page."""
+    sid = _initialize(mcp_client)
+    # Write a section page, then unlink it on disk.
+    section_id = "src-rxp-gone::ghost.py"
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section(section_id, "soon to be gone")},
+        req_id=1330,
+    )
+    rel = write["path"]
+    from smalt_mcp.server import _app_instance
+    abs_path = _app_instance.cfg.smalt_dir / rel
+    abs_path.unlink()
+
+    # reindex_page sees indexed-row but no file.
+    rxr = _call_tool(
+        mcp_client, sid, "reindex_page", {"page_id": section_id}, req_id=1331
+    )
+    assert rxr["error"] == "file_not_found"
+    assert rxr["indexed_path"] == rel
+
+
+def test_reindex_all_rebuilds_from_disk(mcp_client: TestClient):
+    """reindex_all wipes the LanceDB tables and rebuilds from `pages/`.
+    All pages that were listed before are still listed after."""
+    sid = _initialize(mcp_client)
+    # Trigger an indexer pass to ensure the state is fresh.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rxa-trigger", "trigger")},
+        req_id=1400,
+    )
+    before = _call_tool(
+        mcp_client, sid, "list_pages", {"limit": 10_000}, req_id=1401
+    )
+    before_ids = {p["id"] for p in before["pages"]}
+    assert before["count"] > 0
+
+    # Wipe + rebuild.
+    rxa = _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1402)
+    assert rxa.get("error") is None, rxa
+    assert "wiped_tables" in rxa
+    assert "recreated_tables" in rxa
+    assert isinstance(rxa["index_result"], dict)
+
+    # Every page id from before is back. Reindex preserves on-disk
+    # content (which is the source of truth).
+    after = _call_tool(
+        mcp_client, sid, "list_pages", {"limit": 10_000}, req_id=1403
+    )
+    after_ids = {p["id"] for p in after["pages"]}
+    # Subset check — reindex_all auto-regenerates IndexPages which are
+    # always present after the rebuild.
+    assert before_ids <= after_ids
+
+
+def test_reindex_all_preserves_index_pages(mcp_client: TestClient):
+    """After reindex_all, the canonical IndexPages (glossary, domains)
+    are still present (the indexer's auto-regen step runs at the end
+    of the rebuild pass)."""
+    sid = _initialize(mcp_client)
+    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1410)
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=1411
+    )
+    assert glossary.get("error") is None
+    assert glossary["type"] == "index"
+
+
+def test_reindex_all_search_still_works(mcp_client: TestClient):
+    """After reindex_all, search returns hits — proves FTS + vector
+    indexes get rebuilt on the new tables."""
+    sid = _initialize(mcp_client)
+    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1420)
+    result = _call_tool(
+        mcp_client, sid, "search", {"query": "Alice", "top_k": 5}, req_id=1421
+    )
+    # Should find at least ent-alice (FTS body match on the seed).
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids, f"search didn't surface ent-alice after reindex_all: {ids}"
 
 
 # ---------------------------------------------------------------------------

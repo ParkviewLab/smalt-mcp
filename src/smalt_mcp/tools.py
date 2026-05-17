@@ -2154,6 +2154,185 @@ async def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- handler: reindex_page + reindex_all (READ_WRITE) — granular ops ----
+
+# C-9: explicit re-index entry points. The auto-trigger on every write
+# covers the common case (just-edited page → indexer runs → table is
+# consistent), but two real workflows want explicit re-indexing:
+#
+# 1. **Post-restore from a Restic backup that excluded `index/lance/`**
+#    (the pattern documented in README's "Operations: backup and
+#    restore"). The markdown is on disk; LanceDB is empty or stale.
+#    `reindex_all` rebuilds from `pages/`. This is the explicit
+#    counterpart to `bootstrap` (which conflates first-init with
+#    re-init).
+#
+# 2. **M7 Cogitate / M6 Research flows** where a single page's content
+#    changed via a non-write_page path — e.g., a hand-edit on disk, or a
+#    proposal-apply that updated a summary. `reindex_page(page_id)`
+#    forces re-projection without sweeping the whole corpus.
+
+
+def _find_page_file_by_id(smalt_root: Path, page_id: str) -> Path | None:
+    """Walk `pages/` and find the markdown file whose frontmatter `id`
+    matches `page_id`. Returns None if no file matches.
+
+    Used by `reindex_page` for the case where the page isn't in
+    LanceDB yet (e.g., restored from disk; never indexed). Cheap fall
+    back — we already have LanceDB as the fast path; this is only
+    invoked when LanceDB doesn't know about the id.
+    """
+    pages_root = paths.pages_dir(smalt_root)
+    if not pages_root.exists():
+        return None
+    for path in pages_root.rglob("*.md"):
+        if not path.is_file():
+            continue
+        try:
+            parsed = parse_page(path, smalt_root=smalt_root)
+        except (ValidationError, ValueError, OSError):
+            continue
+        if parsed.frontmatter.id == page_id:
+            return path
+    return None
+
+
+async def reindex_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Force-re-index a single page from disk.
+
+    Locates the page (LanceDB lookup first, filesystem walk as
+    fallback), re-parses it, projects to `pages` + `embeddings` +
+    `links` + `claims` tables, refreshes FTS + ANN. Returns the
+    per-page indexer summary.
+
+    Use cases:
+      - The page was edited on disk outside the MCP write path (rare
+        but real — humans poking at the markdown directly).
+      - A proposal-apply via cobalt-grinding's orchestration updated
+        the page's body and the agent wants re-embedding even though
+        write_page already triggered the indexer (defensive belt-and-
+        suspenders for high-stakes edits).
+      - The page is on disk (e.g., post-restore) but not yet indexed.
+
+    Runs under the corpus mutex; one indexer pass for the single file.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+
+    with app.mutex.acquire("reindex_page"):
+        # Try LanceDB first; fall back to filesystem walk if the page
+        # isn't indexed yet.
+        rel_path = _existing_page_path(app, page_id)
+        if rel_path is not None:
+            file_path = app.cfg.smalt_dir / rel_path
+            if not file_path.exists():
+                # Indexed row points at a missing file — the caller
+                # probably wants remove_page, not reindex_page. Surface
+                # both so they can choose.
+                return {
+                    "error": "file_not_found",
+                    "page_id": page_id,
+                    "indexed_path": rel_path,
+                    "message": (
+                        f"page {page_id!r} is indexed at {rel_path!r} but the file is gone; "
+                        "use remove_page to drop the orphaned row, or restore the file first"
+                    ),
+                }
+        else:
+            file_path = _find_page_file_by_id(app.cfg.smalt_dir, page_id)
+            if file_path is None:
+                return {
+                    "error": "not_found",
+                    "page_id": page_id,
+                    "message": (
+                        f"page {page_id!r} not found in LanceDB or on disk; "
+                        "check the id (try find_by_alias if you have a memorable handle)"
+                    ),
+                }
+
+        from smalt_mcp.storage.indexer import Indexer
+
+        indexer = Indexer(
+            smalt_root=app.cfg.smalt_dir,
+            embedder=app.embedder(),
+            db=app.db(),
+        )
+        result = indexer.run(only_paths=[file_path])
+        app.record_indexer_run(result)
+
+    return {
+        "page_id": page_id,
+        "path": str(file_path.relative_to(app.cfg.smalt_dir)),
+        "index_result": result.to_dict(),
+    }
+
+
+async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Full LanceDB rebuild from disk: wipe every table, recreate
+    schemas, walk `pages/`, project everything.
+
+    The thorough version of `Indexer.run(full=True)` — handles the case
+    where the LanceDB tables themselves are missing or corrupt (e.g.,
+    post-restore from a Restic backup that excluded `index/lance/`).
+    For the "tables are healthy but I want to force re-embed" case,
+    `Indexer.run(full=True)` (no wipe) would suffice — but the public
+    `reindex_all` tool does the wipe-first variant because that's the
+    one operators actually need.
+
+    Runs under the corpus mutex for the whole rebuild. On a multi-GB
+    Smalt this can take minutes; concurrent writers are blocked. Not
+    yet async (C-13 will make it a background task).
+
+    Returns the full IndexResult summary of the rebuild pass.
+    """
+    if not app.smalt_exists():
+        return _not_initialized()
+
+    with app.mutex.acquire("reindex_all"):
+        db = app.db()
+
+        # Wipe every canonical table. LanceDB's drop_table raises
+        # ValueError (or its own NotFoundError) for missing tables —
+        # treat that as "already gone, nothing to do."
+        wiped: list[str] = []
+        for table_name in lance.ALL_TABLES:
+            try:
+                db.drop_table(table_name)
+                wiped.append(table_name)
+            except (FileNotFoundError, ValueError, KeyError):
+                continue  # already absent
+            except Exception as e:  # noqa: BLE001 — surface but don't crash
+                logger.warning("reindex_all: drop_table(%s) failed: %s", table_name, e)
+
+        # Recreate empty schemas.
+        recreated = lance.ensure_tables(
+            app.cfg.smalt_dir, embedding_dim=app.cfg.embedding.dim
+        )
+
+        # Full reindex from disk. The indexer's `full=True` mode
+        # force-re-projects every file; no hash short-circuit.
+        from smalt_mcp.storage.indexer import Indexer
+
+        indexer = Indexer(
+            smalt_root=app.cfg.smalt_dir,
+            embedder=app.embedder(),
+            db=db,
+        )
+        result = indexer.run(full=True)
+        app.record_indexer_run(result)
+
+    return {
+        "wiped_tables": wiped,
+        "recreated_tables": recreated,
+        "index_result": result.to_dict(),
+    }
+
+
 # ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
 
 
@@ -3172,6 +3351,63 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=write_batch,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="reindex_page",
+            description=(
+                "Force-re-index a single page from disk.\n\n"
+                "Locates the page (LanceDB lookup first; filesystem "
+                "walk fallback for pages that exist on disk but aren't "
+                "in the index — e.g., post-restore), re-parses, "
+                "projects to pages + embeddings + links + claims, "
+                "refreshes FTS + ANN. Returns the per-page indexer "
+                "summary.\n\n"
+                "Use cases:\n"
+                "  - The page was edited on disk outside the MCP write "
+                "path.\n"
+                "  - A high-stakes apply just landed and the operator "
+                "wants belt-and-suspenders re-embedding.\n"
+                "  - The page is on disk but not yet indexed.\n\n"
+                "Runs under the corpus mutex; one indexer pass."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "Canonical id of the page to re-index.",
+                    },
+                },
+                "required": ["page_id"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=reindex_page,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="reindex_all",
+            description=(
+                "Wipe every LanceDB table, recreate schemas, walk "
+                "`pages/`, project everything from disk. The explicit "
+                "version of `bootstrap` for the re-init case — operators "
+                "after a Restic restore (where `index/lance/` was "
+                "excluded from the backup) use this to rebuild the "
+                "derived index from the canonical markdown.\n\n"
+                "Runs under the corpus mutex for the whole rebuild. On "
+                "a multi-GB Smalt this can take minutes; concurrent "
+                "writers are blocked. Not yet async (C-13 will make it "
+                "a background task)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=reindex_all,
     ),
     # ---- REMOVE_DESTRUCTIVE ----
     ToolDef(
