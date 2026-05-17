@@ -493,6 +493,42 @@ def _rrf_fuse(rankings: list[list[str]], *, k: int = 60) -> list[tuple[str, floa
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
 
+def _find_alias_matches(app: App, query: str) -> list[str]:
+    """Return page_ids whose aliases match the query string.
+
+    Match rule: the page matches if **the whole query** appears verbatim
+    in its aliases list, OR if any whitespace-separated token of the
+    query appears verbatim. This handles both the common "search for the
+    alias directly" case (`search('ent-alice')`) and the embedded case
+    (`search('tell me about ent-alice')`).
+
+    Returns the page_ids in `pages`-table-scan order. The downstream RRF
+    treats them as a single ranked list — pages that match earlier in
+    the scan get slightly higher rank, but the ranking signal is weak.
+    The point is presence in the input set, not relative ordering inside it.
+    """
+    db = app.db()
+    pages = db.open_table(lance.TABLE_PAGES)
+    arrow = (
+        pages.search()
+        .select(["id", "frontmatter_json"])
+        .to_arrow()
+    )
+    needles: set[str] = {query}
+    needles.update(t.strip() for t in query.split() if t.strip())
+    matches: list[str] = []
+    for i in range(arrow.num_rows):
+        fm_raw = arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            continue
+        aliases = set(fm.get("aliases") or [])
+        if aliases & needles:
+            matches.append(arrow.column("id")[i].as_py())
+    return matches
+
+
 async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Hybrid search over the pages corpus: FTS (body) + vector (embeddings), RRF-fused.
 
@@ -542,29 +578,45 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         logger.warning("vector search failed: %s", e)
         vec_ids = []
 
-    if not fts_ids and not vec_ids:
+    # Third retrieval source: aliases. Catches the case where the query is
+    # (or contains) a page's alias — e.g., searching for the caller-id of a
+    # mangled page. FTS won't surface this because aliases aren't in the
+    # FTS-indexed columns; vector similarity won't either because the alias
+    # string isn't in the page body.
+    alias_ids = _find_alias_matches(app, query)
+
+    if not fts_ids and not vec_ids and not alias_ids:
         return {"results": [], "count": 0}
 
-    fused = _rrf_fuse([fts_ids, vec_ids])
+    fused = _rrf_fuse([fts_ids, vec_ids, alias_ids])
     top = fused[:top_k]
     top_ids = [pid for pid, _ in top]
 
-    # Hydrate with page metadata in one query.
+    # Hydrate with page metadata in one query. Pull frontmatter_json too so we
+    # can surface aliases per hit — callers often want to render results by a
+    # memorable handle (the caller-id-now-alias) rather than the canonical id.
     quoted = ", ".join(lance.sql_str(p) for p in top_ids)
     meta_arrow = (
         pages.search()
         .where(f"id IN ({quoted})")
-        .select(["id", "title", "type", "body"])
+        .select(["id", "title", "type", "body", "frontmatter_json"])
         .limit(len(top_ids))
         .to_arrow()
     )
     by_id: dict[str, dict[str, Any]] = {}
     for i in range(meta_arrow.num_rows):
         pid = meta_arrow.column("id")[i].as_py()
+        fm_raw = meta_arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            fm = {}
+        aliases = list(fm.get("aliases") or [])
         by_id[pid] = {
             "title": meta_arrow.column("title")[i].as_py(),
             "type": meta_arrow.column("type")[i].as_py(),
             "body": meta_arrow.column("body")[i].as_py() or "",
+            "aliases": aliases,
         }
 
     results = []
@@ -577,6 +629,7 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         results.append(
             {
                 "id": pid,
+                "aliases": meta["aliases"],
                 "title": meta["title"],
                 "type": meta["type"],
                 "snippet": snippet,
@@ -1657,11 +1710,22 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="search",
             description=(
-                "Hybrid search over the Smalt's pages: FTS (body) + vector "
-                "(summary embedding), fused via Reciprocal Rank Fusion. "
-                "Returns top-`top_k` matches with id, title, type, snippet, "
-                "and an RRF score. If the FTS index isn't built yet (very "
-                "small Smalts), falls back to vector-only ranking."
+                "Hybrid search over the Smalt's pages, three retrieval "
+                "sources fused via Reciprocal Rank Fusion:\n"
+                "  1. FTS over title + body (`pages` table indexes).\n"
+                "  2. Vector similarity over summary embeddings "
+                "(`embeddings` table).\n"
+                "  3. Alias match: any page whose `aliases` list contains "
+                "the query verbatim — or any whitespace-separated token "
+                "of the query verbatim — joins the ranking. Catches "
+                "searches for caller-ids of mangled pages "
+                "(e.g. `search('ent-alice')` finds a page whose canonical "
+                "id is `ent-alice-XYZ` because `ent-alice` is in its "
+                "`aliases`).\n\n"
+                "Returns top-`top_k` matches; each hit carries `id` "
+                "(canonical), `aliases`, `title`, `type`, `snippet`, and "
+                "`score` (RRF). Empty hit list if no retrieval source "
+                "matched."
             ),
             inputSchema={
                 "type": "object",

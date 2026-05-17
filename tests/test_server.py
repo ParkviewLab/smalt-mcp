@@ -296,7 +296,10 @@ def test_traverse_no_outgoing(mcp_client: TestClient):
 
 
 def test_search_finds_relevant_pages(mcp_client: TestClient):
-    """The word 'embedding' appears in 3 of 5 seed pages — FTS finds them."""
+    """The word 'embedding' appears in 3 of 5 seed pages — FTS finds them.
+
+    Every hit must carry id, aliases, title, type, snippet, score.
+    """
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "search", {"query": "embedding"}, req_id=50)
     ids = {r["id"] for r in result["results"]}
@@ -304,17 +307,140 @@ def test_search_finds_relevant_pages(mcp_client: TestClient):
     # The fake embedder may pull in others via random vector similarity, so
     # we assert subset rather than equality.
     assert {"con-embedding", "con-index", "src-doc1"} <= ids
-    # Snippet + score shape:
+    # Per-hit shape: required fields present.
     for r in result["results"]:
-        assert "snippet" in r
-        assert "score" in r
+        assert {"id", "aliases", "title", "type", "snippet", "score"} <= r.keys()
+        assert isinstance(r["aliases"], list)  # may be empty, but present
         assert r["score"] > 0
+
+
+def test_search_includes_aliases_for_mangled_pages(mcp_client: TestClient):
+    """A page created via write_page (always-mangle) has its caller-id in
+    aliases; that alias must appear in search hits so a caller can find
+    the page by its memorable handle."""
+    sid = _initialize(mcp_client)
+    # Create a page with a distinctive body so FTS will rank it.
+    fm = _ent_fm("ent-search-alias-probe", "Search-Alias-Probe Entity")
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": fm,
+            "body": "search-alias-probe distinctive body content for FTS",
+        },
+        req_id=53,
+    )
+    canonical = create["id"]
+    # Search by a distinctive word from the body.
+    result = _call_tool(
+        mcp_client, sid, "search", {"query": "search-alias-probe"}, req_id=54
+    )
+    # The mangled page should be in the results, with the caller-id in aliases.
+    matched = next((r for r in result["results"] if r["id"] == canonical), None)
+    assert matched is not None, f"expected canonical {canonical} in search results"
+    assert "ent-search-alias-probe" in matched["aliases"]
 
 
 def test_search_top_k_caps_results(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "search", {"query": "Alice", "top_k": 2}, req_id=51)
     assert result["count"] <= 2
+
+
+def test_search_matches_by_exact_alias(mcp_client: TestClient):
+    """Searching for the EXACT alias of a mangled page finds that page,
+    even if the alias doesn't appear in the page's body or title."""
+    sid = _initialize(mcp_client)
+    # Create a page whose body deliberately doesn't mention the caller-id.
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _ent_fm("ent-zzqx-aliasprobe", "Unrelated Title"),
+            "body": "totally unrelated body content with no matching tokens",
+        },
+        req_id=55,
+    )
+    canonical = create["id"]
+    assert "ent-zzqx-aliasprobe" in create["original_id"]
+    # Search by the caller-id (which is now an alias on the page).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "ent-zzqx-aliasprobe"},
+        req_id=56,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert canonical in ids, (
+        "search must find a page by alias even when the alias doesn't "
+        "appear in body or title"
+    )
+    # And the hit itself carries the matched alias in its aliases list.
+    matched = next(r for r in result["results"] if r["id"] == canonical)
+    assert "ent-zzqx-aliasprobe" in matched["aliases"]
+
+
+def test_search_tokenized_query_matches_alias(mcp_client: TestClient):
+    """A query that EMBEDS an alias (with other words around it) still
+    matches the page via alias retrieval — the whitespace-tokenized
+    matching catches it."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _ent_fm("ent-qqrx-tokenprobe", "Unrelated"),
+            "body": "another unrelated body with no matching content",
+        },
+        req_id=57,
+    )
+    canonical = create["id"]
+    # Query has other words; alias is one of the tokens.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "tell me about ent-qqrx-tokenprobe please"},
+        req_id=58,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert canonical in ids
+
+
+def test_search_alias_match_independent_of_fts_and_vector(mcp_client: TestClient):
+    """A query that matches NEITHER body FTS nor title FTS, but matches an
+    alias, still surfaces the page via the alias retrieval source.
+
+    Vector similarity will return SOMETHING via random fake-embedder
+    similarity, so we can't assert FTS+vector returned nothing — we just
+    assert the alias-matched page IS in the results, and ranks well
+    enough to fit in top_k."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _ent_fm("ent-qqrx-onlyalias", "title only here"),
+            "body": "body content has nothing in common with the query",
+        },
+        req_id=59,
+    )
+    canonical = create["id"]
+    # Query is the bare alias — should rank highly due to alias match.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "ent-qqrx-onlyalias", "top_k": 5},
+        req_id=60,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert canonical in ids
 
 
 def test_search_requires_query(mcp_client: TestClient):
