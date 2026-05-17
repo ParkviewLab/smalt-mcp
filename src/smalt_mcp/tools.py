@@ -1708,6 +1708,418 @@ async def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- handler: write_batch (READ_WRITE) — mixed-op transaction ----
+
+# Op kinds accepted in write_batch. Destructive ops (`remove_page`,
+# `remove_link`, `remove_claim`) are NOT accepted in v1 — they're at the
+# REMOVE_DESTRUCTIVE tier and including them would force write_batch up a
+# tier. Bulk versions (`add_links`, `add_claims`) are also not accepted —
+# callers can flatten them into many single-op entries, and supporting
+# batch-of-batch raises edge-case complexity for no real win.
+_WRITE_BATCH_OP_KINDS: frozenset[str] = frozenset({
+    "write_page",
+    "add_link",
+    "add_claim",
+    "update_claim",
+})
+
+
+async def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Mixed-op atomic transaction: pages + links + claims + claim-updates
+    in one MCP call. Single indexer pass at the end.
+
+    Each op in the batch is one of:
+      - `{kind: "write_page", frontmatter, body?, mode?}` (mode default "create")
+      - `{kind: "add_link", from_id, to_id, label?, via_source?}`
+      - `{kind: "add_claim", page_id, claim}`
+      - `{kind: "update_claim", page_id, claim_id, new_claim}`
+
+    **Three-phase contract** (matches `write_pages`):
+      1. Validate-all: every op's `kind` and args are validated before any
+         disk work. Any failure aborts the whole batch with
+         `{error: 'validation_error', index: N, message}` (or `unknown_kind`
+         for unrecognized op kinds).
+      2. Existence-check (under corpus mutex): for ops that reference an
+         existing page (add_link/add_claim/update_claim), verify the page
+         exists in LanceDB. For update_claim, verify the claim id exists
+         on that page. Any failure aborts with
+         `{error: 'not_found' | 'claim_not_found', index: N}`. NOTE: this
+         check uses pre-batch LanceDB state, so an op that targets a page
+         CREATED EARLIER IN THE SAME BATCH will be reported as not_found —
+         cross-op references inside a single batch are not supported. To
+         create a page and then add things to it, use two consecutive
+         write_batch calls (or two consecutive tool calls; the auto-indexer
+         on the first commit makes the second batch see the new page).
+      3. Commit (still under mutex): each op is executed inline (same
+         logic as its single-call counterpart but without the per-op
+         indexer pass). Disk writes happen sequentially; multiple ops on
+         the same page result in multiple read-modify-writes (correct;
+         intermediate state is mutex-protected and never visible to
+         other readers). The indexer runs **once** at the end.
+
+    Per-op results are returned in input order. On a successful batch:
+    `{committed: true, count: N, results: [...], index_result: {...}}`.
+
+    Skipping the indexer per-op is the whole point — for a batch of 20
+    mixed ops, the indexer's fastembed call + LanceDB writes happen once
+    instead of 20 times.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    ops = arguments.get("ops")
+    if not isinstance(ops, list) or not ops:
+        return {
+            "error": "missing_argument",
+            "message": "ops must be a non-empty list",
+        }
+
+    # ---- Phase 1: validate every op (no disk) ----
+
+    # Each entry is `(index, kind, validated_args_dict)`. We re-key the
+    # args into normalized shapes here so phase 3 doesn't need to re-parse.
+    validated: list[tuple[int, str, dict[str, Any]]] = []
+
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            return {"error": "validation_error", "index": i, "message": "each op must be an object"}
+        kind = op.get("kind")
+        if kind not in _WRITE_BATCH_OP_KINDS:
+            return {
+                "error": "unknown_kind",
+                "index": i,
+                "kind": kind,
+                "message": f"kind must be one of {sorted(_WRITE_BATCH_OP_KINDS)}; got {kind!r}",
+            }
+
+        if kind == "write_page":
+            fm = op.get("frontmatter")
+            if not fm:
+                return {"error": "validation_error", "index": i, "message": "frontmatter is required"}
+            body = op.get("body") or ""
+            mode = op.get("mode") or "create"
+            if mode not in _VALID_WRITE_MODES:
+                return {
+                    "error": "invalid_argument",
+                    "index": i,
+                    "message": f"mode must be one of {sorted(_VALID_WRITE_MODES)}; got {mode!r}",
+                }
+            try:
+                PAGE_ADAPTER.validate_python(fm)
+            except ValidationError as e:
+                return {"error": "validation_error", "index": i, "message": str(e)}
+            if fm.get("type") == PageType.INDEX.value:
+                return {
+                    "error": "forbidden_page_type",
+                    "index": i,
+                    "type": PageType.INDEX.value,
+                    "message": "IndexPages are auto-generated; direct writes via write_batch are rejected.",
+                }
+            validated.append((i, kind, {"frontmatter": fm, "body": body, "mode": mode}))
+
+        elif kind == "add_link":
+            from_id = op.get("from_id")
+            to_id = op.get("to_id")
+            if not from_id:
+                return {"error": "validation_error", "index": i, "message": "from_id is required"}
+            if not to_id:
+                return {"error": "validation_error", "index": i, "message": "to_id is required"}
+            link_shape: dict[str, Any] = {"target": to_id}
+            if op.get("label") is not None:
+                link_shape["label"] = op["label"]
+            if op.get("via_source") is not None:
+                link_shape["via_source"] = op["via_source"]
+            try:
+                from smalt_mcp.schema import Link
+                Link.model_validate(link_shape)
+            except ValidationError as e:
+                return {"error": "validation_error", "index": i, "message": str(e)}
+            validated.append((i, kind, {"from_id": from_id, "link": link_shape}))
+
+        elif kind == "add_claim":
+            page_id = op.get("page_id")
+            claim = op.get("claim")
+            if not page_id:
+                return {"error": "validation_error", "index": i, "message": "page_id is required"}
+            if not isinstance(claim, dict):
+                return {"error": "validation_error", "index": i, "message": "claim object is required"}
+            try:
+                validated_claim = Claim.model_validate(claim)
+            except ValidationError as e:
+                return {"error": "validation_error", "index": i, "message": str(e)}
+            validated.append((i, kind, {"page_id": page_id, "claim_raw": claim, "claim_id": validated_claim.id}))
+
+        else:  # kind == "update_claim"
+            page_id = op.get("page_id")
+            claim_id = op.get("claim_id")
+            new_claim = op.get("new_claim")
+            if not page_id:
+                return {"error": "validation_error", "index": i, "message": "page_id is required"}
+            if not claim_id:
+                return {"error": "validation_error", "index": i, "message": "claim_id is required"}
+            if not isinstance(new_claim, dict):
+                return {"error": "validation_error", "index": i, "message": "new_claim object is required"}
+            if new_claim.get("id") != claim_id:
+                return {
+                    "error": "invalid_argument",
+                    "index": i,
+                    "message": (
+                        f"new_claim.id ({new_claim.get('id')!r}) must match "
+                        f"claim_id ({claim_id!r}) — update doesn't rename claims"
+                    ),
+                }
+            try:
+                Claim.model_validate(new_claim)
+            except ValidationError as e:
+                return {"error": "validation_error", "index": i, "message": str(e)}
+            validated.append((i, kind, {"page_id": page_id, "claim_id": claim_id, "new_claim": new_claim}))
+
+    # ---- Phase 2 + 3: under corpus mutex ----
+
+    results: list[dict[str, Any]] = []
+    with app.mutex.acquire("write_batch"):
+        # Phase 2: existence checks for the ops that need them.
+        for i, kind, op in validated:
+            if kind == "write_page":
+                fm = op["frontmatter"]
+                mode = op["mode"]
+                if mode == "update":
+                    if _existing_page_path(app, fm["id"]) is None:
+                        return {
+                            "error": "not_found",
+                            "index": i,
+                            "id": fm["id"],
+                            "message": f"page {fm['id']!r} does not exist; batch aborted",
+                        }
+                # mode='create' with slug: no existence check (mangling
+                # makes each new id unique by construction).
+                # mode='create' with section id: upsert, no existence check.
+
+            elif kind == "add_link":
+                if _existing_page_path(app, op["from_id"]) is None:
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "page_id": op["from_id"],
+                        "message": f"page {op['from_id']!r} does not exist; batch aborted",
+                    }
+
+            elif kind == "add_claim":
+                if _existing_page_path(app, op["page_id"]) is None:
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "page_id": op["page_id"],
+                        "message": f"page {op['page_id']!r} does not exist; batch aborted",
+                    }
+
+            else:  # update_claim
+                page_path = _locate_page_file(app, op["page_id"])
+                if page_path is None or not page_path.exists():
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "page_id": op["page_id"],
+                        "message": f"page {op['page_id']!r} does not exist; batch aborted",
+                    }
+                # Check claim_id exists on the page — parse the file once
+                # (cheap; same file may be touched by later ops, but the
+                # claim_id check needs the on-disk state at phase-2 time).
+                try:
+                    parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+                except (ValidationError, ValueError, OSError) as e:
+                    return {
+                        "error": "parse_error",
+                        "index": i,
+                        "page_id": op["page_id"],
+                        "message": f"failed to parse {op['page_id']!r}: {e}",
+                    }
+                existing_claims = parsed.raw_frontmatter.get("claims") or []
+                claim_ids = {c.get("id") for c in existing_claims if isinstance(c, dict)}
+                if op["claim_id"] not in claim_ids:
+                    return {
+                        "error": "claim_not_found",
+                        "index": i,
+                        "page_id": op["page_id"],
+                        "claim_id": op["claim_id"],
+                        "message": (
+                            f"claim {op['claim_id']!r} not found on page "
+                            f"{op['page_id']!r}; batch aborted"
+                        ),
+                    }
+
+        # Phase 3: commit each op in order. Each op writes its own file;
+        # the indexer runs ONCE at the end.
+        for i, kind, op in validated:
+            if kind == "write_page":
+                fm_in = op["frontmatter"]
+                body = op["body"]
+                mode = op["mode"]
+                if mode == "create" and "::" in fm_in["id"]:
+                    # Section-id upsert path.
+                    page = PAGE_ADAPTER.validate_python(fm_in)
+                    target = _page_target_path(app.cfg.smalt_dir, page)
+                    already_existed = _existing_page_path(app, page.id) is not None
+                    _serialize_and_write_page(target, fm_in, body)
+                    results.append({
+                        "index": i,
+                        "kind": kind,
+                        "id": page.id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mode": "create",
+                        "mangled": False,
+                        "upserted": already_existed,
+                    })
+                elif mode == "create":
+                    # Slug create — always mangle.
+                    page, fm_out, original_id = _prepare_create_write(fm_in)
+                    target = _page_target_path(app.cfg.smalt_dir, page)
+                    if _existing_page_path(app, page.id) is not None:
+                        return {
+                            "error": "uuid_collision",
+                            "index": i,
+                            "id": page.id,
+                            "message": "UUID4 collision (extraordinary); retry the batch",
+                        }
+                    _serialize_and_write_page(target, fm_out, body)
+                    results.append({
+                        "index": i,
+                        "kind": kind,
+                        "id": page.id,
+                        "original_id": original_id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mode": "create",
+                        "mangled": True,
+                    })
+                else:  # mode == "update"
+                    page = PAGE_ADAPTER.validate_python(fm_in)
+                    target = _page_target_path(app.cfg.smalt_dir, page)
+                    _serialize_and_write_page(target, fm_in, body)
+                    results.append({
+                        "index": i,
+                        "kind": kind,
+                        "id": page.id,
+                        "path": str(target.relative_to(app.cfg.smalt_dir)),
+                        "type": page.type.value,
+                        "mode": "update",
+                        "mangled": False,
+                    })
+
+            elif kind == "add_link":
+                from_id = op["from_id"]
+                new_link = op["link"]
+                page_path = _locate_page_file(app, from_id)
+                # page_path can't be None — phase 2 verified existence.
+                parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+                existing_links = list(parsed.raw_frontmatter.get("links_out") or [])
+                duplicate = any(
+                    existing.get("target") == new_link["target"]
+                    and existing.get("label") == new_link.get("label")
+                    for existing in existing_links
+                )
+                if duplicate:
+                    results.append({
+                        "index": i,
+                        "kind": kind,
+                        "id": from_id,
+                        "added": False,
+                        "reason": "duplicate",
+                        "link": new_link,
+                    })
+                    continue
+                new_fm = dict(parsed.raw_frontmatter)
+                new_fm["links_out"] = existing_links + [new_link]
+                _serialize_and_write_page(page_path, new_fm, parsed.body)
+                results.append({
+                    "index": i,
+                    "kind": kind,
+                    "id": from_id,
+                    "added": True,
+                    "link": new_link,
+                    "links_out_count": len(new_fm["links_out"]),
+                })
+
+            elif kind == "add_claim":
+                page_id = op["page_id"]
+                claim_raw = op["claim_raw"]
+                claim_id = op["claim_id"]
+                page_path = _locate_page_file(app, page_id)
+                parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+                existing_claims = list(parsed.raw_frontmatter.get("claims") or [])
+                duplicate = any(c.get("id") == claim_id for c in existing_claims if isinstance(c, dict))
+                if duplicate:
+                    results.append({
+                        "index": i,
+                        "kind": kind,
+                        "id": page_id,
+                        "added": False,
+                        "reason": "duplicate_claim_id",
+                        "claim_id": claim_id,
+                    })
+                    continue
+                new_fm = dict(parsed.raw_frontmatter)
+                new_fm["claims"] = existing_claims + [claim_raw]
+                _serialize_and_write_page(page_path, new_fm, parsed.body)
+                results.append({
+                    "index": i,
+                    "kind": kind,
+                    "id": page_id,
+                    "added": True,
+                    "claim_id": claim_id,
+                    "claims_count": len(new_fm["claims"]),
+                })
+
+            else:  # update_claim
+                page_id = op["page_id"]
+                claim_id = op["claim_id"]
+                new_claim = op["new_claim"]
+                page_path = _locate_page_file(app, page_id)
+                parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+                claims = list(parsed.raw_frontmatter.get("claims") or [])
+                # Phase 2 already verified claim_id presence — but a
+                # prior op in this batch might have removed/added claims
+                # on the same page. Re-check at commit time too.
+                idx = next(
+                    (k for k, c in enumerate(claims) if isinstance(c, dict) and c.get("id") == claim_id),
+                    None,
+                )
+                if idx is None:
+                    return {
+                        "error": "claim_not_found",
+                        "index": i,
+                        "page_id": page_id,
+                        "claim_id": claim_id,
+                        "message": (
+                            f"claim {claim_id!r} not found on {page_id!r} at commit time "
+                            "(earlier op in this batch removed it?)"
+                        ),
+                    }
+                claims[idx] = new_claim
+                new_fm = dict(parsed.raw_frontmatter)
+                new_fm["claims"] = claims
+                _serialize_and_write_page(page_path, new_fm, parsed.body)
+                results.append({
+                    "index": i,
+                    "kind": kind,
+                    "id": page_id,
+                    "claim_id": claim_id,
+                    "updated": True,
+                })
+
+        # One indexer pass at the end.
+        index_result = _run_indexer(app)
+
+    return {
+        "committed": True,
+        "count": len(results),
+        "results": results,
+        "index_result": index_result,
+    }
+
+
 # ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
 
 
@@ -2625,6 +3037,67 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=add_claims,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="write_batch",
+            description=(
+                "Mixed-op atomic transaction: pages + links + claims + "
+                "claim-updates in one MCP call. Single indexer pass at "
+                "the end.\n\n"
+                "Each op is one of:\n"
+                "  - `{kind: 'write_page', frontmatter, body?, mode?}`\n"
+                "  - `{kind: 'add_link', from_id, to_id, label?, via_source?}`\n"
+                "  - `{kind: 'add_claim', page_id, claim}`\n"
+                "  - `{kind: 'update_claim', page_id, claim_id, new_claim}`\n\n"
+                "Three-phase contract (matches `write_pages`):\n"
+                "  1. **Validate-all**: every op's kind + args validated "
+                "before any disk work. Any failure aborts with "
+                "`{error: 'validation_error'|'unknown_kind', index: N}`.\n"
+                "  2. **Existence-check** (under corpus mutex): ops that "
+                "reference an existing page verify it exists in LanceDB. "
+                "**Cross-op references inside a single batch are NOT "
+                "supported** — an `add_link` targeting a page CREATED "
+                "earlier in the same batch will be reported as not_found. "
+                "To create + reference, use two consecutive batches.\n"
+                "  3. **Commit** (still under mutex): each op executes "
+                "inline (same logic as its single-call counterpart). "
+                "Multiple ops on the same page → multiple "
+                "read-modify-writes (correct; intermediate state is "
+                "mutex-protected). Indexer runs ONCE at the end.\n\n"
+                "Destructive op kinds (`remove_*`) are not accepted in "
+                "v1 — they're at the REMOVE_DESTRUCTIVE tier. Bulk op "
+                "kinds (`add_links`, `add_claims`) aren't accepted either "
+                "— callers flatten them into many single-op entries."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "List of op objects (see description for shapes).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "write_page",
+                                        "add_link",
+                                        "add_claim",
+                                        "update_claim",
+                                    ],
+                                },
+                            },
+                            "required": ["kind"],
+                        },
+                    },
+                },
+                "required": ["ops"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=write_batch,
     ),
     # ---- REMOVE_DESTRUCTIVE ----
     ToolDef(
