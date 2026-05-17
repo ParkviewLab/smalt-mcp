@@ -26,7 +26,7 @@ import frontmatter
 from mcp import types
 from pydantic import TypeAdapter, ValidationError
 
-from smalt_mcp.permissions import Scope
+from smalt_mcp.permissions import SCOPE_TIER, Scope
 from smalt_mcp.schema import Claim, Page, PageType, ProposalKind, ProposalPage
 from smalt_mcp.storage import lance, paths
 from smalt_mcp.storage.markdown import parse_page
@@ -428,6 +428,57 @@ async def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         )
     ]
     return {"from_id": from_id, "edges": edges, "count": len(edges)}
+
+
+# ---- handler: incoming_links (READ_ONLY) ----
+
+
+async def incoming_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List every link whose `to_id` matches `page_id` — the "what points
+    at me" view.
+
+    Symmetric to `traverse` (which lists OUTGOING links). Useful to audit
+    references before calling `remove_page` (which cascades — removing a
+    page silently drops all incoming references; this tool lets the caller
+    see them first).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    label = arguments.get("label")
+
+    db = app.db()
+    links = db.open_table(lance.TABLE_LINKS)
+    where = f"to_id = {lance.sql_str(page_id)}"
+    if label:
+        where += f" AND label = {lance.sql_str(label)}"
+    arrow = (
+        links.search()
+        .where(where)
+        .select(["from_id", "to_id", "label", "source_page"])
+        .limit(10_000)
+        .to_arrow()
+    )
+    edges = [
+        {
+            "from_id": f,
+            "to_id": t,
+            "label": lbl,
+            "source_page": sp,
+        }
+        for f, t, lbl, sp in zip(
+            arrow.column("from_id").to_pylist(),
+            arrow.column("to_id").to_pylist(),
+            arrow.column("label").to_pylist(),
+            arrow.column("source_page").to_pylist(),
+            strict=True,
+        )
+    ]
+    return {"to_id": page_id, "edges": edges, "count": len(edges)}
 
 
 # ---- handler: search ----
@@ -1177,6 +1228,250 @@ async def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
+
+
+async def remove_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Cascading delete of a page by canonical id.
+
+    Removes, all under the corpus mutex:
+      - the `.md` file from disk (`pages/<subdir>/<id>.md`)
+      - the `pages` row
+      - the `embeddings` row (page_id match)
+      - every outgoing link (from_id match)  ← the page is "leaving"
+      - every incoming link (to_id match)    ← references to the gone page
+      - every claim attached to the page (page_id match)
+
+    Use `incoming_links(page_id)` first if you want to audit what
+    references will be silently dropped.
+
+    No alias resolution: caller must pass the canonical id (use `find_by_alias`
+    or `read_page` to resolve from an alias first).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+
+    with app.mutex.acquire("remove_page"):
+        # Locate the page on disk (also serves as exists-check)
+        rel_path = _existing_page_path(app, page_id)
+        if rel_path is None:
+            return {"error": "not_found", "page_id": page_id}
+        abs_path = app.cfg.smalt_dir / rel_path
+
+        # Cascade: delete from each LanceDB table, then the file.
+        db = app.db()
+        quoted = lance.sql_str(page_id)
+
+        # Count what we're about to remove, for the response.
+        links_table = db.open_table(lance.TABLE_LINKS)
+        outgoing_n = links_table.search().where(f"from_id = {quoted}").to_arrow().num_rows
+        incoming_n = links_table.search().where(f"to_id = {quoted}").to_arrow().num_rows
+        claims_table = db.open_table(lance.TABLE_CLAIMS)
+        claims_n = claims_table.search().where(f"page_id = {quoted}").to_arrow().num_rows
+
+        # Delete rows
+        db.open_table(lance.TABLE_PAGES).delete(f"id = {quoted}")
+        db.open_table(lance.TABLE_EMBEDDINGS).delete(f"page_id = {quoted}")
+        links_table.delete(f"from_id = {quoted}")
+        links_table.delete(f"to_id = {quoted}")
+        claims_table.delete(f"page_id = {quoted}")
+
+        # Delete the file (after the index is clear, so a crash mid-op leaves
+        # the file present and the index missing — the indexer will surface a
+        # not-yet-indexed page rather than a phantom row pointing at nothing).
+        if abs_path.exists():
+            abs_path.unlink()
+
+    return {
+        "id": page_id,
+        "removed": {
+            "file": str(rel_path),
+            "outgoing_links": outgoing_n,
+            "incoming_links": incoming_n,
+            "claims": claims_n,
+            "embedding": 1,  # always 1 if the page was indexed
+        },
+    }
+
+
+# ---- handler: update_claim (REMOVE_DESTRUCTIVE) ----
+
+
+async def update_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Replace one claim on a page, identified by `claim_id` within the
+    page's `claims` list. Read-modify-write under the corpus mutex.
+
+    The new claim is validated against the `Claim` schema. The claim id
+    in `new_claim` must match `claim_id` (we don't let updates change the
+    identifier — use add_claim + remove_claim if you want to rename).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    claim_id = arguments.get("claim_id")
+    new_claim = arguments.get("new_claim")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    if not claim_id:
+        return {"error": "missing_argument", "message": "claim_id is required"}
+    if not new_claim or not isinstance(new_claim, dict):
+        return {"error": "missing_argument", "message": "new_claim object is required"}
+    if new_claim.get("id") != claim_id:
+        return {
+            "error": "invalid_argument",
+            "message": f"new_claim.id ({new_claim.get('id')!r}) must match claim_id ({claim_id!r})",
+        }
+    try:
+        Claim.model_validate(new_claim)
+    except ValidationError as e:
+        return {"error": "validation_error", "message": str(e)}
+
+    with app.mutex.acquire("update_claim"):
+        page_path = _locate_page_file(app, page_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": page_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+        claims: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("claims") or [])
+        idx = next((i for i, c in enumerate(claims) if c.get("id") == claim_id), None)
+        if idx is None:
+            return {
+                "error": "claim_not_found",
+                "page_id": page_id,
+                "claim_id": claim_id,
+            }
+        claims[idx] = new_claim
+        new_fm = dict(parsed.raw_frontmatter)
+        new_fm["claims"] = claims
+
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page_id,
+        "claim_id": claim_id,
+        "updated": True,
+        "index_result": index_result,
+    }
+
+
+# ---- handler: remove_claim (REMOVE_DESTRUCTIVE) ----
+
+
+async def remove_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Remove one claim from a page by `claim_id`. RMW under the mutex.
+
+    Returns `{error: 'claim_not_found'}` if the claim id isn't on the page.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    claim_id = arguments.get("claim_id")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    if not claim_id:
+        return {"error": "missing_argument", "message": "claim_id is required"}
+
+    with app.mutex.acquire("remove_claim"):
+        page_path = _locate_page_file(app, page_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": page_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+        claims: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("claims") or [])
+        new_claims = [c for c in claims if c.get("id") != claim_id]
+        if len(new_claims) == len(claims):
+            return {
+                "error": "claim_not_found",
+                "page_id": page_id,
+                "claim_id": claim_id,
+            }
+        new_fm = dict(parsed.raw_frontmatter)
+        new_fm["claims"] = new_claims
+
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page_id,
+        "claim_id": claim_id,
+        "removed": True,
+        "claims_remaining": len(new_claims),
+        "index_result": index_result,
+    }
+
+
+# ---- handler: remove_link (REMOVE_DESTRUCTIVE) ----
+
+
+async def remove_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Remove an outgoing link from a page, matched by (target, label).
+
+    If `label` is omitted, removes EVERY edge from `from_id` to `to_id`
+    regardless of label (returns a count). Otherwise removes only edges
+    with matching `(target, label)`.
+
+    RMW under the mutex. Returns `{removed: <count>}`; 0 means no matching
+    link existed (not an error — symmetric with add_link's duplicate-no-op).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    from_id = arguments.get("from_id")
+    to_id = arguments.get("to_id")
+    if not from_id:
+        return {"error": "missing_argument", "message": "from_id is required"}
+    if not to_id:
+        return {"error": "missing_argument", "message": "to_id is required"}
+    label = arguments.get("label")  # may be None → match-any-label
+
+    with app.mutex.acquire("remove_link"):
+        page_path = _locate_page_file(app, from_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": from_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+        links: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("links_out") or [])
+
+        def matches(link: dict[str, Any]) -> bool:
+            if link.get("target") != to_id:
+                return False
+            if label is None:
+                return True
+            return link.get("label") == label
+
+        kept = [link for link in links if not matches(link)]
+        removed = len(links) - len(kept)
+        if removed == 0:
+            return {
+                "id": from_id,
+                "removed": 0,
+                "reason": "no_matching_link",
+            }
+        new_fm = dict(parsed.raw_frontmatter)
+        new_fm["links_out"] = kept
+
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": from_id,
+        "removed": removed,
+        "links_remaining": len(kept),
+        "index_result": index_result,
+    }
+
+
 # ---- registry ----
 
 
@@ -1328,6 +1623,35 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=traverse,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="incoming_links",
+            description=(
+                "List every link whose `to_id` matches this page id — the "
+                "'what points at me' view. Symmetric to `traverse` (which "
+                "lists outgoing links). Each returned edge is "
+                "`{from_id, to_id, label, source_page}`. Use this before "
+                "`remove_page` to audit what references will be silently "
+                "dropped when the page is deleted."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "The page id being referenced (= the link's `to_id`).",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional edge-label filter.",
+                    },
+                },
+                "required": ["page_id"],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=incoming_links,
     ),
     ToolDef(
         spec=types.Tool(
@@ -1681,6 +2005,142 @@ TOOLS: list[ToolDef] = [
         scope=Scope.READ_WRITE,
         handler=add_claim,
     ),
+    # ---- REMOVE_DESTRUCTIVE ----
+    ToolDef(
+        spec=types.Tool(
+            name="remove_page",
+            description=(
+                "Cascading delete of a page by canonical id. Removes:\n"
+                "  - the `.md` file from disk\n"
+                "  - the `pages` row\n"
+                "  - the `embeddings` row\n"
+                "  - every outgoing link (from_id match)\n"
+                "  - every incoming link (to_id match) — references to "
+                "the gone page are silently dropped\n"
+                "  - every claim attached to the page\n\n"
+                "Use `incoming_links(page_id)` first to audit what "
+                "references will be dropped. No alias resolution: pass "
+                "the canonical id (use `find_by_alias` if you only have "
+                "an alias)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "Canonical id of the page to remove.",
+                    },
+                },
+                "required": ["page_id"],
+            },
+        ),
+        scope=Scope.REMOVE_DESTRUCTIVE,
+        handler=remove_page,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="update_claim",
+            description=(
+                "Replace one claim on a page, identified by `claim_id` "
+                "within the page's `claims` list. The `new_claim` is "
+                "validated against the `Claim` schema; its `id` must "
+                "equal `claim_id` (no renaming via update — use "
+                "add_claim + remove_claim if you need to rename). "
+                "Read-modify-write under the corpus mutex."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "claim_id": {"type": "string"},
+                    "new_claim": {
+                        "type": "object",
+                        "description": "The replacement claim shape (Claim schema).",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "value_type": {
+                                "type": "string",
+                                "enum": ["string", "number", "bool", "date"],
+                            },
+                            "value": {},
+                            "unit": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "confidence_label": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low", "unrated"],
+                            },
+                            "source_ref": {"type": "string"},
+                        },
+                        "required": ["id", "text"],
+                    },
+                },
+                "required": ["page_id", "claim_id", "new_claim"],
+            },
+        ),
+        scope=Scope.REMOVE_DESTRUCTIVE,
+        handler=update_claim,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="remove_claim",
+            description=(
+                "Remove one claim from a page by `claim_id`. "
+                "Read-modify-write under the corpus mutex. Returns "
+                "`{error: 'claim_not_found'}` if the id isn't on the "
+                "page."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "claim_id": {"type": "string"},
+                },
+                "required": ["page_id", "claim_id"],
+            },
+        ),
+        scope=Scope.REMOVE_DESTRUCTIVE,
+        handler=remove_claim,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="remove_link",
+            description=(
+                "Remove an outgoing link from a page, matched by "
+                "`(target, label)`. If `label` is omitted, removes "
+                "EVERY edge from `from_id` to `to_id` regardless of "
+                "label (returns a count). Otherwise removes only edges "
+                "with matching `(target, label)`. RMW under the mutex. "
+                "Returns `{removed: <count>}`; 0 means no matching link "
+                "existed (not an error — symmetric with add_link's "
+                "duplicate no-op)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_id": {
+                        "type": "string",
+                        "description": "Id of the page the link originates from.",
+                    },
+                    "to_id": {
+                        "type": "string",
+                        "description": "Id of the target page (the link's `target`).",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": (
+                            "Optional edge label. Omit to remove every "
+                            "edge between from_id and to_id regardless "
+                            "of label."
+                        ),
+                    },
+                },
+                "required": ["from_id", "to_id"],
+            },
+        ),
+        scope=Scope.REMOVE_DESTRUCTIVE,
+        handler=remove_link,
+    ),
 ]
 
 
@@ -1691,10 +2151,12 @@ _TOOLS_BY_NAME: dict[str, ToolDef] = {t.spec.name: t for t in TOOLS}
 
 
 def list_tools(scope: Scope) -> list[types.Tool]:
-    """Return the tool specs the caller is allowed to see."""
-    if scope is Scope.READ_WRITE:
-        return [t.spec for t in TOOLS]
-    return [t.spec for t in TOOLS if t.scope is Scope.READ_ONLY]
+    """Return the tool specs the caller is allowed to see.
+
+    Tier-based: caller at tier N sees every tool whose required scope is ≤ N.
+    """
+    caller_tier = SCOPE_TIER[scope]
+    return [t.spec for t in TOOLS if SCOPE_TIER[t.scope] <= caller_tier]
 
 
 async def dispatch(name: str, arguments: dict[str, Any], *, app: App, scope: Scope) -> dict[str, Any]:
@@ -1702,6 +2164,8 @@ async def dispatch(name: str, arguments: dict[str, Any], *, app: App, scope: Sco
     tool = _TOOLS_BY_NAME.get(name)
     if tool is None:
         raise KeyError(f"unknown tool: {name}")
-    if scope is Scope.READ_ONLY and tool.scope is Scope.READ_WRITE:
-        raise PermissionError(f"tool {name!r} requires read-write scope")
+    if SCOPE_TIER[tool.scope] > SCOPE_TIER[scope]:
+        raise PermissionError(
+            f"tool {name!r} requires scope {tool.scope.value!r}; caller has {scope.value!r}"
+        )
     return await tool.handler(app, arguments)
