@@ -2570,6 +2570,219 @@ def test_reindex_all_search_still_works(mcp_client: TestClient):
 
 
 # ---------------------------------------------------------------------------
+# Aliases LanceDB column (C-10)
+
+
+def test_pages_table_has_aliases_column(mcp_client: TestClient):
+    """The pages table schema includes a first-class `aliases` list<string>
+    column after C-10."""
+    sid = _initialize(mcp_client)
+    # Trigger an indexer pass to make sure ensure_tables ran (it does on
+    # conftest's seed bootstrap, but be explicit).
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c10-trigger", "trigger")},
+        req_id=1500,
+    )
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    assert "aliases" in table.schema.names
+    # Field type is list<string>.
+    aliases_field = table.schema.field("aliases")
+    import pyarrow as pa
+    assert pa.types.is_list(aliases_field.type)
+    assert pa.types.is_string(aliases_field.type.value_type)
+
+
+def test_alias_indexed_after_write_page(mcp_client: TestClient):
+    """A page written via the v0.5.0 always-mangle path has its caller-id
+    in `aliases`; after the write+indexer pass, that alias is in the
+    LanceDB column (not just in frontmatter_json)."""
+    sid = _initialize(mcp_client)
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c10-indexed-alias", "test")},
+        req_id=1510,
+    )
+    canonical = write["id"]
+    assert canonical.startswith("ent-c10-indexed-alias-")  # mangled
+
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    arrow = (
+        table.search()
+        .where(f"id = {lance.sql_str(canonical)}")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    aliases = arrow.column("aliases")[0].as_py()
+    # The original caller id is in the indexed aliases column.
+    assert "ent-c10-indexed-alias" in aliases
+
+
+def test_find_by_alias_uses_array_has_predicate(mcp_client: TestClient):
+    """find_by_alias returns matches via the indexed column. Hard to
+    distinguish 'indexed' vs 'scanned' from the response shape alone —
+    so this test mostly checks behavioral equivalence with the legacy
+    scan path."""
+    sid = _initialize(mcp_client)
+    # Seed: ent-alice has aliases: [Alicia].
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "Alicia"},
+        req_id=1520,
+    )
+    ids = {m["id"] for m in result["matches"]}
+    assert "ent-alice" in ids
+
+
+def test_search_alias_match_uses_indexed_column(mcp_client: TestClient):
+    """search() with a query that's an alias (the C-2 path that uses
+    _find_alias_matches) keeps working — but now via array_has under the
+    hood. Behavioral assertion: the alias-only page surfaces in search
+    results, same as it did pre-C-10."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _ent_fm("ent-c10-search-alias", "no body match"),
+            "body": "unrelated body content nothing matching the query",
+        },
+        req_id=1530,
+    )
+    canonical = create["id"]
+    # Search for the alias verbatim — FTS won't match (body is
+    # unrelated), but alias retrieval via array_has should.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "ent-c10-search-alias", "top_k": 5},
+        req_id=1531,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert canonical in ids, f"search via alias missed canonical {canonical}; got {ids}"
+
+
+def test_migration_adds_aliases_column_to_pre_c10_table(tmp_path):
+    """An existing pages table without the aliases column is migrated
+    (additively) on ensure_tables — column appears, existing rows get
+    NULL for aliases (no data loss)."""
+    import pyarrow as pa
+    from smalt_mcp.storage import lance
+
+    # Build a pre-C-10 schema (without aliases) + create a table with it.
+    pre_c10_schema = pa.schema(
+        [
+            pa.field("id", pa.string(), nullable=False),
+            pa.field("path", pa.string(), nullable=False),
+            pa.field("type", pa.string(), nullable=False),
+            pa.field("title", pa.string()),
+            pa.field("body", pa.string()),
+            pa.field("frontmatter_json", pa.string()),
+            pa.field("content_hash", pa.string()),
+            pa.field("created_at", pa.timestamp("us", tz="UTC")),
+            pa.field("updated_at", pa.timestamp("us", tz="UTC")),
+        ]
+    )
+    smalt_root = tmp_path / "migrate-smalt"
+    smalt_root.mkdir()
+    db = lance.connect(smalt_root)
+    db.create_table(lance.TABLE_PAGES, schema=pre_c10_schema, mode="create")
+    # Insert one row so the migration has something to operate on.
+    db.open_table(lance.TABLE_PAGES).add(
+        [
+            {
+                "id": "ent-legacy",
+                "path": "pages/entities/ent-legacy.md",
+                "type": "entity",
+                "title": "Legacy",
+                "body": "old data",
+                "frontmatter_json": "{}",
+                "content_hash": "deadbeef",
+                "created_at": None,
+                "updated_at": None,
+            }
+        ]
+    )
+
+    # Sanity: column is NOT there yet.
+    assert "aliases" not in db.open_table(lance.TABLE_PAGES).schema.names
+
+    # ensure_tables runs the migration.
+    created = lance.ensure_tables(smalt_root, embedding_dim=384)
+    # pages already existed → not in `created`; other tables created.
+    assert lance.TABLE_PAGES not in created
+
+    # After migration: column exists.
+    table = db.open_table(lance.TABLE_PAGES)
+    assert "aliases" in table.schema.names
+    # The legacy row's aliases is NULL (migration default).
+    arrow = (
+        table.search()
+        .where("id = 'ent-legacy'")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    assert arrow.column("aliases")[0].as_py() is None
+
+
+def test_migration_is_idempotent(tmp_path):
+    """Running ensure_tables twice doesn't error — the migration
+    short-circuits when the column is already present."""
+    from smalt_mcp.storage import lance
+
+    smalt_root = tmp_path / "idempotent-smalt"
+    smalt_root.mkdir()
+    # First call creates everything; second is a no-op (column present).
+    lance.ensure_tables(smalt_root, embedding_dim=384)
+    lance.ensure_tables(smalt_root, embedding_dim=384)
+    # No exception is the assertion. (LanceDB add_columns would raise
+    # if called with a duplicate column name.)
+    db = lance.connect(smalt_root)
+    assert "aliases" in db.open_table(lance.TABLE_PAGES).schema.names
+
+
+def test_reindex_all_populates_aliases_column(mcp_client: TestClient):
+    """reindex_all rebuilds the table from disk; pages with `aliases:` in
+    their frontmatter end up with the column populated. The seed Smalt's
+    ent-alice has `aliases: [Alicia]` — assert that after reindex_all
+    the column reflects this."""
+    sid = _initialize(mcp_client)
+    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1540)
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    arrow = (
+        table.search()
+        .where("id = 'ent-alice'")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    aliases = arrow.column("aliases")[0].as_py() or []
+    assert "Alicia" in aliases
+
+
+# ---------------------------------------------------------------------------
 # ID validation (path traversal + portability)
 #
 # Schema-level: rejected ids should never reach the filesystem. Every test
