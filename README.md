@@ -104,6 +104,44 @@ For the proposal / experiment / gap surface (writing hypotheses, recording exper
 | `EMBEDDING_DIM` | `384` | Must match the model. |
 | `SMALT_INTERNAL_TOKEN` | *(unset)* | Reserved for future per-client scope routing; not yet enforced. |
 
+## Operations: backup and restore
+
+The Smalt is a directory of markdown files (plus a rebuildable LanceDB index). **Use [Restic](https://restic.net/) directly against `SMALT_DIR`** for backup — there's no dedicated backup endpoint on the server, and it's intentional: Restic's content-defined chunk-level deduplication needs to see raw file content. Pointing it at the live directory gives real per-file dedup, real incremental snapshots, and a restore-as-directory-tree workflow that's strictly better than any server-side archive-export endpoint would deliver.
+
+### Backup
+
+```sh
+restic backup "$SMALT_DIR" --exclude "index/lance"
+```
+
+Excluding `index/lance/` is the recommended default — the LanceDB store is rebuildable from the markdown in `pages/`. Including it would roughly double snapshot size with bytes that the indexer can regenerate post-restore.
+
+You can run this against a live smalt-mcp (the server only holds the corpus mutex briefly, during the commit phase of a write). For a strictly point-in-time snapshot, stop the server first.
+
+### Restore
+
+```sh
+# 1. Stop smalt-mcp (otherwise it could race the restore).
+# 2. Restore from the latest snapshot to a staging dir.
+restic restore latest --target /staging
+
+# 3. Move the restored Smalt into place.
+mv /staging/<path-restic-recorded>/Smalt "$SMALT_DIR"
+
+# 4. Start smalt-mcp pointing at the restored SMALT_DIR.
+SMALT_DIR="$SMALT_DIR" uv run python -m smalt_mcp   # or your usual run mode
+```
+
+Then trigger an index rebuild via the MCP `bootstrap` tool. `bootstrap` is idempotent — it'll detect the restored markdown and rebuild the LanceDB index from it (since we excluded `index/lance/` from the backup). A planned future tool (`reindex_all`) will be the cleaner explicit version of this for the restore use case; until it ships, `bootstrap` is the right call.
+
+### Remote Smalts (running on a host where Restic can't reach the filesystem)
+
+Mount `SMALT_DIR` locally via SSHFS (or equivalent), then `restic backup` against the mount. Same per-file dedup as the local case, with one extra hop. If even SSHFS isn't possible (very restricted deployment), the prior approach of building a tar.gz server-side and piping to `restic backup --stdin` is technically possible but defeats Restic's dedup — every snapshot becomes one opaque binary blob. Not recommended.
+
+### Why no `/admin/backup` endpoint
+
+Earlier iterations of smalt-mcp briefly shipped a `GET /admin/backup` streaming tar.gz endpoint. It was removed in v0.12.0 after we realized the Restic-native pattern is strictly better for the common case. The endpoint design (streaming tar.gz via stdlib `tarfile`, best-effort consistency, scope-filtered downloads) was sound; the question was whether to ship a half-good answer (opaque blob, zero dedup) or the right answer (Restic against the filesystem). We chose the latter.
+
 ## Releasing
 
 Tag-driven via the release workflow on push of a `v*` tag. Use the [`ParkviewLab/dev-tools`](https://github.com/ParkviewLab/dev-tools) helpers — they enforce the SSOT-tag-CI loop (`pyproject.toml` is the only place the version lives; CI verifies the pushed tag matches before publishing).
