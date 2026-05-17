@@ -141,8 +141,9 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (8 read-only + 5 read-write + 4 remove-destructive = 17) should be
+    # (8 read-only + 7 read-write + 4 remove-destructive = 19) should be
     # listed. Proposal / experiment / gap tools moved to ebony-enriching.
+    # C-5 added: add_links + add_claims (bulk variants).
     assert names == {
         # READ_ONLY (8)
         "status",
@@ -153,12 +154,14 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
-        # READ_WRITE (5)
+        # READ_WRITE (7)
         "bootstrap",
         "write_page",
         "write_pages",
         "add_link",
+        "add_links",
         "add_claim",
+        "add_claims",
         # REMOVE_DESTRUCTIVE (4)
         "remove_page",
         "update_claim",
@@ -1389,6 +1392,445 @@ def test_add_claim_unknown_page(mcp_client: TestClient):
         req_id=241,
     )
     assert result["error"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# add_links (C-5) — bulk variant
+
+
+def test_add_links_batch_happy_path(mcp_client: TestClient):
+    """Batch of 5 distinct links — all written; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-links-src", "src")},
+        req_id=900,
+    )
+    src_id = src["id"]
+    # 5 distinct targets via new entity pages.
+    target_ids = []
+    for i in range(5):
+        t = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _ent_fm(f"ent-bulk-links-t{i}", f"t{i}")},
+            req_id=901 + i,
+        )
+        target_ids.append(t["id"])
+    links_arg = [{"target": tid, "label": "knows"} for tid in target_ids]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": src_id, "links": links_arg},
+        req_id=910,
+    )
+    assert result.get("error") is None, result
+    assert result["added_count"] == 5
+    assert result["duplicate_count"] == 0
+    assert all(r["added"] is True for r in result["results"])
+    # One indexer run at the end.
+    assert result["index_result"] is not None
+    # Round-trip: traverse from src finds all 5 targets.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src_id, "label": "knows"},
+        req_id=911,
+    )
+    trav_targets = {e["to_id"] for e in trav["edges"]}
+    for tid in target_ids:
+        assert tid in trav_targets
+
+
+def test_add_links_batch_with_existing_duplicate(mcp_client: TestClient):
+    """A batch containing one already-existing link reports that one as
+    duplicate; the others still get added; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-src", "src")},
+        req_id=920,
+    )
+    src_id = src["id"]
+    # Pre-existing target + link.
+    t_existing = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-existing-t", "t")},
+        req_id=921,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src_id, "to_id": t_existing["id"], "label": "knows"},
+        req_id=922,
+    )
+    # Two new targets.
+    t_new_a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-new-a", "a")},
+        req_id=923,
+    )
+    t_new_b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-new-b", "b")},
+        req_id=924,
+    )
+    # Batch: 3 links, one of which duplicates the existing one.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src_id,
+            "links": [
+                {"target": t_existing["id"], "label": "knows"},  # duplicate
+                {"target": t_new_a["id"], "label": "knows"},
+                {"target": t_new_b["id"], "label": "knows"},
+            ],
+        },
+        req_id=925,
+    )
+    assert result["added_count"] == 2
+    assert result["duplicate_count"] == 1
+    # Per-item results in order: first is duplicate, others added.
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate"
+    assert result["results"][1]["added"] is True
+    assert result["results"][2]["added"] is True
+
+
+def test_add_links_in_batch_duplicate_detected(mcp_client: TestClient):
+    """Two identical links in the SAME batch — the second is reported as
+    duplicate (matched against the first in-batch item, not the on-disk
+    state). Only one is actually appended."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-inbatch-src", "src")},
+        req_id=930,
+    )
+    t = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-inbatch-t", "t")},
+        req_id=931,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": t["id"], "label": "knows"},
+                {"target": t["id"], "label": "knows"},  # identical
+            ],
+        },
+        req_id=932,
+    )
+    assert result["added_count"] == 1
+    assert result["duplicate_count"] == 1
+    assert result["results"][0]["added"] is True
+    assert result["results"][1]["added"] is False
+
+
+def test_add_links_all_duplicates_skips_indexer(mcp_client: TestClient):
+    """If every item in the batch is a duplicate, the write + indexer pass
+    is skipped — `index_result` is null."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-skip-src", "src")},
+        req_id=940,
+    )
+    t = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-skip-t", "t")},
+        req_id=941,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src["id"], "to_id": t["id"], "label": "knows"},
+        req_id=942,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": src["id"], "links": [{"target": t["id"], "label": "knows"}]},
+        req_id=943,
+    )
+    assert result["added_count"] == 0
+    assert result["duplicate_count"] == 1
+    assert result["index_result"] is None
+
+
+def test_add_links_validation_aborts_batch(mcp_client: TestClient):
+    """One invalid entry (missing required `target`) aborts the whole batch.
+    The MCP input-schema validator catches this before the handler runs
+    (each link item declares `required: ['target']` in the tool spec).
+    Either way the post-condition holds: no partial commit happens, the
+    valid first entry is NOT written."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-abort-src", "src")},
+        req_id=950,
+    )
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": "ent-bob", "label": "knows"},  # valid
+                {"label": "knows"},  # missing target → MCP schema rejects whole call
+            ],
+        },
+        req_id=951,
+    )
+    assert "target" in text and (
+        "required" in text.lower() or "missing" in text.lower()
+    )
+    # Post-condition: the valid first entry was NOT written (no partial commit).
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src["id"]},
+        req_id=952,
+    )
+    assert trav["count"] == 0
+
+
+def test_add_links_handler_validation_rejects_unknown_field(mcp_client: TestClient):
+    """Handler-side: an extra field on a link (extra='forbid' on `Link`)
+    bypasses MCP-level checks but Pydantic catches it. This proves the
+    handler's `validate-all-then-act` phase actually runs and aborts the
+    batch with a structured JSON error (not just the MCP plain-text)."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-handler-abort-src", "src")},
+        req_id=955,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": "ent-bob", "label": "knows"},  # valid
+                {"target": "ent-bob", "label": "knows", "bogus_field": "x"},  # extra
+            ],
+        },
+        req_id=956,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # The valid first entry must NOT be written.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src["id"]},
+        req_id=957,
+    )
+    assert trav["count"] == 0
+
+
+def test_add_links_unknown_page_returns_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": "ent-no-such-page-AbCdEfGhIjKlMnOpQrStUv",
+            "links": [{"target": "ent-bob"}],
+        },
+        req_id=960,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_add_links_empty_list_rejected(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": "ent-alice", "links": []},
+        req_id=961,
+    )
+    assert result["error"] == "missing_argument"
+
+
+# ---------------------------------------------------------------------------
+# add_claims (C-5) — bulk variant
+
+
+def test_add_claims_batch_happy_path(mcp_client: TestClient):
+    """Batch of 3 distinct claims — all added; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-host", "host")},
+        req_id=970,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "bc1", "text": "first"},
+                {"id": "bc2", "text": "second", "confidence": 0.7},
+                {"id": "bc3", "text": "third"},
+            ],
+        },
+        req_id=971,
+    )
+    assert result.get("error") is None, result
+    assert result["added_count"] == 3
+    assert result["duplicate_count"] == 0
+    assert result["index_result"] is not None
+    # Round-trip via read_page — claims on the page.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page["id"]}, req_id=972
+    )
+    claim_ids = {c["id"] for c in read["frontmatter"]["claims"]}
+    assert {"bc1", "bc2", "bc3"} <= claim_ids
+
+
+def test_add_claims_batch_with_existing_duplicate(mcp_client: TestClient):
+    """One claim id already present → reported as duplicate; others added."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-dup", "host")},
+        req_id=980,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page["id"], "claim": {"id": "preexisting", "text": "ohai"}},
+        req_id=981,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "preexisting", "text": "duplicate attempt"},  # dup
+                {"id": "fresh1", "text": "fresh one"},
+                {"id": "fresh2", "text": "fresh two"},
+            ],
+        },
+        req_id=982,
+    )
+    assert result["added_count"] == 2
+    assert result["duplicate_count"] == 1
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate_claim_id"
+
+
+def test_add_claims_in_batch_duplicate_id_detected(mcp_client: TestClient):
+    """Two claims with the same id in one batch — second is duplicate."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-inbatch", "host")},
+        req_id=990,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "twin", "text": "first"},
+                {"id": "twin", "text": "second"},
+            ],
+        },
+        req_id=991,
+    )
+    assert result["added_count"] == 1
+    assert result["duplicate_count"] == 1
+    assert result["results"][1]["reason"] == "duplicate_claim_id"
+
+
+def test_add_claims_validation_aborts_batch(mcp_client: TestClient):
+    """Invalid claim (e.g., confidence out of range) aborts the whole batch."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-abort", "host")},
+        req_id=995,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "ok1", "text": "valid"},
+                {"id": "bad", "text": "x", "confidence": 5.0},  # out of [0,1]
+            ],
+        },
+        req_id=996,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # The valid first entry must NOT be written.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page["id"]}, req_id=997
+    )
+    claim_ids = {c["id"] for c in (read["frontmatter"].get("claims") or [])}
+    assert "ok1" not in claim_ids
 
 
 # ---------------------------------------------------------------------------

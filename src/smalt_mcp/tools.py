@@ -1506,6 +1506,208 @@ async def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- handler: add_links (READ_WRITE) — batch ----
+
+
+async def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Append multiple outgoing links to a page's `links_out` in one batch.
+
+    Validate-all-then-act contract:
+      1. Every link in the batch is validated against the `Link` schema.
+         Any validation failure aborts the whole batch with
+         `{error: 'validation_error', index: N, message: ...}`.
+      2. The page is located once (single existence check).
+      3. Duplicate detection runs per-item against (a) the page's
+         existing `links_out` on disk AND (b) earlier items in this same
+         batch. Duplicates are NOT errors — they're reported per-item as
+         `{added: false, reason: 'duplicate'}`, matching the single-call
+         `add_link` semantics. The non-duplicate items are written
+         atomically + the indexer runs once.
+
+    Net: one disk read, one disk write, one indexer pass per call —
+    instead of N round-trips for callers that have many links to add
+    (M3 ingest's entity-resolution stage is the motivating use case).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    links_in = arguments.get("links")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    if not isinstance(links_in, list) or not links_in:
+        return {
+            "error": "missing_argument",
+            "message": "links must be a non-empty list",
+        }
+
+    # Phase 1: validate every entry's structure (no disk).
+    from smalt_mcp.schema import Link
+
+    validated_dicts: list[dict[str, Any]] = []
+    for i, item in enumerate(links_in):
+        if not isinstance(item, dict):
+            return {"error": "validation_error", "index": i, "message": "each link must be an object"}
+        try:
+            Link.model_validate(item)
+        except ValidationError as e:
+            return {"error": "validation_error", "index": i, "message": str(e)}
+        # Preserve the user-supplied dict shape (omit None defaults so the
+        # frontmatter stays sparse — mirrors single-call add_link).
+        clean: dict[str, Any] = {"target": item["target"]}
+        if item.get("label") is not None:
+            clean["label"] = item["label"]
+        if item.get("via_source") is not None:
+            clean["via_source"] = item["via_source"]
+        validated_dicts.append(clean)
+
+    results: list[dict[str, Any]] = []
+    added_count = 0
+    with app.mutex.acquire("add_links"):
+        page_path = _locate_page_file(app, page_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": page_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+        existing_links: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("links_out") or [])
+
+        # Build a key-set over (target, label) for fast duplicate detection.
+        # Same identity as the single-call add_link uses.
+        def _link_key(link: dict[str, Any]) -> tuple[Any, Any]:
+            return (link.get("target"), link.get("label"))
+
+        seen_keys: set[tuple[Any, Any]] = {_link_key(existing) for existing in existing_links}
+        to_append: list[dict[str, Any]] = []
+
+        for link in validated_dicts:
+            key = _link_key(link)
+            if key in seen_keys:
+                results.append({"added": False, "reason": "duplicate", "link": link})
+                continue
+            seen_keys.add(key)
+            to_append.append(link)
+            results.append({"added": True, "link": link})
+            added_count += 1
+
+        # If no items actually need adding, skip the write + indexer pass.
+        if not to_append:
+            return {
+                "id": page_id,
+                "added_count": 0,
+                "duplicate_count": len(results),
+                "results": results,
+                "links_out_count": len(existing_links),
+                "index_result": None,
+            }
+
+        new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
+        new_fm["links_out"] = existing_links + to_append
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page_id,
+        "added_count": added_count,
+        "duplicate_count": len(results) - added_count,
+        "results": results,
+        "links_out_count": len(existing_links) + len(to_append),
+        "index_result": index_result,
+    }
+
+
+# ---- handler: add_claims (READ_WRITE) — batch ----
+
+
+async def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Append multiple Claims to a page's `claims` list in one batch.
+
+    Same validate-all-then-act contract as `add_links`:
+      1. Every claim is validated against the `Claim` schema; any
+         validation failure aborts the whole batch.
+      2. The page is located once.
+      3. Duplicate detection (by claim `id`) runs per-item against the
+         existing claims AND against earlier items in this same batch;
+         duplicates are reported per-item, not errors.
+      4. Non-duplicates are appended atomically + the indexer runs once.
+
+    Net: one disk read, one disk write, one indexer pass per call.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    page_id = arguments.get("page_id")
+    claims_in = arguments.get("claims")
+    if not page_id:
+        return {"error": "missing_argument", "message": "page_id is required"}
+    if not isinstance(claims_in, list) or not claims_in:
+        return {
+            "error": "missing_argument",
+            "message": "claims must be a non-empty list",
+        }
+
+    # Phase 1: validate every entry's structure (no disk).
+    validated_pairs: list[tuple[dict[str, Any], str]] = []  # (raw_dict, claim_id)
+    for i, item in enumerate(claims_in):
+        if not isinstance(item, dict):
+            return {"error": "validation_error", "index": i, "message": "each claim must be an object"}
+        try:
+            validated = Claim.model_validate(item)
+        except ValidationError as e:
+            return {"error": "validation_error", "index": i, "message": str(e)}
+        # Keep the raw user-supplied dict (sparse-on-disk philosophy);
+        # use the validated model only for the id (defense against
+        # weird casing / extra-fields drift).
+        validated_pairs.append((item, validated.id))
+
+    results: list[dict[str, Any]] = []
+    added_count = 0
+    with app.mutex.acquire("add_claims"):
+        page_path = _locate_page_file(app, page_id)
+        if page_path is None or not page_path.exists():
+            return {"error": "not_found", "page_id": page_id}
+
+        parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
+        existing_claims: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("claims") or [])
+
+        existing_ids: set[str] = {c.get("id") for c in existing_claims if c.get("id")}
+        to_append: list[dict[str, Any]] = []
+
+        for raw, claim_id in validated_pairs:
+            if claim_id in existing_ids:
+                results.append({"added": False, "reason": "duplicate_claim_id", "claim_id": claim_id})
+                continue
+            existing_ids.add(claim_id)  # block in-batch duplicates from the same id
+            to_append.append(raw)
+            results.append({"added": True, "claim_id": claim_id})
+            added_count += 1
+
+        if not to_append:
+            return {
+                "id": page_id,
+                "added_count": 0,
+                "duplicate_count": len(results),
+                "results": results,
+                "claims_count": len(existing_claims),
+                "index_result": None,
+            }
+
+        new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
+        new_fm["claims"] = existing_claims + to_append
+        _serialize_and_write_page(page_path, new_fm, parsed.body)
+        index_result = _run_indexer(app)
+
+    return {
+        "id": page_id,
+        "added_count": added_count,
+        "duplicate_count": len(results) - added_count,
+        "results": results,
+        "claims_count": len(existing_claims) + len(to_append),
+        "index_result": index_result,
+    }
+
+
 # ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
 
 
@@ -2320,6 +2522,109 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=add_claim,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="add_links",
+            description=(
+                "Batch-append multiple outgoing links to one page's "
+                "`links_out`. One disk read, one disk write, one indexer "
+                "pass per call — versus N round-trips for callers that "
+                "have many links to add (M3 ingest's entity-resolution "
+                "stage being the motivating case).\n\n"
+                "Validate-all-then-act: every link is validated against "
+                "the `Link` schema before any disk work. Any validation "
+                "failure aborts the whole batch with "
+                "`{error: 'validation_error', index: N}`. Duplicate "
+                "links (same `target` AND `label`) are NOT errors — "
+                "they're reported per-item as "
+                "`{added: false, reason: 'duplicate'}` (matches "
+                "single-call `add_link`). Duplicate detection runs "
+                "against existing links on disk AND against earlier "
+                "items in the same batch.\n\n"
+                "If 0 items actually need adding (all duplicates), the "
+                "write + indexer pass is skipped entirely; "
+                "`index_result` in the response is `null`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "Id of the page to append links to.",
+                    },
+                    "links": {
+                        "type": "array",
+                        "description": "List of Link objects to append.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "target": {"type": "string"},
+                                "label": {"type": "string"},
+                                "via_source": {"type": "string"},
+                            },
+                            "required": ["target"],
+                        },
+                    },
+                },
+                "required": ["page_id", "links"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=add_links,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="add_claims",
+            description=(
+                "Batch-append multiple Claims to one page's `claims` "
+                "list. Same shape as `add_links`: one disk read, one "
+                "disk write, one indexer pass.\n\n"
+                "Validate-all-then-act: each claim is validated against "
+                "the `Claim` schema; any validation failure aborts the "
+                "whole batch. Duplicate claim ids (in existing claims OR "
+                "in earlier batch items) are reported per-item as "
+                "`{added: false, reason: 'duplicate_claim_id'}` — not "
+                "errors. If 0 items need adding, the write + indexer "
+                "pass is skipped."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "Id of the page to append claims to.",
+                    },
+                    "claims": {
+                        "type": "array",
+                        "description": "List of Claim objects to append.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "text": {"type": "string"},
+                                "value_type": {
+                                    "type": "string",
+                                    "enum": ["string", "number", "bool", "date"],
+                                },
+                                "value": {},
+                                "unit": {"type": "string"},
+                                "confidence": {"type": "number"},
+                                "confidence_label": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low", "unrated"],
+                                },
+                                "source_ref": {"type": "string"},
+                            },
+                            "required": ["id", "text"],
+                        },
+                    },
+                },
+                "required": ["page_id", "claims"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=add_claims,
     ),
     # ---- REMOVE_DESTRUCTIVE ----
     ToolDef(
