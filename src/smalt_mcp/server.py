@@ -159,7 +159,7 @@ class AdminVersion(BaseModel):
     smalt_exists: bool
 
 
-@router.get("/admin/version", response_model=AdminVersion)
+@router.get("/admin/version", response_model=AdminVersion, tags=["admin"])
 async def admin_version() -> AdminVersion:
     return AdminVersion(
         name="smalt-mcp",
