@@ -22,9 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---- id validation ----
 #
-# Page ids and proposal ids become path components on disk
-# (`pages/<subdir>/<id>.md`, `tasks/proposals/<subdir>/<id>.md`). The same is
-# true for `ProposalPage.proposed_by` (the subdir). Reject anything that:
+# Page ids become path components on disk (`pages/<subdir>/<id>.md`).
+# Reject anything that:
 #
 #   - would escape its target directory (`..`, `/`, `\`, leading `.`)
 #   - is non-portable across Windows/macOS/Linux (`<>:"|?*`, whitespace,
@@ -78,70 +77,6 @@ class PageType(StrEnum):
     CONCEPT = "concept"
     SOURCE = "source"
     SYNTHESIS = "synthesis"  # cross-source pages, written by Cogitate (Phase 2)
-
-
-class ProposalKind(StrEnum):
-    """Kind of proposal. Determines which downstream system / lifecycle applies.
-
-    The full set is described in `cobalt-grinding/docs/plan.md` → "Proposal
-    document shape and lifecycle"; keep this enum in sync as new kinds land.
-    """
-
-    # Schema layer — Cogitate proposes additions; Curate flags drift/removal.
-    SCHEMA_ADDITION = "schema_addition"
-    SCHEMA_DRIFT = "schema_drift"
-    SCHEMA_REMOVAL = "schema_removal"
-
-    # Graph structure — Cogitate constructs; Curate critiques.
-    WIKI_EDGE = "wiki_edge"
-    CONCEPT_MERGE = "concept_merge"
-    NOVEL_CONCEPT = "novel_concept"
-    CONTRADICTION = "contradiction"
-    NOVEL_SYNTHESIS = "novel_synthesis"
-
-    # Corpus growth — Research proposes new sources.
-    SOURCE_ADOPTION = "source_adoption"
-
-    # Capability surface — Toolsmith (Phase 3).
-    TOOL_ADOPTION = "tool_adoption"
-    TOOL_SPECIFICATION = "tool_specification"
-    TOOLKIT_ADDITION = "toolkit_addition"
-    TOOLKIT_REMOVAL = "toolkit_removal"
-
-    # Curate audits.
-    ORPHAN = "orphan"
-    DUPLICATE = "duplicate"
-    BROKEN_LINK = "broken_link"
-    STALENESS = "staleness"
-
-
-class ProposalStatus(StrEnum):
-    """Lifecycle state of a proposal."""
-
-    PROPOSED = "proposed"
-    UNDER_TEST = "under_test"
-    VALIDATED = "validated"
-    REJECTED = "rejected"
-    APPLIED = "applied"
-    SUPERSEDED = "superseded"
-
-
-class TestStatus(StrEnum):
-    """Test outcome for a proposal's prediction."""
-
-    UNTESTED = "untested"
-    PASSED = "passed"
-    FAILED = "failed"
-    UNTESTABLE = "untestable"  # falsifiability gap; the user is the test
-
-
-class TestCost(StrEnum):
-    """Coarse cost tier. Governs whether the system auto-tests."""
-
-    TRIVIAL = "trivial"   # no test required; user-approve and apply
-    CHEAP = "cheap"       # auto-test
-    MEDIUM = "medium"     # test if budget allows
-    EXPENSIVE = "expensive"  # run only on user request
 
 
 class LocationKind(StrEnum):
@@ -411,62 +346,7 @@ Page = Annotated[
 ]
 """Any Smalt page, discriminated on `type`."""
 
-
-# ---- ProposalPage (lives outside the Page union) ----
-#
-# Proposals don't live in `pages/` — they live in `tasks/proposals/<system or
-# schema>/`. The indexer walks `pages/` only, so ProposalPages aren't
-# projected into the LanceDB pages table. Keeping them out of the discriminated
-# `Page` union keeps that boundary clean.
-#
-# Per `cobalt-grinding/docs/plan.md` → "Proposal document shape and lifecycle":
-# every system that doesn't directly write the corpus emits proposals (Curate,
-# Cogitate, Research, Converse's novelty detector, Toolsmith). Each proposal
-# is a hypothesis with a falsifiable prediction; the system tests where cheap
-# and the user reviews hypothesis + evidence together.
-
-
-class ProposalPage(BaseModel):
-    """Structured proposal — Observation/Hypothesis/Prediction/Test in body;
-    lifecycle + provenance metadata in frontmatter.
-
-    The body is plain markdown with an expected section ordering
-    (Observation, Hypothesis, Prediction, Test, Reasoning); this model only
-    validates the frontmatter shape.
-    """
-
-    model_config = ConfigDict(extra="allow")  # forward-compat for new kinds/fields
-
-    id: str = Field(description="stable proposal id; usually a slug")
-    type: Literal["proposal"] = "proposal"
-    title: str
-    proposal_kind: ProposalKind
-    status: ProposalStatus = ProposalStatus.PROPOSED
-    proposed_by: str = Field(
-        description=(
-            "name of the agentic system that emitted this proposal — typically "
-            "one of: cogitate, curate, research, converse, toolsmith"
-        ),
-    )
-    proposed_at: datetime
-    test_status: TestStatus = TestStatus.UNTESTED
-    test_cost: TestCost = TestCost.MEDIUM
-    related_pages: list[str] = Field(
-        default_factory=list,
-        description="ids of pages this proposal references (its `Observation` source material)",
-    )
-    supersedes: str | None = Field(
-        default=None, description="proposal id this proposal supersedes, if any"
-    )
-    superseded_by: str | None = Field(
-        default=None,
-        description="proposal id that supersedes this one (set when a later proposal lands)",
-    )
-
-    # Both `id` and `proposed_by` become path components for the routing
-    # in `tools._proposal_target_path` (`tasks/proposals/<proposed_by>/<id>.md`).
-    # Apply the same path-traversal + portability guard as PageBase.id.
-    @field_validator("id", "proposed_by")
-    @classmethod
-    def _check_path_components(cls, v: str) -> str:
-        return _validate_id(v)
+# Proposals (the scientific-method surface) live in a separate substrate:
+# the `ebony-enriching` MCP server, with its own `ProposalPage` schema and
+# `EBONY_ENRICHING_DIR` storage. Smalt-mcp is purely the canonical
+# knowledge substrate — no proposal / experiment / gap models live here.
