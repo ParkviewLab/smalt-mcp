@@ -6,9 +6,9 @@ To `cobalt-grinding` what [`deco-assaying`](https://github.com/ParkviewLab/deco-
 
 ## Status
 
-**v0 foundation.** Server runs; one MCP tool (`status`) wired up; storage layer ported from `cobgrind/storage/` and ready for the rest of the tool surface. Track A of CoGrind's M2.7 plan — see [`cobalt-grinding/docs/plan.md`](https://github.com/ParkviewLab/cobalt-grinding/blob/main/docs/plan.md) for the full design.
+**Storage substrate complete.** The full storage-substrate surface is wired up: 17 tools across three permission tiers, with auto-indexer-trigger on writes and hybrid (FTS + vector + alias, RRF-fused) search. Track A of CoGrind's M2.7 plan — see [`cobalt-grinding/docs/plan.md`](https://github.com/ParkviewLab/cobalt-grinding/blob/main/docs/plan.md) for the full design.
 
-Coming in the next iterations: read-only tools (`list_pages`, `read_page`, `search`, `traverse`, `list_domains`, `list_proposals`), read-write tools (`write_page`, `write_pages`, `add_link`, `add_claim`, `write_proposal`, `bootstrap`), auto-indexer-trigger on writes, end-to-end integration with CoGrind.
+The scientific-method surface (proposals / experiments / gaps) is **not** part of smalt-mcp — it lives in a separate MCP server, [`ebony-enriching`](https://github.com/ParkviewLab/ebony-enriching), the lab-notebook substrate. Cobalt-grinding's cognitive systems read from both substrates and orchestrate cross-substrate writes.
 
 ## Run
 
@@ -59,15 +59,37 @@ Or use [`docker-compose.yml`](docker-compose.yml).
 
 HTTP responses are gzipped when the client sends `Accept-Encoding: gzip`.
 
-## MCP tools (v0)
+## MCP tools
 
-**Read-only:**
+Three permission tiers controlled by `SMALT_SCOPE`. A caller at tier N sees and may call any tool whose required scope is ≤ N.
 
-- `status` — Smalt path, existence, LanceDB tables present, page count, single-writer mutex state, embedding provider. Always safe to call.
+**`read_only` (8 tools):**
 
-**Read-write:** *(coming next iteration)*
+- `status` — Smalt path, existence, LanceDB tables, page count, single-writer mutex state, embedding provider.
+- `list_pages` — indexed pages, filtered by `type` / `prefix`.
+- `read_page` — full page (frontmatter + body); falls back to alias lookup on miss.
+- `find_by_alias` — every page whose `aliases` list contains the given alias.
+- `incoming_links` — "what links to this page" (the inverse of `traverse`).
+- `traverse` — outgoing edges from a page; optional label filter.
+- `search` — hybrid FTS + vector + alias, RRF-fused; every hit carries `id`, `aliases`, `title`, `type`, `snippet`, `score`.
+- `list_domains` — ConceptPages flagged `is_domain: true`.
 
-The full target surface is in [`cobalt-grinding/docs/plan.md`](https://github.com/ParkviewLab/cobalt-grinding/blob/main/docs/plan.md) under "Track A — `ParkviewLab/smalt-mcp` v0".
+**`read_write` (+5 tools):**
+
+- `bootstrap` — initialize the canonical layout + LanceDB tables; idempotent.
+- `write_page` — `create` (always-mangle: caller-id becomes slug-prefix + 22-char UUID4 suffix; original id preserved in aliases) or `update` (requires existing canonical id). Runs the incremental indexer.
+- `write_pages` — batch of writes; validate-all-then-act; single indexer pass at the end.
+- `add_link` — append an outgoing link to a page's `links_out`; duplicate detection.
+- `add_claim` — append a `Claim` to a page's `claims`; duplicate-id detection.
+
+**`remove_destructive` (+4 tools):**
+
+- `remove_page` — cascading delete (file + pages row + embeddings row + outgoing + incoming links + claims).
+- `update_claim` — replace one claim by id; `new_claim.id` must equal `claim_id`.
+- `remove_claim` — remove one claim by id.
+- `remove_link` — remove edges by `(from_id, to_id, label?)`; omit `label` to drop every edge between the pair.
+
+For the proposal / experiment / gap surface (writing hypotheses, recording experiment runs, queueing knowledge gaps), use [`ebony-enriching`](https://github.com/ParkviewLab/ebony-enriching) — the lab-notebook substrate. Both servers are independent: cobalt-grinding's cognitive systems orchestrate any cross-substrate flow.
 
 ## Configuration
 
@@ -75,8 +97,8 @@ The full target surface is in [`cobalt-grinding/docs/plan.md`](https://github.co
 |---|---|---|
 | `PORT` | `35833` | HTTP listen port. |
 | `HOST` | `0.0.0.0` | HTTP bind address. |
-| `SMALT_DIR` | `~/Documents/Smalt` | Path to the Smalt this server wraps. Auto-created on bootstrap (planned). |
-| `SMALT_SCOPE` | `read_write` | `read_only` or `read_write`. Read-only deployments only expose tools that don't mutate the corpus. |
+| `SMALT_DIR` | `~/Documents/Smalt` | Path to the Smalt this server wraps. Call the `bootstrap` MCP tool once to initialize. |
+| `SMALT_SCOPE` | `read_write` | `read_only`, `read_write`, or `remove_destructive`. Tiered: caller at tier N sees every tool whose required scope is ≤ N. |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding backend. `fastembed` is the only one wired up; `voyage` / `openai` are placeholders. |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Model name passed to the provider. |
 | `EMBEDDING_DIM` | `384` | Must match the model. |

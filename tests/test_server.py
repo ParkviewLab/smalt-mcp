@@ -140,10 +140,11 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     body, _ = _mcp(mcp_client, "tools/list", {}, req_id=2, session_id=sid)
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
-    # Server defaults to read_write scope; every tool (7 read-only + 4
-    # read-write) should be listed.
+    # Server runs at remove_destructive scope (from conftest); every tool
+    # (8 read-only + 5 read-write + 4 remove-destructive = 17) should be
+    # listed. Proposal / experiment / gap tools moved to ebony-enriching.
     assert names == {
-        # READ_ONLY (9)
+        # READ_ONLY (8)
         "status",
         "list_pages",
         "read_page",
@@ -152,12 +153,10 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
-        "list_proposals",
-        # READ_WRITE (6)
+        # READ_WRITE (5)
         "bootstrap",
         "write_page",
         "write_pages",
-        "write_proposal",
         "add_link",
         "add_claim",
         # REMOVE_DESTRUCTIVE (4)
@@ -684,177 +683,6 @@ def test_list_domains_ignores_non_domain_concepts(mcp_client: TestClient):
 
 
 # ---------------------------------------------------------------------------
-# write_proposal + list_proposals
-
-
-def _proposal_now() -> str:
-    from datetime import UTC, datetime
-
-    return datetime.now(UTC).isoformat()
-
-
-def test_write_proposal_routes_schema_kind_to_schema_subdir(mcp_client: TestClient):
-    """schema_addition proposals land in tasks/proposals/schema/, regardless of proposed_by."""
-    sid = _initialize(mcp_client)
-    fm = {
-        "id": "prop-test-schema-1",
-        "type": "proposal",
-        "title": "Add foo field to ConceptPage",
-        "proposal_kind": "schema_addition",
-        "proposed_by": "cogitate",
-        "proposed_at": _proposal_now(),
-    }
-    result = _call_tool(
-        mcp_client,
-        sid,
-        "write_proposal",
-        {"frontmatter": fm, "body": "## Observation\n\nfoo"},
-        req_id=100,
-    )
-    assert result["id"] == "prop-test-schema-1"
-    assert result["subdir"] == "schema"
-    assert result["path"] == "tasks/proposals/schema/prop-test-schema-1.md"
-    assert result["proposal_kind"] == "schema_addition"
-    assert result["status"] == "proposed"
-
-
-def test_write_proposal_routes_other_kind_to_proposer_subdir(mcp_client: TestClient):
-    """Non-schema kinds land in tasks/proposals/<proposed_by>/."""
-    sid = _initialize(mcp_client)
-    fm = {
-        "id": "prop-test-research-1",
-        "type": "proposal",
-        "title": "Ingest the foo paper",
-        "proposal_kind": "source_adoption",
-        "proposed_by": "research",
-        "proposed_at": _proposal_now(),
-    }
-    result = _call_tool(
-        mcp_client,
-        sid,
-        "write_proposal",
-        {"frontmatter": fm},
-        req_id=101,
-    )
-    assert result["subdir"] == "research"
-    assert result["path"] == "tasks/proposals/research/prop-test-research-1.md"
-
-
-def test_write_proposal_validation_error(mcp_client: TestClient):
-    """Missing required field → structured validation_error."""
-    sid = _initialize(mcp_client)
-    fm = {
-        "id": "prop-test-bad",
-        "type": "proposal",
-        "title": "Bad",
-        # missing proposal_kind, proposed_by, proposed_at
-    }
-    result = _call_tool(
-        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=102
-    )
-    assert result["error"] == "validation_error"
-
-
-def test_list_proposals_includes_written(mcp_client: TestClient):
-    """After write_proposal, list_proposals should surface the new entry."""
-    sid = _initialize(mcp_client)
-    # Write a fresh proposal so we can find it by id below
-    proposal_id = "prop-test-list-1"
-    fm = {
-        "id": proposal_id,
-        "type": "proposal",
-        "title": "Listable proposal",
-        "proposal_kind": "wiki_edge",
-        "proposed_by": "cogitate",
-        "proposed_at": _proposal_now(),
-    }
-    _call_tool(mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=110)
-
-    result = _call_tool(mcp_client, sid, "list_proposals", {}, req_id=111)
-    by_id = {p["id"]: p for p in result["proposals"]}
-    assert proposal_id in by_id
-    entry = by_id[proposal_id]
-    assert entry["proposal_kind"] == "wiki_edge"
-    assert entry["proposed_by"] == "cogitate"
-    assert entry["subdir"] == "cogitate"
-    assert entry["status"] == "proposed"
-    assert entry["path"].endswith(f"cogitate/{proposal_id}.md")
-
-
-def test_list_proposals_filter_by_system(mcp_client: TestClient):
-    """system filter narrows to one subdir."""
-    sid = _initialize(mcp_client)
-    # Ensure at least one schema and one research proposal exist
-    for fm, body in [
-        (
-            {
-                "id": "prop-test-filter-schema",
-                "type": "proposal",
-                "title": "Schema add",
-                "proposal_kind": "schema_addition",
-                "proposed_by": "cogitate",
-                "proposed_at": _proposal_now(),
-            },
-            "",
-        ),
-        (
-            {
-                "id": "prop-test-filter-research",
-                "type": "proposal",
-                "title": "Source adopt",
-                "proposal_kind": "source_adoption",
-                "proposed_by": "research",
-                "proposed_at": _proposal_now(),
-            },
-            "",
-        ),
-    ]:
-        _call_tool(
-            mcp_client, sid, "write_proposal", {"frontmatter": fm, "body": body}, req_id=120
-        )
-
-    res_schema = _call_tool(
-        mcp_client, sid, "list_proposals", {"system": "schema"}, req_id=121
-    )
-    schema_ids = {p["id"] for p in res_schema["proposals"]}
-    assert "prop-test-filter-schema" in schema_ids
-    assert "prop-test-filter-research" not in schema_ids
-    assert all(p["subdir"] == "schema" for p in res_schema["proposals"])
-
-    res_research = _call_tool(
-        mcp_client, sid, "list_proposals", {"system": "research"}, req_id=122
-    )
-    research_ids = {p["id"] for p in res_research["proposals"]}
-    assert "prop-test-filter-research" in research_ids
-    assert "prop-test-filter-schema" not in research_ids
-
-
-def test_list_proposals_filter_by_kind(mcp_client: TestClient):
-    sid = _initialize(mcp_client)
-    result = _call_tool(
-        mcp_client, sid, "list_proposals", {"kind": "source_adoption"}, req_id=130
-    )
-    assert all(p["proposal_kind"] == "source_adoption" for p in result["proposals"])
-    # At least the research filter test wrote one of these.
-    assert result["count"] >= 1
-
-
-def test_list_proposals_filter_by_status(mcp_client: TestClient):
-    sid = _initialize(mcp_client)
-    # Every test proposal has default status="proposed"
-    result = _call_tool(
-        mcp_client, sid, "list_proposals", {"status": "proposed"}, req_id=131
-    )
-    assert all(p["status"] == "proposed" for p in result["proposals"])
-    assert result["count"] >= 1
-    # No "applied" proposals exist in this test session
-    none_applied = _call_tool(
-        mcp_client, sid, "list_proposals", {"status": "applied"}, req_id=132
-    )
-    assert none_applied["count"] == 0
-
-
-# ---------------------------------------------------------------------------
 # add_link
 
 
@@ -1076,45 +904,6 @@ def test_write_page_rejects_windows_reserved_names(mcp_client: TestClient):
         )
         assert result["error"] == "validation_error", f"{bad!r} should have been rejected"
         assert "windows" in result["message"].lower() or "reserved" in result["message"].lower()
-
-
-def test_write_proposal_rejects_path_traversal_id(mcp_client: TestClient):
-    """A proposal id like `../prop` would escape `tasks/proposals/<subdir>/`."""
-    sid = _initialize(mcp_client)
-    from datetime import UTC, datetime
-
-    fm = {
-        "id": "../prop",
-        "type": "proposal",
-        "title": "bad",
-        "proposal_kind": "wiki_edge",
-        "proposed_by": "cogitate",
-        "proposed_at": datetime.now(UTC).isoformat(),
-    }
-    result = _call_tool(
-        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=340
-    )
-    assert result["error"] == "validation_error"
-
-
-def test_write_proposal_rejects_path_traversal_proposed_by(mcp_client: TestClient):
-    """proposed_by becomes a subdir name — `../schema` would put a 'cogitate'
-    proposal into the wrong bucket (or escape entirely)."""
-    sid = _initialize(mcp_client)
-    from datetime import UTC, datetime
-
-    fm = {
-        "id": "prop-traversal-test",
-        "type": "proposal",
-        "title": "bad",
-        "proposal_kind": "wiki_edge",
-        "proposed_by": "../schema",
-        "proposed_at": datetime.now(UTC).isoformat(),
-    }
-    result = _call_tool(
-        mcp_client, sid, "write_proposal", {"frontmatter": fm}, req_id=341
-    )
-    assert result["error"] == "validation_error"
 
 
 # ---------------------------------------------------------------------------
