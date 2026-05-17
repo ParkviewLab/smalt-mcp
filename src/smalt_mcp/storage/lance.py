@@ -10,7 +10,6 @@ Keep them in sync when the plan updates.
 
 from __future__ import annotations
 
-import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -277,33 +276,87 @@ def fetch_created_at(db: lancedb.DBConnection, page_ids: set[str]) -> dict[str, 
 # ---- index management ----
 
 
-def create_or_refresh_fts(db: lancedb.DBConnection, *, replace: bool = True) -> None:
+def create_or_refresh_fts(db: lancedb.DBConnection, *, replace: bool = True) -> dict[str, dict[str, Any]]:
     """(Re)create the full-text-search indexes — one per field.
 
     LanceDB's native FTS only accepts one field per index, so we create
     separate indexes on `title` and `body`. Hybrid search handles them at
     query time.
+
+    **Returns** a per-field status dict, one entry per indexed field:
+
+        {"title": {"status": "ok", "error": None},
+         "body":  {"status": "ok"|"failed", "error": "..." | None}}
+
+    `status` is `"ok"` on success and `"failed"` on any exception. The
+    function captures errors per-field rather than letting them propagate
+    — the indexer keeps running, and `index_status` (C-8) surfaces the
+    failure state to operators. The previous behavior
+    (`contextlib.suppress(Exception)`) silently swallowed failures and
+    left no trace anywhere — a query would just return weird results
+    until someone noticed.
     """
     table = _open_table(db, TABLE_PAGES)
+    status: dict[str, dict[str, Any]] = {}
     for field in ("title", "body"):
-        with contextlib.suppress(Exception):  # pragma: no cover — best effort
+        try:
             table.create_fts_index(field, replace=replace)
+            status[field] = {"status": "ok", "error": None}
+        except Exception as e:  # noqa: BLE001 — capture per-field for /admin/health surfacing
+            status[field] = {"status": "failed", "error": _short_lance_error(e)}
+    return status
 
 
 def create_or_refresh_vector_index(
     db: lancedb.DBConnection, *, num_partitions: int | None = None, replace: bool = True
-) -> None:
+) -> dict[str, Any]:
     """(Re)create the ANN index on `embeddings.vector`.
 
-    Falls back gracefully on tables too small to index (LanceDB requires a
-    minimum row count). At small Smalt sizes we just rely on a brute-force
-    scan, which is fine.
+    LanceDB requires a minimum row count for the IVF-PQ index; at small
+    Smalt sizes (<256 embeddings) the index is intentionally skipped and
+    queries fall back to brute-force scan (correct, just slower).
+
+    **Returns** a single status dict:
+
+        {"status": "ok"|"failed"|"skipped",
+         "error": str | None,
+         "reason": str | None}
+
+    `skipped` means the table didn't have enough rows yet; that's a
+    normal state, not a failure. `failed` means LanceDB raised on the
+    `create_index` call — surfaces via `index_status` so an operator
+    knows brute-force is the current state.
     """
     table = _open_table(db, TABLE_EMBEDDINGS)
-    if table.count_rows() < 256:
-        return
+    row_count = table.count_rows()
+    if row_count < 256:
+        return {
+            "status": "skipped",
+            "error": None,
+            "reason": f"only {row_count} embeddings (need ≥256 for IVF-PQ); brute-force scan in use",
+        }
     kwargs: dict[str, Any] = {"replace": replace, "metric": "cosine"}
     if num_partitions is not None:
         kwargs["num_partitions"] = num_partitions
-    with contextlib.suppress(Exception):  # pragma: no cover — best-effort; brute force still works
+    try:
         table.create_index(**kwargs)
+        return {"status": "ok", "error": None, "reason": None}
+    except Exception as e:  # noqa: BLE001 — capture for /admin/health surfacing
+        return {
+            "status": "failed",
+            "error": _short_lance_error(e),
+            "reason": None,
+        }
+
+
+def _short_lance_error(e: BaseException) -> str:
+    """One-line error summary for the status payload.
+
+    LanceDB / pyarrow errors often have multi-line tracebacks attached;
+    keep the first line and cap at 200 chars so the response stays
+    sane.
+    """
+    text = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+    if len(text) > 200:
+        text = text[:200] + "…"
+    return f"{type(e).__name__}: {text}"

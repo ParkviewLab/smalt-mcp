@@ -141,13 +141,15 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (8 read-only + 8 read-write + 4 remove-destructive = 20) should be
+    # (9 read-only + 8 read-write + 4 remove-destructive = 21) should be
     # listed. Proposal / experiment / gap tools moved to ebony-enriching.
     # C-5 added: add_links + add_claims (bulk variants). C-6 added:
-    # write_batch (mixed-op transaction).
+    # write_batch (mixed-op transaction). C-8 added: index_status
+    # (observability).
     assert names == {
-        # READ_ONLY (8)
+        # READ_ONLY (9)
         "status",
+        "index_status",
         "list_pages",
         "read_page",
         "find_by_alias",
@@ -189,6 +191,183 @@ def test_unknown_tool_returns_structured_error(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "does_not_exist", {}, req_id=11)
     assert result.get("error") == "unknown_tool"
+
+
+# ---- /admin/health + index_status MCP tool (C-8) ----
+
+
+def _trigger_indexer_run(mcp_client: TestClient, sid: str) -> None:
+    """Trigger an indexer pass so App observability state is populated.
+
+    Writes a throwaway entity page — write_page auto-runs the indexer,
+    which calls app.record_indexer_run().
+    """
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-trigger-indexer", "trigger")},
+        req_id=1200,
+    )
+
+
+def test_admin_health_payload_shape(mcp_client: TestClient):
+    """GET /admin/health returns the full index_status payload.
+    Verify the top-level shape + a few field types."""
+    # Trigger an indexer pass first so observability state is non-null.
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+
+    r = mcp_client.get("/admin/health")
+    assert r.status_code == 200
+    body = r.json()
+    # Top-level fields present.
+    assert {"smalt_dir", "smalt_exists", "tables", "indexer", "indexes", "embedding", "mutex"} <= body.keys()
+    assert body["smalt_exists"] is True
+    # Tables: every canonical LanceDB table with a row_count.
+    assert {"pages", "embeddings", "links", "claims", "sources"} <= body["tables"].keys()
+    for table_info in body["tables"].values():
+        assert "row_count" in table_info
+        assert isinstance(table_info["row_count"], int)
+    # Indexer state populated after the trigger.
+    assert body["indexer"]["last_run_at"] is not None
+    assert body["indexer"]["last_run_duration_seconds"] is not None
+    assert body["indexer"]["last_result"] is not None
+    # Indexes section present (FTS + vector; may be None on a fresh
+    # session where no refresh actually ran — but the trigger above
+    # changed the corpus, so refresh did run).
+    assert "fts" in body["indexes"]
+    assert "vector" in body["indexes"]
+    # Embedding: provider + dim + model_loaded.
+    assert body["embedding"]["provider"] == "fake"
+    assert body["embedding"]["dim"] == 384
+    assert isinstance(body["embedding"]["model_loaded"], bool)
+    # Mutex: locked-now flag + contention counters.
+    m = body["mutex"]
+    assert m["locked"] is False  # not held when the response was being built
+    assert m["holder"] is None
+    assert m["acquire_count"] >= 1  # the trigger acquired the mutex
+    assert m["total_wait_seconds"] >= 0.0
+    assert m["mean_wait_ms"] >= 0.0
+
+
+def test_index_status_mcp_tool_matches_admin_health(mcp_client: TestClient):
+    """The `index_status` MCP tool returns the same payload as
+    `GET /admin/health` (modulo non-deterministic fields like
+    last_run_at, mutex contention counters that move between calls)."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+
+    mcp_payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1210)
+    http_payload = mcp_client.get("/admin/health").json()
+
+    # Same top-level keys.
+    assert mcp_payload.keys() == http_payload.keys()
+    # Stable fields match exactly.
+    assert mcp_payload["smalt_dir"] == http_payload["smalt_dir"]
+    assert mcp_payload["smalt_exists"] == http_payload["smalt_exists"]
+    assert mcp_payload["embedding"] == http_payload["embedding"]
+    # Tables: same keys; row_counts may have drifted by 0 between calls.
+    assert mcp_payload["tables"].keys() == http_payload["tables"].keys()
+
+
+def test_index_status_fts_status_per_field(mcp_client: TestClient):
+    """C-8 surfaces FTS status per field (title + body). After a normal
+    indexer run, both should be 'ok'."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1220)
+    fts = payload["indexes"]["fts"]
+    # Per-field shape: {title: {status, error}, body: {status, error}}.
+    assert set(fts.keys()) >= {"title", "body"}
+    for field, status in fts.items():
+        if field.startswith("_"):
+            continue  # `_call` is the defensive shape; ignore here
+        assert status["status"] in {"ok", "failed"}
+        if status["status"] == "ok":
+            assert status["error"] is None
+
+
+def test_index_status_vector_skipped_below_threshold(mcp_client: TestClient):
+    """Seed Smalt has <256 embeddings → ANN index is intentionally skipped
+    (brute-force scan is fine at that scale). C-8 surfaces this as
+    `status: 'skipped'` with a reason — not a failure."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1230)
+    vec = payload["indexes"]["vector"]
+    assert vec["status"] == "skipped"
+    assert vec["error"] is None
+    assert vec["reason"] and "256" in vec["reason"]
+
+
+def test_index_status_mutex_contention_counters_advance(mcp_client: TestClient):
+    """The mutex acquire_count + total_wait_seconds grow over the session.
+    Two consecutive writes → at least two more acquires + non-decreasing
+    wait time."""
+    sid = _initialize(mcp_client)
+    before = _call_tool(mcp_client, sid, "index_status", {}, req_id=1240)
+    before_count = before["mutex"]["acquire_count"]
+    before_wait = before["mutex"]["total_wait_seconds"]
+
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-contention-1", "x")},
+        req_id=1241,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-contention-2", "y")},
+        req_id=1242,
+    )
+
+    after = _call_tool(mcp_client, sid, "index_status", {}, req_id=1243)
+    assert after["mutex"]["acquire_count"] >= before_count + 2
+    assert after["mutex"]["total_wait_seconds"] >= before_wait  # monotonic
+
+
+def test_index_status_surfaces_fts_failure(mcp_client: TestClient, tmp_path, monkeypatch):
+    """Deliberately corrupt the FTS rebuild path → status is reported
+    as `failed` with a structured error. Proves the silent-failure-
+    surfacing is wired end-to-end (the C-8 motivation: previously the
+    lance.py wrapper used contextlib.suppress(Exception) and the failure
+    would never reach the operator).
+
+    Monkey-patch `create_or_refresh_fts` to raise, trigger a write to
+    invoke the indexer, then read index_status."""
+    sid = _initialize(mcp_client)
+
+    from smalt_mcp.storage import lance
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("fake FTS rebuild failure for C-8 test")
+
+    monkeypatch.setattr(lance, "create_or_refresh_fts", _boom)
+    # Trigger a write — the indexer runs, the FTS rebuild raises, the
+    # indexer captures the failure on result.fts_status, and
+    # app.record_indexer_run propagates it to app.last_fts_status.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-fts-fail-trigger", "fail")},
+        req_id=1250,
+    )
+
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1251)
+    fts = payload["indexes"]["fts"]
+    # The defensive top-level capture in indexer._refresh_indexes uses
+    # the key `_call`; we just check that SOMETHING in the FTS payload
+    # is marked failed with an error message.
+    found_failure = any(
+        isinstance(v, dict) and v.get("status") == "failed" and v.get("error")
+        for v in fts.values()
+    )
+    assert found_failure, f"expected a failed FTS status, got {fts!r}"
 
 
 # ---------------------------------------------------------------------------

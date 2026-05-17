@@ -150,7 +150,13 @@ def _page_target_path(smalt_root: Path, page: Page) -> Path:
 
 
 def _run_indexer(app: App) -> dict[str, Any]:
-    """Run an incremental indexer pass. Caller must hold the corpus mutex."""
+    """Run an incremental indexer pass. Caller must hold the corpus mutex.
+
+    Also updates the App's observability state (C-8) — `last_indexer_run_at`,
+    `last_indexer_result`, `last_fts_status`, `last_vector_status` — so the
+    `index_status` tool + `/admin/health` HTTP route can surface what
+    happened on the most recent pass.
+    """
     from smalt_mcp.storage.indexer import Indexer
 
     result = Indexer(
@@ -158,6 +164,7 @@ def _run_indexer(app: App) -> dict[str, Any]:
         embedder=app.embedder(),
         db=app.db(),
     ).run()
+    app.record_indexer_run(result)
     return result.to_dict()
 
 
@@ -345,6 +352,33 @@ async def status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             "dim": app.cfg.embedding.dim,
         },
     }
+
+
+# ---- handler: index_status (C-8) ----
+
+
+async def index_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Report detailed index + indexer state.
+
+    Returns the same payload as the `GET /admin/health` HTTP route
+    (assembled by `App.index_status_payload()`). Lets MCP clients
+    introspect server health without an out-of-band HTTP roundtrip —
+    useful for cogrindd's M2.5 host that holds the MCP session but
+    doesn't necessarily talk HTTP to the same server.
+
+    The payload covers:
+      - Smalt path + existence
+      - Per-table row counts (pages, embeddings, links, claims, sources)
+      - Last indexer run metadata (timestamp, duration, full IndexResult)
+      - Per-index build status (FTS per-field; ANN with skip-vs-fail-vs-ok)
+      - Embedding config + whether the model is loaded
+      - Mutex contention (locked-now, holder, acquire count, mean wait ms)
+
+    Always safe to call (no writes, no LanceDB mutations); returns
+    nulls for not-yet-known fields when called pre-bootstrap or before
+    the first indexer pass.
+    """
+    return app.index_status_payload()
 
 
 # ---- handler: list_pages ----
@@ -2387,6 +2421,46 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=status,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="index_status",
+            description=(
+                "Report detailed index + indexer state — the deeper "
+                "cousin of `status`. Returns:\n"
+                "  - Smalt path + existence\n"
+                "  - Per-table row counts (pages, embeddings, links, "
+                "claims, sources)\n"
+                "  - Last indexer run metadata (timestamp, duration, "
+                "full IndexResult — inserted/updated/deleted/failed "
+                "counts + per-file failures)\n"
+                "  - Per-index build status:\n"
+                "    - **FTS**: per-field `{status: ok|failed, error: …}` "
+                "for `title` + `body`. A `failed` here means the rebuild "
+                "raised on the most recent indexer pass and that field's "
+                "FTS index may be stale or missing.\n"
+                "    - **ANN (vector)**: `{status: ok|failed|skipped, "
+                "reason: …}`. `skipped` is the normal state for small "
+                "Smalts (<256 embeddings → brute-force scan, no index "
+                "needed); `failed` flags a real problem.\n"
+                "  - Embedding config + whether the fastembed model is "
+                "loaded into memory\n"
+                "  - Mutex contention (locked-now, holder, "
+                "acquire_count, total_wait_seconds, mean_wait_ms)\n\n"
+                "Always safe to call (no writes, no LanceDB mutations); "
+                "returns nulls for not-yet-known fields when called "
+                "pre-bootstrap or before any indexer pass.\n\n"
+                "Mirrors the `GET /admin/health` HTTP route's payload "
+                "exactly — use whichever channel is more convenient."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=index_status,
     ),
     ToolDef(
         spec=types.Tool(
