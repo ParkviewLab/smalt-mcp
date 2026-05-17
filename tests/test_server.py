@@ -141,9 +141,10 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (8 read-only + 7 read-write + 4 remove-destructive = 19) should be
+    # (8 read-only + 8 read-write + 4 remove-destructive = 20) should be
     # listed. Proposal / experiment / gap tools moved to ebony-enriching.
-    # C-5 added: add_links + add_claims (bulk variants).
+    # C-5 added: add_links + add_claims (bulk variants). C-6 added:
+    # write_batch (mixed-op transaction).
     assert names == {
         # READ_ONLY (8)
         "status",
@@ -154,7 +155,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
-        # READ_WRITE (7)
+        # READ_WRITE (8)
         "bootstrap",
         "write_page",
         "write_pages",
@@ -162,6 +163,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "add_links",
         "add_claim",
         "add_claims",
+        "write_batch",
         # REMOVE_DESTRUCTIVE (4)
         "remove_page",
         "update_claim",
@@ -1831,6 +1833,363 @@ def test_add_claims_validation_aborts_batch(mcp_client: TestClient):
     )
     claim_ids = {c["id"] for c in (read["frontmatter"].get("claims") or [])}
     assert "ok1" not in claim_ids
+
+
+# ---------------------------------------------------------------------------
+# write_batch (C-6) — mixed-op transaction
+
+
+def test_write_batch_mixed_ops_happy_path(mcp_client: TestClient):
+    """Batch: write a new entity + add a link from it to ent-alice + add a
+    claim to ent-alice. One indexer pass at the end; all three ops commit."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-mix-author", "Mixed-batch author"),
+                    "body": "author body",
+                },
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-alice",
+                    "to_id": "ent-bob",
+                    "label": "wb_link",
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": "ent-alice",
+                    "claim": {"id": "wb-claim-mix", "text": "from a batch"},
+                },
+            ]
+        },
+        req_id=1000,
+    )
+    assert result.get("committed") is True
+    assert result["count"] == 3
+    # Only one indexer pass for the whole batch.
+    assert result["index_result"] is not None
+    # Per-op result inspection.
+    write_res = result["results"][0]
+    assert write_res["kind"] == "write_page"
+    assert write_res["mangled"] is True
+    assert write_res["original_id"] == "ent-wb-mix-author"
+    link_res = result["results"][1]
+    assert link_res["kind"] == "add_link"
+    assert link_res["added"] is True
+    claim_res = result["results"][2]
+    assert claim_res["kind"] == "add_claim"
+    assert claim_res["added"] is True
+    assert claim_res["claim_id"] == "wb-claim-mix"
+    # Round-trip via traverse + read_page.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "ent-alice", "label": "wb_link"},
+        req_id=1001,
+    )
+    assert any(e["to_id"] == "ent-bob" for e in trav["edges"])
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-alice"}, req_id=1002
+    )
+    claim_ids = {c["id"] for c in read["frontmatter"]["claims"]}
+    assert "wb-claim-mix" in claim_ids
+
+
+def test_write_batch_unknown_kind_rejected_at_mcp(mcp_client: TestClient):
+    """Op[1] has an invalid kind → MCP schema enum rejects the whole call.
+    Post-condition: nothing in the batch was committed."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-abort-mcp", "should not be written"),
+                },
+                {"kind": "this-is-not-a-real-kind", "page_id": "ent-alice"},
+            ]
+        },
+        req_id=1010,
+    )
+    assert "kind" in text.lower() or "enum" in text.lower()
+    # ent-wb-abort-mcp must NOT have been written.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-abort-mcp"},
+        req_id=1011,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_handler_validation_aborts_no_partial_commit(mcp_client: TestClient):
+    """Handler-side validation (the JSON-schema check covers `kind`, but the
+    *frontmatter* is just `object` — invalid frontmatter slips past MCP and
+    hits the handler's Pydantic check). Op[1]'s missing `title` aborts the
+    batch; op[0] never executes."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-abort-victim", "valid"),
+                },
+                {
+                    "kind": "write_page",
+                    # Missing required `title` — Pydantic rejects in handler.
+                    "frontmatter": {"id": "ent-wb-no-title", "type": "entity"},
+                },
+            ]
+        },
+        req_id=1012,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # ent-wb-abort-victim must NOT have been written (validate-all-then-act).
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-abort-victim"},
+        req_id=1013,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_existence_check_aborts_at_phase_two(mcp_client: TestClient):
+    """add_link to a page that doesn't exist → phase 2 abort; the
+    write_page op (op[0]) doesn't execute either (validate-all-then-act)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-existence-victim", "fresh"),
+                },
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-does-not-exist-AbCdEfGhIjKlMnOpQrStUv",
+                    "to_id": "ent-bob",
+                },
+            ]
+        },
+        req_id=1020,
+    )
+    assert result["error"] == "not_found"
+    assert result["index"] == 1
+    # Phase 2 happens AFTER phase 1's validation; but phase 3 (commit)
+    # never runs. ent-wb-existence-victim must NOT have been written.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-existence-victim"},
+        req_id=1021,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_cross_op_reference_within_batch_rejected(mcp_client: TestClient):
+    """Documented limitation: an add_link to a page created EARLIER in the
+    SAME batch is rejected (existence check uses pre-batch LanceDB state).
+    The agent must use two separate batches for create-then-reference flows."""
+    sid = _initialize(mcp_client)
+    # write_page mode='create' with a section id is deterministic — we
+    # can predict the canonical id is what we passed (no mangling).
+    section_id = "src-wb-cross::created.py"
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": {
+                        "id": section_id,
+                        "type": "source",
+                        "title": "Created in batch",
+                        "location_uri": "file:/tmp/x",
+                        "location_kind": "file",
+                    },
+                },
+                {
+                    # Will fail — the page exists on disk after op[0] writes,
+                    # but LanceDB doesn't see it until the indexer runs at
+                    # the end.
+                    "kind": "add_link",
+                    "from_id": section_id,
+                    "to_id": "ent-bob",
+                },
+            ]
+        },
+        req_id=1030,
+    )
+    assert result["error"] == "not_found"
+    assert result["index"] == 1
+    # Neither op committed. find_by_alias has no entry for the section id
+    # (section ids don't generate aliases), so probe by list_pages prefix.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"prefix": "src-wb-cross"},
+        req_id=1031,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_duplicates_reported_per_op_not_error(mcp_client: TestClient):
+    """add_link + add_claim ops with duplicate targets are reported
+    per-op (added: false) — they do NOT abort the batch. Matches the
+    single-call semantics."""
+    sid = _initialize(mcp_client)
+    # Pre-populate one link + one claim on ent-alice via single-call tools.
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-alice", "to_id": "ent-bob", "label": "wb_dup_link"},
+        req_id=1040,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-alice", "claim": {"id": "wb-dup-claim", "text": "pre"}},
+        req_id=1041,
+    )
+    # Batch: each tries to add the same thing → duplicates.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-alice",
+                    "to_id": "ent-bob",
+                    "label": "wb_dup_link",
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": "ent-alice",
+                    "claim": {"id": "wb-dup-claim", "text": "attempt"},
+                },
+            ]
+        },
+        req_id=1042,
+    )
+    assert result.get("committed") is True
+    assert result["count"] == 2
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate"
+    assert result["results"][1]["added"] is False
+    assert result["results"][1]["reason"] == "duplicate_claim_id"
+
+
+def test_write_batch_update_claim_then_add_claim_same_page(mcp_client: TestClient):
+    """Two ops on the same page (update_claim + add_claim) commit
+    correctly — RMW per op, mutex-protected; final state reflects both."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-wb-same-page", "host")},
+        req_id=1050,
+    )
+    page_id = page["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page_id, "claim": {"id": "c-pre", "text": "v1"}},
+        req_id=1051,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "update_claim",
+                    "page_id": page_id,
+                    "claim_id": "c-pre",
+                    "new_claim": {"id": "c-pre", "text": "v2"},
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": page_id,
+                    "claim": {"id": "c-added", "text": "new"},
+                },
+            ]
+        },
+        req_id=1052,
+    )
+    assert result.get("committed") is True
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1053
+    )
+    by_id = {c["id"]: c for c in read["frontmatter"]["claims"]}
+    assert by_id["c-pre"]["text"] == "v2"
+    assert by_id["c-added"]["text"] == "new"
+
+
+def test_write_batch_empty_ops_rejected(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "write_batch", {"ops": []}, req_id=1060
+    )
+    assert result["error"] == "missing_argument"
+
+
+def test_write_batch_rejects_index_page_in_write_op(mcp_client: TestClient):
+    """IndexPage writes are rejected even inside a batch (matches the
+    single-call write_page behavior added in C-3)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": {
+                        "id": "idx-batch-attempt",
+                        "type": "index",
+                        "title": "Should Fail",
+                        "auto_generated": True,
+                        "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+                    },
+                },
+            ]
+        },
+        req_id=1070,
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["index"] == 0
 
 
 # ---------------------------------------------------------------------------
