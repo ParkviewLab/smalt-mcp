@@ -46,16 +46,25 @@ _app_instance = App()
 def _server_scope() -> Scope:
     """Read the server-wide scope at startup.
 
-    Set `SMALT_SCOPE=read_only` to expose only read-only tools regardless of
-    client. Default (unset) is `read_write` — appropriate for dev mode where
-    smalt-mcp is the daemon's private companion.
+    Accepted values (with tier):
+      - `read_only`           (0): only `Scope.READ_ONLY` tools exposed.
+      - `read_write`          (1, default): READ_ONLY + READ_WRITE.
+      - `remove_destructive`  (2): READ_ONLY + READ_WRITE + REMOVE_DESTRUCTIVE.
+
+    Default is `read_write` so the destructive tools (`remove_page`,
+    `update_claim`, `remove_claim`, `remove_link`) are opt-in to expose —
+    they're powerful enough that operators should consciously enable them.
     """
     raw = (os.environ.get("SMALT_SCOPE") or "read_write").lower()
     if raw == "read_only":
         return Scope.READ_ONLY
     if raw == "read_write":
         return Scope.READ_WRITE
-    raise ValueError(f"invalid SMALT_SCOPE={raw!r}; expected read_only or read_write")
+    if raw == "remove_destructive":
+        return Scope.REMOVE_DESTRUCTIVE
+    raise ValueError(
+        f"invalid SMALT_SCOPE={raw!r}; expected one of read_only / read_write / remove_destructive"
+    )
 
 
 _SERVER_SCOPE: Scope = _server_scope()
