@@ -214,6 +214,169 @@ def test_list_pages_filter_by_prefix(mcp_client: TestClient):
     assert ids == {"con-cs", "con-embedding", "con-index"}
 
 
+# ---- property filters on list_pages (C-2) ----
+
+
+def test_list_pages_filter_by_glossary(mcp_client: TestClient):
+    """Seed: con-embedding + con-index both have `glossary: true`; con-cs has
+    `is_domain: true` (and no glossary field)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"glossary": True}, req_id=110
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"con-embedding", "con-index"} <= ids
+    assert "con-cs" not in ids  # is_domain, not glossary
+    assert "ent-alice" not in ids  # not a concept
+    assert result["truncated"] is False
+
+
+def test_list_pages_filter_by_is_domain(mcp_client: TestClient):
+    """Seed: con-cs is the only `is_domain: true` page."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"is_domain": True}, req_id=111
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert "con-cs" in ids
+    assert "con-embedding" not in ids
+    assert "con-index" not in ids
+
+
+def test_list_pages_filter_by_domain(mcp_client: TestClient):
+    """Seed: ent-alice, con-embedding, con-index, src-doc1 all tag `domains: [con-cs]`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"domain": "con-cs"}, req_id=112
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"ent-alice", "con-embedding", "con-index", "src-doc1"} <= ids
+    # ent-bob has no `domains:` field; con-cs doesn't self-tag.
+    assert "ent-bob" not in ids
+    assert "con-cs" not in ids
+
+
+def test_list_pages_filter_by_has_aliases_containing(mcp_client: TestClient):
+    """Seed: ent-alice has `aliases: [Alicia]`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"has_aliases_containing": "Alicia"},
+        req_id=113,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_list_pages_filter_by_fetched_at_range(mcp_client: TestClient):
+    """Write two SourcePages with explicit fetched_at; filter by both endpoints
+    of the date range. (Seed src-doc1 has no fetched_at — won't match either
+    fetched_at filter under SQL-NULL semantics.)"""
+    sid = _initialize(mcp_client)
+    # Write an old source.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "src-fetched-2020",
+                "type": "source",
+                "title": "Old source",
+                "location_uri": "file:/tmp/old.md",
+                "location_kind": "file",
+                "fetched_at": "2020-01-15T00:00:00",
+            },
+        },
+        req_id=114,
+    )
+    # Write a new source.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "src-fetched-2025",
+                "type": "source",
+                "title": "New source",
+                "location_uri": "file:/tmp/new.md",
+                "location_kind": "file",
+                "fetched_at": "2025-08-01T00:00:00",
+            },
+        },
+        req_id=115,
+    )
+
+    # fetched_at_before=2024 → old source only.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_before": "2024-01-01T00:00:00"},
+        req_id=116,
+    )
+    original_ids = set()
+    for p in result["pages"]:
+        # write_page mangles ids; the original is in aliases. We don't need
+        # the original here — we just check that the old source's canonical
+        # id (which starts with the caller id) is in the result.
+        original_ids.add(p["id"])
+    matched_old = [pid for pid in original_ids if pid.startswith("src-fetched-2020-")]
+    matched_new = [pid for pid in original_ids if pid.startswith("src-fetched-2025-")]
+    assert len(matched_old) >= 1
+    assert len(matched_new) == 0
+    # Seed src-doc1 has no fetched_at, so SQL-NULL semantics excludes it.
+    assert "src-doc1" not in original_ids
+
+    # fetched_at_after=2024 → new source only.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_after": "2024-01-01T00:00:00"},
+        req_id=117,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    matched_old = [pid for pid in ids if pid.startswith("src-fetched-2020-")]
+    matched_new = [pid for pid in ids if pid.startswith("src-fetched-2025-")]
+    assert len(matched_old) == 0
+    assert len(matched_new) >= 1
+
+
+def test_list_pages_filter_combined_type_and_glossary(mcp_client: TestClient):
+    """AND-composed: type=concept AND glossary=True returns the two glossary
+    concepts only (excludes con-cs which is a concept but not glossary)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"type": "concept", "glossary": True},
+        req_id=118,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"con-embedding", "con-index"} <= ids
+    assert "con-cs" not in ids
+    assert all(p["type"] == "concept" for p in result["pages"])
+
+
+def test_list_pages_filter_validation_error_on_bad_datetime(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_before": "not-a-real-date"},
+        req_id=119,
+    )
+    assert result["error"] == "validation_error"
+    assert "fetched_at_before" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # read_page
 
@@ -578,6 +741,92 @@ def test_search_requires_query(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     text = _call_tool_raw_text(mcp_client, sid, "search", {}, req_id=52)
     assert "query" in text and ("required" in text.lower() or "missing" in text.lower())
+
+
+# ---- property filters on search (C-2) ----
+
+
+def test_search_filter_by_glossary(mcp_client: TestClient):
+    """search('embedding') over the seed surfaces con-embedding (glossary),
+    con-index (glossary), and src-doc1 (source). With glossary=True, the
+    source drops out and only the two concept-glossary entries remain."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "embedding", "glossary": True, "top_k": 10},
+        req_id=180,
+    )
+    ids = {r["id"] for r in result["results"]}
+    # The two glossary concepts must appear; the source must NOT.
+    assert {"con-embedding", "con-index"} <= ids
+    assert "src-doc1" not in ids
+    # Every returned result must be a glossary concept (defense against
+    # FTS/vector noise pulling in non-matching pages).
+    for r in result["results"]:
+        assert r["type"] == "concept"
+
+
+def test_search_filter_by_domain(mcp_client: TestClient):
+    """search('Alice') with domain=con-cs returns only pages tagged with
+    that domain. ent-alice has domains:[con-cs] in the seed; ent-bob has
+    no domains → excluded."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "Alice", "domain": "con-cs", "top_k": 10},
+        req_id=181,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_search_filter_by_has_aliases_containing(mcp_client: TestClient):
+    """ent-alice's `aliases: [Alicia]` makes it match
+    has_aliases_containing='Alicia'."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "fictional person", "has_aliases_containing": "Alicia"},
+        req_id=182,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_search_filter_no_matches_returns_empty(mcp_client: TestClient):
+    """A filter that excludes every retrieved candidate returns an empty list
+    (not an error)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "embedding", "domain": "no-such-domain"},
+        req_id=183,
+    )
+    assert result["count"] == 0
+    assert result["results"] == []
+
+
+def test_search_filter_validation_error_on_bad_datetime(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "anything", "fetched_at_after": "not-a-real-date"},
+        req_id=184,
+    )
+    assert result["error"] == "validation_error"
+    assert "fetched_at_after" in result["message"]
 
 
 # ---------------------------------------------------------------------------

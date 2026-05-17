@@ -19,6 +19,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -144,6 +145,146 @@ def _run_indexer(app: App) -> dict[str, Any]:
     return result.to_dict()
 
 
+# ---- property-filter helpers (shared by list_pages + search) ----
+#
+# v0 list_pages and search filtered by `type` and `prefix` only. C-2 adds
+# six new property filters that look inside each page's frontmatter (the
+# raw on-disk dict, preserved in LanceDB's `pages.frontmatter_json` text
+# column):
+#
+#   glossary: bool                   ← ConceptPage.glossary
+#   is_domain: bool                  ← ConceptPage.is_domain
+#   domain: str                      ← ConceptPage/SourcePage/EntityPage.domains list-contains
+#   fetched_at_before: ISO datetime  ← SourcePage.fetched_at < threshold
+#   fetched_at_after: ISO datetime   ← SourcePage.fetched_at > threshold
+#   has_aliases_containing: str      ← PageBase.aliases list-contains
+#
+# All AND-composed. SQL-NULL semantics: a filter on a field the page
+# doesn't have → page doesn't match (matches how a SQL `WHERE field = X`
+# excludes NULL rows).
+#
+# Implementation does client-side JSON parsing on `frontmatter_json` —
+# same O(N) pattern as `_find_pages_by_alias`. C-10 (aliases LanceDB
+# column) sets up the perf foundation; some of these filters may migrate
+# to LanceDB-native predicates in later C PRs once the column work lands.
+
+_PROPERTY_FILTER_ARGS: frozenset[str] = frozenset({
+    "glossary",
+    "is_domain",
+    "domain",
+    "fetched_at_before",
+    "fetched_at_after",
+    "has_aliases_containing",
+})
+
+
+def _has_property_filters(args: dict[str, Any]) -> bool:
+    """True if the caller supplied any of the property-filter args (not None)."""
+    return any(args.get(k) is not None for k in _PROPERTY_FILTER_ARGS)
+
+
+def _parse_property_filters(
+    args: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Parse + validate property-filter args.
+
+    Returns `(filters, None)` on success, or `(None, error_payload)` on
+    validation failure. The returned `filters` dict only contains keys for
+    filters the caller actually supplied — absent keys mean "no filter on
+    that field," not "filter on null."
+    """
+    filters: dict[str, Any] = {}
+
+    for key in ("glossary", "is_domain"):
+        val = args.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, bool):
+            return None, {
+                "error": "validation_error",
+                "message": f"{key} must be a bool; got {type(val).__name__}",
+            }
+        filters[key] = val
+
+    for key in ("domain", "has_aliases_containing"):
+        val = args.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, str) or not val:
+            return None, {
+                "error": "validation_error",
+                "message": f"{key} must be a non-empty string; got {val!r}",
+            }
+        filters[key] = val
+
+    for key in ("fetched_at_before", "fetched_at_after"):
+        val = args.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            return None, {
+                "error": "validation_error",
+                "message": f"{key} must be an ISO 8601 datetime string; got {type(val).__name__}",
+            }
+        try:
+            filters[key] = datetime.fromisoformat(val)
+        except ValueError as e:
+            return None, {
+                "error": "validation_error",
+                "message": f"{key} must be ISO 8601; got {val!r} ({e})",
+            }
+
+    return filters, None
+
+
+def _apply_property_filters(fm: dict[str, Any], filters: dict[str, Any]) -> bool:
+    """Return True if `fm` (a page's raw frontmatter dict) passes every filter.
+
+    All filters AND-composed. SQL-NULL semantics: a filter on a field the
+    page doesn't have → page doesn't match.
+
+    Bool filters (`glossary`, `is_domain`) compare the raw value as it
+    appears in YAML — a ConceptPage that omits `glossary:` will NOT match
+    `glossary=False` (the schema default doesn't materialize at filter
+    time; the user is filtering on what's literally written). Caveat
+    documented in the tool spec.
+    """
+    if not filters:
+        return True
+
+    # Bool fields — exact match on the raw frontmatter value.
+    for key in ("glossary", "is_domain"):
+        if key in filters and fm.get(key) != filters[key]:
+            return False
+
+    # List-contains fields.
+    if "domain" in filters:
+        domains = fm.get("domains")
+        if not isinstance(domains, list) or filters["domain"] not in domains:
+            return False
+    if "has_aliases_containing" in filters:
+        aliases = fm.get("aliases")
+        if not isinstance(aliases, list) or filters["has_aliases_containing"] not in aliases:
+            return False
+
+    # SourcePage `fetched_at` range. Parse the page's value lazily; missing
+    # or unparseable → page doesn't match (matches the SQL-NULL semantics).
+    if "fetched_at_before" in filters or "fetched_at_after" in filters:
+        fetched_at_raw = fm.get("fetched_at")
+        if not fetched_at_raw:
+            return False
+        try:
+            fetched_at = datetime.fromisoformat(str(fetched_at_raw))
+        except (ValueError, TypeError):
+            return False
+        if "fetched_at_before" in filters and fetched_at >= filters["fetched_at_before"]:
+            return False
+        if "fetched_at_after" in filters and fetched_at <= filters["fetched_at_after"]:
+            return False
+
+    return True
+
+
 # ---- handler: status ----
 
 
@@ -194,7 +335,11 @@ async def status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """List indexed pages, optionally filtered by `type` and/or `prefix` on id."""
+    """List indexed pages, optionally filtered by `type` / `prefix` (LanceDB-side)
+    and/or any of the property filters (`glossary`, `is_domain`, `domain`,
+    `fetched_at_before`, `fetched_at_after`, `has_aliases_containing`,
+    client-side post-fetch). All filters AND-composed; `limit` applies to the
+    final filtered set."""
     ok, err = _ensure_initialized(app)
     if not ok:
         return err  # type: ignore[return-value]
@@ -202,6 +347,11 @@ async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     type_filter = arguments.get("type")
     prefix = arguments.get("prefix")
     limit = int(arguments.get("limit", 100))
+
+    property_filters, err_payload = _parse_property_filters(arguments)
+    if err_payload is not None:
+        return err_payload
+    has_props = bool(property_filters)
 
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
@@ -212,21 +362,47 @@ async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     if prefix:
         where_parts.append(f"id LIKE {lance.sql_str(prefix + '%')}")
 
-    query = pages.search().select(["id", "title", "type", "path"])
+    # Column selection: pull `frontmatter_json` too when any property
+    # filter is set (we parse it client-side). Avoid the extra column
+    # otherwise — slightly cheaper on big Smalts.
+    select_cols = ["id", "title", "type", "path"]
+    if has_props:
+        select_cols.append("frontmatter_json")
+
+    query = pages.search().select(select_cols)
     if where_parts:
         query = query.where(" AND ".join(where_parts))
-    arrow = query.limit(limit).to_arrow()
+
+    # When property filters are set, we don't know how many SQL-filtered
+    # rows will survive client-side filtering, so over-fetch and trim.
+    # Heuristic: fetch up to 10x the requested limit (capped at 10_000)
+    # when filters are present; otherwise fetch exactly `limit`. If the
+    # over-fetch budget is exhausted the response sets `truncated: true`.
+    fetch_limit = limit if not has_props else max(limit * 10, 1000)
+    fetch_limit = min(fetch_limit, 10_000)
+    arrow = query.limit(fetch_limit).to_arrow()
 
     ids = arrow.column("id").to_pylist()
     titles = arrow.column("title").to_pylist()
     types_ = arrow.column("type").to_pylist()
     paths = arrow.column("path").to_pylist()
+    fms_raw = arrow.column("frontmatter_json").to_pylist() if has_props else [None] * len(ids)
 
-    out_pages = [
-        {"id": pid, "title": t, "type": tp, "path": p}
-        for pid, t, tp, p in zip(ids, titles, types_, paths, strict=True)
-    ]
-    return {"pages": out_pages, "count": len(out_pages)}
+    out_pages: list[dict[str, Any]] = []
+    for pid, t, tp, p, fm_raw in zip(ids, titles, types_, paths, fms_raw, strict=True):
+        if has_props:
+            try:
+                fm = json.loads(fm_raw) if fm_raw else {}
+            except json.JSONDecodeError:
+                continue
+            if not _apply_property_filters(fm, property_filters):
+                continue
+        out_pages.append({"id": pid, "title": t, "type": tp, "path": p})
+        if len(out_pages) >= limit:
+            break
+
+    truncated = has_props and arrow.num_rows >= fetch_limit and len(out_pages) < limit
+    return {"pages": out_pages, "count": len(out_pages), "truncated": truncated}
 
 
 # ---- alias-lookup helpers (shared by find_by_alias + read_page fallback) ----
@@ -577,11 +753,20 @@ def _find_alias_matches(app: App, query: str) -> list[str]:
 
 
 async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Hybrid search over the pages corpus: FTS (body) + vector (embeddings), RRF-fused.
+    """Hybrid search over the pages corpus: FTS (body) + vector (embeddings) +
+    alias retrieval, RRF-fused, with optional property filters applied
+    post-fusion before the top_k cap.
 
-    Returns the top-`top_k` matches with id, title, type, snippet, score. If
-    the FTS index hasn't been built yet (very small Smalt), falls back to
-    vector-only ranking.
+    Returns the top-`top_k` matches with id, title, type, snippet, score,
+    aliases. If the FTS index hasn't been built yet (very small Smalt),
+    falls back to vector-only ranking.
+
+    Property filters (`glossary`, `is_domain`, `domain`, `fetched_at_before`,
+    `fetched_at_after`, `has_aliases_containing`) are applied to the hydrated
+    candidates AFTER RRF fusion and BEFORE top_k truncation, so the top_k
+    you get back is "top_k matches that pass the filter," not "top_k matches
+    of which some happen to pass." When filters are set, the retrieval
+    over-fetches further to keep the post-filter candidate pool deep.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -591,7 +776,17 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     if not query:
         return {"error": "missing_argument", "message": "query is required"}
     top_k = int(arguments.get("top_k", 10))
-    fetch_k = max(top_k * 3, top_k + 5)  # over-fetch for RRF; clamp at top_k below
+
+    property_filters, err_payload = _parse_property_filters(arguments)
+    if err_payload is not None:
+        return err_payload
+    has_props = bool(property_filters)
+
+    # Over-fetch for RRF; when filters are set, over-fetch further so the
+    # post-filter pool stays deep enough to fill top_k.
+    fetch_k = max(top_k * 3, top_k + 5)
+    if has_props:
+        fetch_k = max(fetch_k * 5, 100)  # 5× extra room for filter dropoff
 
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
@@ -636,18 +831,29 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"results": [], "count": 0}
 
     fused = _rrf_fuse([fts_ids, vec_ids, alias_ids])
-    top = fused[:top_k]
-    top_ids = [pid for pid, _ in top]
+    # When property filters are set, hydrate the FULL fused candidate
+    # pool (not just top_k) so we have enough rows to apply the filter
+    # and still fill top_k. Cap the hydration set at fetch_k to bound the
+    # IN-clause + parse cost.
+    if has_props:
+        candidate_pool = fused[:fetch_k]
+    else:
+        candidate_pool = fused[:top_k]
+    candidate_ids = [pid for pid, _ in candidate_pool]
+
+    if not candidate_ids:
+        return {"results": [], "count": 0}
 
     # Hydrate with page metadata in one query. Pull frontmatter_json too so we
-    # can surface aliases per hit — callers often want to render results by a
-    # memorable handle (the caller-id-now-alias) rather than the canonical id.
-    quoted = ", ".join(lance.sql_str(p) for p in top_ids)
+    # can (a) surface aliases per hit — callers often want to render results
+    # by a memorable handle (the caller-id-now-alias) rather than the
+    # canonical id — and (b) apply property filters client-side.
+    quoted = ", ".join(lance.sql_str(p) for p in candidate_ids)
     meta_arrow = (
         pages.search()
         .where(f"id IN ({quoted})")
         .select(["id", "title", "type", "body", "frontmatter_json"])
-        .limit(len(top_ids))
+        .limit(len(candidate_ids))
         .to_arrow()
     )
     by_id: dict[str, dict[str, Any]] = {}
@@ -658,6 +864,8 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             fm = json.loads(fm_raw) if fm_raw else {}
         except json.JSONDecodeError:
             fm = {}
+        if has_props and not _apply_property_filters(fm, property_filters):
+            continue
         aliases = list(fm.get("aliases") or [])
         by_id[pid] = {
             "title": meta_arrow.column("title")[i].as_py(),
@@ -666,8 +874,10 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             "aliases": aliases,
         }
 
-    results = []
-    for pid, score in top:
+    # Re-rank: walk the fused (RRF-ordered) candidate pool, picking up
+    # filter-passing hits until top_k or the pool runs out.
+    results: list[dict[str, Any]] = []
+    for pid, score in candidate_pool:
         meta = by_id.get(pid)
         if not meta:
             continue
@@ -683,6 +893,9 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 "score": round(score, 6),
             }
         )
+        if len(results) >= top_k:
+            break
+
     return {"results": results, "count": len(results)}
 
 
@@ -1467,11 +1680,29 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="list_pages",
             description=(
-                "List indexed pages in the Smalt, optionally filtered by `type` "
-                "(entity/concept/source/synthesis) and/or `prefix` (id starts "
-                "with). Returns minimal metadata per page (id, title, type, "
-                "path) — use `read_page` to fetch a single page's full body + "
-                "frontmatter."
+                "List indexed pages in the Smalt with optional filters. "
+                "Returns minimal metadata per page (id, title, type, path) "
+                "— use `read_page` to fetch a single page's full body + "
+                "frontmatter.\n\n"
+                "**LanceDB-side filters** (fast):\n"
+                "- `type` — entity / concept / source / synthesis\n"
+                "- `prefix` — id starts with (e.g. 'ent-' or 'con-embedding')\n\n"
+                "**Property filters** (client-side post-fetch; slower for "
+                "huge Smalts but expressive — same semantics shared with "
+                "`search`):\n"
+                "- `glossary: bool` — ConceptPage `glossary` flag\n"
+                "- `is_domain: bool` — ConceptPage `is_domain` flag\n"
+                "- `domain: str` — page's `domains:` list contains the given id\n"
+                "- `fetched_at_before` / `fetched_at_after`: ISO 8601 datetime — "
+                "SourcePage `fetched_at` range\n"
+                "- `has_aliases_containing: str` — page's `aliases:` list contains the given value\n\n"
+                "All filters AND-composed. Bool filters compare the raw "
+                "frontmatter value (a ConceptPage that omits `glossary:` "
+                "won't match `glossary=False` — schema defaults don't "
+                "materialize at filter time). `limit` applies to the final "
+                "filtered set; if the over-fetch budget is exhausted before "
+                "`limit` filtered hits accumulate, the response sets "
+                "`truncated: true`."
             ),
             inputSchema={
                 "type": "object",
@@ -1489,6 +1720,38 @@ TOOLS: list[ToolDef] = [
                         "type": "integer",
                         "description": "Max pages to return. Default 100.",
                         "default": 100,
+                    },
+                    "glossary": {
+                        "type": "boolean",
+                        "description": "Filter on ConceptPage `glossary` flag.",
+                    },
+                    "is_domain": {
+                        "type": "boolean",
+                        "description": "Filter on ConceptPage `is_domain` flag.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Filter: page's `domains:` list contains this id.",
+                    },
+                    "fetched_at_before": {
+                        "type": "string",
+                        "description": (
+                            "Filter: SourcePage `fetched_at` strictly before "
+                            "this ISO 8601 datetime. Non-source pages don't "
+                            "match (SQL-NULL semantics)."
+                        ),
+                    },
+                    "fetched_at_after": {
+                        "type": "string",
+                        "description": (
+                            "Filter: SourcePage `fetched_at` strictly after "
+                            "this ISO 8601 datetime. Non-source pages don't "
+                            "match (SQL-NULL semantics)."
+                        ),
+                    },
+                    "has_aliases_containing": {
+                        "type": "string",
+                        "description": "Filter: page's `aliases:` list contains this value.",
                     },
                 },
                 "required": [],
@@ -1655,10 +1918,19 @@ TOOLS: list[ToolDef] = [
                 "(e.g. `search('ent-alice')` finds a page whose canonical "
                 "id is `ent-alice-XYZ` because `ent-alice` is in its "
                 "`aliases`).\n\n"
+                "**Optional property filters** (same semantics as "
+                "`list_pages`; applied to hydrated candidates AFTER RRF "
+                "fusion and BEFORE top_k truncation, so the top_k you get "
+                "back is 'top_k filter-passing matches' — not 'top_k "
+                "matches of which some happen to pass'):\n"
+                "  - `glossary: bool`, `is_domain: bool`\n"
+                "  - `domain: str` (page's `domains:` list contains the id)\n"
+                "  - `fetched_at_before` / `fetched_at_after` (ISO 8601)\n"
+                "  - `has_aliases_containing: str`\n\n"
                 "Returns top-`top_k` matches; each hit carries `id` "
                 "(canonical), `aliases`, `title`, `type`, `snippet`, and "
                 "`score` (RRF). Empty hit list if no retrieval source "
-                "matched."
+                "matched or no candidate passed the filters."
             ),
             inputSchema={
                 "type": "object",
@@ -1671,6 +1943,36 @@ TOOLS: list[ToolDef] = [
                         "type": "integer",
                         "description": "Max results to return. Default 10.",
                         "default": 10,
+                    },
+                    "glossary": {
+                        "type": "boolean",
+                        "description": "Filter on ConceptPage `glossary` flag.",
+                    },
+                    "is_domain": {
+                        "type": "boolean",
+                        "description": "Filter on ConceptPage `is_domain` flag.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Filter: page's `domains:` list contains this id.",
+                    },
+                    "fetched_at_before": {
+                        "type": "string",
+                        "description": (
+                            "Filter: SourcePage `fetched_at` strictly before this "
+                            "ISO 8601 datetime. Non-source pages don't match."
+                        ),
+                    },
+                    "fetched_at_after": {
+                        "type": "string",
+                        "description": (
+                            "Filter: SourcePage `fetched_at` strictly after this "
+                            "ISO 8601 datetime. Non-source pages don't match."
+                        ),
+                    },
+                    "has_aliases_containing": {
+                        "type": "string",
+                        "description": "Filter: page's `aliases:` list contains this value.",
                     },
                 },
                 "required": ["query"],
