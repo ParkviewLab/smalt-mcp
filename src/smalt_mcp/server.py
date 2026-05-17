@@ -146,7 +146,7 @@ class Health(BaseModel):
     uptime_seconds: float
 
 
-@router.get("/health", response_model=Health)
+@router.get("/health", response_model=Health, tags=["health"])
 async def health() -> Health:
     return Health(ok=True, version=VERSION, uptime_seconds=time.time() - _started_at)
 
