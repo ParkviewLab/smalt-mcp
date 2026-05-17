@@ -152,6 +152,17 @@ def mcp_client(tmp_path_factory) -> TestClient:
     _write_seed_smalt(smalt_dir)
     _bootstrap_and_index(smalt_dir)
 
+    # If another test module (test_concurrency.py) already loaded +
+    # ran the server module, its `StreamableHTTPSessionManager` is a
+    # single-use singleton that won't accept a second `run()` —
+    # TestClient's lifespan would fail. Reload to get a fresh
+    # session_manager + a fresh _app_instance pointed at this
+    # fixture's smalt_dir.
+    import importlib
+    import sys
+
+    if "smalt_mcp.server" in sys.modules:
+        importlib.reload(sys.modules["smalt_mcp.server"])
     from smalt_mcp.server import app
 
     with TestClient(app) as c:

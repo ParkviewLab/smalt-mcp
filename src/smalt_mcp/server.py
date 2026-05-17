@@ -6,12 +6,14 @@ Tools are defined in `smalt_mcp.tools` — this module only does the plumbing.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import APIRouter, FastAPI
@@ -123,6 +125,17 @@ mcp_asgi = MCPASGIApp()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvlog = logging.getLogger("uvicorn.error")
+    # E-2 (concurrency): replace the default ThreadPoolExecutor with
+    # one sized per `SMALT_THREAD_POOL_WORKERS`. Tool handlers
+    # dispatch their blocking work via `asyncio.to_thread`, which
+    # pulls from this pool. Python's default cap is `min(32, cpu+4)`
+    # — adequate for typical I/O-bound workloads; operators tuning a
+    # heavy-write deployment can bump it via the env var.
+    loop = asyncio.get_running_loop()
+    workers = _app_instance.cfg.thread_pool_workers
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=workers))
+    uvlog.info("thread pool sized to %d workers", workers)
+
     # E-1: pre-warm the lazy-init resources so the first inbound
     # request doesn't pay (a) the LanceDB connection cost or (b) the
     # fastembed model load. Also closes the only currently-exploitable
