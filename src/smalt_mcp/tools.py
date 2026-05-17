@@ -1299,6 +1299,212 @@ async def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return {"domains": domains, "count": len(domains)}
 
 
+# ---- handler: source_similarity (READ_ONLY, C-12) ----
+#
+# Vector search using a page's stored embedding as the query vector —
+# "what other pages are most similar to this one?" — without paying
+# the embed cost of a new query string. The arg is conventionally
+# named `source_id` because the page sources the query vector, NOT
+# because the input must be a SourcePage; any indexed page works.
+#
+# Cosine similarity, derived from LanceDB's `_distance` column
+# (built with metric="cosine"). similarity = 1 - distance. Range
+# nominally [-1, 1]; with normalized embeddings in practice [0, 1].
+#
+# Type filter: optional list of page-type strings (e.g.
+# `types: ["source"]`) restricts results to those types. Filtering
+# happens client-side after the vector hit list comes back from
+# LanceDB (over-fetched 5× to preserve depth post-filter); the
+# `embeddings` table doesn't carry a type column.
+
+
+async def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Pages most similar to `source_id`'s embedding by cosine similarity.
+
+    Excludes the source page itself from the result list. Returns up to
+    `top_k` matches (default 10) with id, title, type, path, aliases,
+    and `similarity` (= 1 - cosine distance, range nominally [-1, 1];
+    with normalized embeddings, practically [0, 1] where 1.0 = identical).
+
+    Optional `types` arg (list of page-type strings) filters the result
+    set. Validated against the known PageType enum; unknown types return
+    `invalid_argument` rather than silently producing zero results.
+
+    Errors:
+      - `missing_argument` if `source_id` is omitted.
+      - `invalid_argument` if `top_k <= 0` or `types` is malformed.
+      - `not_found` if `source_id` has no embedding (page not indexed
+        or embedding generation failed — caller should try
+        `reindex_page` first).
+      - `vector_search_failed` if LanceDB raises mid-search (rare;
+        usually means the ANN index is in a bad state).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    source_id = arguments.get("source_id")
+    if not source_id:
+        return {"error": "missing_argument", "message": "source_id is required"}
+    try:
+        top_k = int(arguments.get("top_k", 10))
+    except (TypeError, ValueError):
+        return {
+            "error": "invalid_argument",
+            "message": "top_k must be an integer",
+        }
+    if top_k <= 0:
+        return {
+            "error": "invalid_argument",
+            "message": f"top_k must be positive (got {top_k})",
+        }
+    types = arguments.get("types")
+    if types is not None:
+        if not isinstance(types, list) or not all(isinstance(t, str) for t in types):
+            return {
+                "error": "invalid_argument",
+                "message": "types must be a list of page-type strings",
+            }
+        valid_types = {p.value for p in PageType}
+        unknown = [t for t in types if t not in valid_types]
+        if unknown:
+            return {
+                "error": "invalid_argument",
+                "message": (
+                    f"unknown page type(s): {unknown!r}; "
+                    f"valid: {sorted(valid_types)}"
+                ),
+            }
+
+    db = app.db()
+    embs = db.open_table(lance.TABLE_EMBEDDINGS)
+
+    # 1. Fetch the source's stored embedding.
+    src_arrow = (
+        embs.search()
+        .where(f"page_id = {lance.sql_str(source_id)}")
+        .select(["page_id", "vector"])
+        .limit(1)
+        .to_arrow()
+    )
+    if src_arrow.num_rows == 0:
+        return {
+            "error": "not_found",
+            "source_id": source_id,
+            "message": (
+                f"no embedding for page {source_id!r} — page may not be "
+                "indexed, or embedding generation failed; try reindex_page"
+            ),
+        }
+    query_vec = src_arrow.column("vector")[0].as_py()
+
+    # 2. Over-fetch by 5× when filtering by type so the post-filter pool
+    # stays deep enough to fill top_k. +1 to cover the self-exclusion. The
+    # `page_id != source_id` predicate runs at the LanceDB layer so the
+    # source row never even appears in the hit list — `+1` is here for
+    # safety, not correctness.
+    fetch_k = top_k + 1
+    if types is not None:
+        fetch_k = max(fetch_k * 5, 50)
+
+    try:
+        hit_arrow = (
+            embs.search(query_vec, vector_column_name="vector")
+            .where(f"page_id != {lance.sql_str(source_id)}")
+            .select(["page_id", "_distance"])
+            .limit(fetch_k)
+            .to_arrow()
+        )
+    except Exception as e:  # noqa: BLE001 — surface a clean error to the caller
+        return {
+            "error": "vector_search_failed",
+            "source_id": source_id,
+            "message": f"vector search raised: {e}",
+        }
+
+    if hit_arrow.num_rows == 0:
+        return {
+            "source_id": source_id,
+            "results": [],
+            "count": 0,
+            "types_filter": types,
+        }
+
+    hit_ids = hit_arrow.column("page_id").to_pylist()
+    hit_distances = hit_arrow.column("_distance").to_pylist()
+    id_to_distance = dict(zip(hit_ids, hit_distances, strict=False))
+
+    # 3. Hydrate hit_ids with page metadata in one query. We pull the
+    # frontmatter_json so we can surface `aliases` per row (consistent
+    # with the `search` handler's response shape).
+    pages = db.open_table(lance.TABLE_PAGES)
+    quoted = ", ".join(lance.sql_str(p) for p in hit_ids)
+    meta_arrow = (
+        pages.search()
+        .where(f"id IN ({quoted})")
+        .select(["id", "title", "type", "path", "frontmatter_json"])
+        .limit(len(hit_ids))
+        .to_arrow()
+    )
+    meta_by_id: dict[str, dict[str, Any]] = {}
+    for i in range(meta_arrow.num_rows):
+        pid = meta_arrow.column("id")[i].as_py()
+        fm_raw = meta_arrow.column("frontmatter_json")[i].as_py()
+        try:
+            fm = json.loads(fm_raw) if fm_raw else {}
+        except json.JSONDecodeError:
+            fm = {}
+        meta_by_id[pid] = {
+            "title": meta_arrow.column("title")[i].as_py(),
+            "type": meta_arrow.column("type")[i].as_py(),
+            "path": meta_arrow.column("path")[i].as_py(),
+            "aliases": list(fm.get("aliases") or []),
+        }
+
+    # 4. Walk hit_ids in vector-search rank order (already cosine-sorted
+    # by LanceDB), applying the optional type filter, until `top_k` results
+    # accumulate or the pool is exhausted.
+    type_set: set[str] | None = set(types) if types else None
+    results: list[dict[str, Any]] = []
+    for pid in hit_ids:
+        meta = meta_by_id.get(pid)
+        if meta is None:
+            # Embedding row exists but pages row is missing (shouldn't
+            # normally happen — the indexer projects both in one pass).
+            # Skip rather than break: a stale embedding row is a bug
+            # surface for index_status, not source_similarity.
+            continue
+        if type_set is not None and meta["type"] not in type_set:
+            continue
+        distance = id_to_distance.get(pid, 1.0)
+        similarity = 1.0 - distance
+        results.append(
+            {
+                "id": pid,
+                "title": meta["title"],
+                "type": meta["type"],
+                "path": meta["path"],
+                "aliases": meta["aliases"],
+                "similarity": round(similarity, 6),
+            }
+        )
+        if len(results) >= top_k:
+            break
+
+    truncated = (
+        types is not None
+        and len(results) < top_k
+        and hit_arrow.num_rows >= fetch_k
+    )
+    return {
+        "source_id": source_id,
+        "results": results,
+        "count": len(results),
+        "types_filter": types,
+        "truncated": truncated,
+    }
+
+
 # ---- handler: bootstrap (READ_WRITE) ----
 
 
@@ -3314,6 +3520,87 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_ONLY,
         handler=list_domains,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="source_similarity",
+            description=(
+                "Pages most similar to `source_id`'s embedding by cosine "
+                "similarity. Uses the page's stored vector as the query "
+                "— no re-embed needed. Excludes the source itself.\n\n"
+                "Returns up to `top_k` matches (default 10), each with "
+                "`id`, `title`, `type`, `path`, `aliases`, and "
+                "`similarity` (= 1 - cosine_distance; range nominally "
+                "[-1, 1], practically [0, 1] for normalized "
+                "embeddings; 1.0 = identical).\n\n"
+                "Use cases: Cogitate-style discovery ('what other pages "
+                "are about something similar to this one?'), de-dup "
+                "candidate search across SourcePages (filter "
+                "`types: ['source']`), neighborhood scoping for "
+                "observer walks that don't follow explicit links.\n\n"
+                "**`source_id` is conventionally named** — any indexed "
+                "page works as the query vector source, not just "
+                "SourcePages. The `types` filter restricts the result "
+                "set, not the input.\n\n"
+                "Errors: `missing_argument` (source_id omitted); "
+                "`invalid_argument` (top_k≤0, types malformed); "
+                "`not_found` (source_id has no embedding — likely not "
+                "indexed; try `reindex_page` first); "
+                "`vector_search_failed` (LanceDB raised — usually "
+                "means the ANN index is in a bad state, check "
+                "`index_status`)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_id": {
+                        "type": "string",
+                        "description": (
+                            "Canonical page id whose embedding "
+                            "becomes the query vector. Any page type "
+                            "works."
+                        ),
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": (
+                            "Number of similar pages to return "
+                            "(default 10). Source is excluded; the "
+                            "count is over non-source matches."
+                        ),
+                        "default": 10,
+                        "minimum": 1,
+                    },
+                    "types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "entity",
+                                "concept",
+                                "source",
+                                "synthesis",
+                                "index",
+                            ],
+                        },
+                        "description": (
+                            "Optional page-type filter — only "
+                            "results whose `type` is in this list "
+                            "are returned. Applied client-side after "
+                            "vector retrieval (5× over-fetch keeps "
+                            "the post-filter pool deep). When set, "
+                            "the response carries "
+                            "`truncated: true` if the filter "
+                            "exhausted the over-fetched pool before "
+                            "`top_k` matches accumulated."
+                        ),
+                    },
+                },
+                "required": ["source_id"],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=source_similarity,
     ),
     # ---- READ_WRITE ----
     ToolDef(

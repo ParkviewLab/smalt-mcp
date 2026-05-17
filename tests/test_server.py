@@ -142,13 +142,13 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (9 read-only + 10 read-write + 4 remove-destructive = 23) should
+    # (10 read-only + 10 read-write + 4 remove-destructive = 24) should
     # be listed. Proposal / experiment / gap tools moved to
     # ebony-enriching. C-5 added: add_links + add_claims (bulk
     # variants). C-6 added: write_batch. C-8 added: index_status. C-9
-    # added: reindex_page + reindex_all.
+    # added: reindex_page + reindex_all. C-12 added: source_similarity.
     assert names == {
-        # READ_ONLY (9)
+        # READ_ONLY (10)
         "status",
         "index_status",
         "list_pages",
@@ -158,6 +158,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
+        "source_similarity",
         # READ_WRITE (10)
         "bootstrap",
         "write_page",
@@ -3809,6 +3810,313 @@ def test_c11_search_alias_retrieval_stays_exact_only(mcp_client: TestClient):
     # No exact alias match for the typo; the helper must return empty
     # rather than fuzzy-promoting the close alias.
     assert alias_hits == []
+
+
+# ---------------------------------------------------------------------------
+# C-12: source_similarity (vector-search using a page's stored embedding
+# as the query vector). Tests use the FakeEmbedder (deterministic SHA-256
+# hashing → uncorrelated vectors regardless of body similarity), so the
+# "near-duplicate adjacency" semantic property is tested via a hand-built
+# scenario rather than relying on the embedder to cluster meaningfully.
+# Semantic quality with the real fastembed model is verified out-of-band.
+
+
+def test_c12_source_similarity_missing_argument(mcp_client: TestClient):
+    """source_id is required by the MCP input schema; calls without it
+    are rejected with a JSON-schema validation error (raw text, not
+    our handler's structured `{error: 'missing_argument'}`)."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client, sid, "source_similarity", {}, req_id=700
+    )
+    assert "source_id" in raw
+    assert "required" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_invalid_top_k_zero(mcp_client: TestClient):
+    """top_k has `minimum: 1` in the input schema; MCP rejects top_k=0
+    before the handler sees it."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 0},
+        req_id=701,
+    )
+    assert "less than the minimum" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_invalid_top_k_negative(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": -5},
+        req_id=702,
+    )
+    assert "less than the minimum" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_not_found_for_unknown_source(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-no-such-page-in-smalt"},
+        req_id=703,
+    )
+    assert result["error"] == "not_found"
+    assert result["source_id"] == "ent-no-such-page-in-smalt"
+    assert "reindex_page" in result["message"]
+
+
+def test_c12_source_similarity_excludes_source_itself(mcp_client: TestClient):
+    """The source page must never appear in its own similarity results."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100},
+        req_id=704,
+    )
+    assert "results" in result
+    result_ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" not in result_ids
+
+
+def test_c12_source_similarity_respects_top_k(mcp_client: TestClient):
+    """Result count is bounded by top_k."""
+    sid = _initialize(mcp_client)
+    # Seed Smalt has 6 pages → at most 5 similar pages (excluding source).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 2},
+        req_id=705,
+    )
+    assert result["count"] <= 2
+    assert len(result["results"]) == result["count"]
+
+
+def test_c12_source_similarity_returns_canonical_shape(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 3},
+        req_id=706,
+    )
+    assert result["source_id"] == "ent-alice"
+    assert isinstance(result["results"], list)
+    assert "types_filter" in result
+    assert result["types_filter"] is None
+    for r in result["results"]:
+        # Each result has the expected fields and types.
+        assert set(r.keys()) >= {
+            "id",
+            "title",
+            "type",
+            "path",
+            "aliases",
+            "similarity",
+        }
+        assert isinstance(r["id"], str)
+        assert isinstance(r["title"], str)
+        assert isinstance(r["aliases"], list)
+        # Similarity is the cosine-derived score; for the fake embedder
+        # the vectors are roughly random so similarity floats around 0,
+        # but it must be a real number, not NaN/None.
+        assert isinstance(r["similarity"], (int, float))
+        assert r["similarity"] == r["similarity"]  # NaN check
+
+
+def test_c12_source_similarity_results_sorted_by_similarity_desc(
+    mcp_client: TestClient,
+):
+    """Whatever the absolute scores look like, results MUST be sorted by
+    similarity descending. The fake embedder produces uncorrelated
+    vectors; verifying sort order doesn't depend on semantic similarity
+    being meaningful."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100},
+        req_id=707,
+    )
+    sims = [r["similarity"] for r in result["results"]]
+    for i in range(len(sims) - 1):
+        assert sims[i] >= sims[i + 1], (
+            f"results not sorted desc at index {i}: "
+            f"{sims[i]} < {sims[i + 1]}"
+        )
+
+
+def test_c12_source_similarity_types_filter_restricts(mcp_client: TestClient):
+    """`types: ['source']` filter returns only SourcePages."""
+    sid = _initialize(mcp_client)
+    # Seed Smalt has 1 SourcePage (src-doc1) plus the source-similarity
+    # source. Filter excludes everything that isn't a source.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100, "types": ["source"]},
+        req_id=708,
+    )
+    assert result["types_filter"] == ["source"]
+    for r in result["results"]:
+        assert r["type"] == "source"
+
+
+def test_c12_source_similarity_types_filter_multiple(mcp_client: TestClient):
+    """Multi-value `types` filter allows any of the listed types."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {
+            "source_id": "ent-alice",
+            "top_k": 100,
+            "types": ["concept", "entity"],
+        },
+        req_id=709,
+    )
+    for r in result["results"]:
+        assert r["type"] in {"concept", "entity"}
+
+
+def test_c12_source_similarity_types_filter_rejects_unknown_at_mcp(
+    mcp_client: TestClient,
+):
+    """An unknown type-name in `types` is caught by the MCP input-schema
+    enum (`items.enum`); the handler's defensive check is unreachable
+    via the MCP transport but kept for direct handler-call hygiene."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "types": ["entity", "notatype"]},
+        req_id=710,
+    )
+    assert "notatype" in raw
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+def test_c12_source_similarity_types_filter_rejects_malformed_at_mcp(
+    mcp_client: TestClient,
+):
+    """Non-string items in `types` are rejected by the MCP input schema
+    (items.enum is all strings); reaches the JSON-schema validator
+    before the handler."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "types": [123]},
+        req_id=711,
+    )
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+async def test_c12_source_similarity_handler_rejects_malformed_types_directly():
+    """Direct-handler test of the defensive `types` validation —
+    verifies the handler's own check catches non-list `types` values
+    (which the MCP schema's `type: array` would normally block, but
+    direct callers can bypass)."""
+    from smalt_mcp.tools import source_similarity
+    from smalt_mcp.server import _app_instance
+
+    # types as a string instead of a list — handler must reject.
+    result = await source_similarity(
+        _app_instance, {"source_id": "ent-alice", "types": "source"}
+    )
+    assert result["error"] == "invalid_argument"
+    assert "types" in result["message"]
+
+
+async def test_c12_source_similarity_handler_rejects_unknown_type_directly():
+    """Direct-handler test: an unknown type in the list (bypassing the
+    MCP enum check) is caught by the handler's validation."""
+    from smalt_mcp.tools import source_similarity
+    from smalt_mcp.server import _app_instance
+
+    result = await source_similarity(
+        _app_instance,
+        {"source_id": "ent-alice", "types": ["entity", "notatype"]},
+    )
+    assert result["error"] == "invalid_argument"
+    assert "notatype" in result["message"]
+
+
+def test_c12_source_similarity_default_top_k_is_10(mcp_client: TestClient):
+    """When `top_k` is omitted, the default is 10. With the seed Smalt's
+    5 indexable other pages, the response should be capped by available
+    pages (≤5), but the request itself must not error."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice"},
+        req_id=712,
+    )
+    assert result.get("error") is None, result
+    assert result["count"] <= 10
+
+
+def test_c12_source_similarity_after_write_page(mcp_client: TestClient):
+    """A newly-written page (mangled id) becomes a valid source_id for
+    similarity queries — the write_page indexer pass projects the
+    embedding, so source_similarity finds it immediately."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c12-newly-written-source", "New source")},
+        req_id=713,
+    )
+    canonical = create["id"]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": canonical, "top_k": 5},
+        req_id=714,
+    )
+    assert result.get("error") is None, result
+    # Source-itself exclusion still applies for the mangled canonical id.
+    assert all(r["id"] != canonical for r in result["results"])
+
+
+def test_c12_source_similarity_truncated_flag_when_filter_exhausts_pool(
+    mcp_client: TestClient,
+):
+    """`truncated: true` fires only when a types filter is set AND
+    the over-fetched pool didn't yield enough post-filter matches.
+    With an unset filter, truncated stays False."""
+    sid = _initialize(mcp_client)
+    # No types filter → truncated must be False even when top_k
+    # exceeds the available match pool.
+    no_filter = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 1000},
+        req_id=715,
+    )
+    assert no_filter["truncated"] is False
 
 
 # ---------------------------------------------------------------------------
