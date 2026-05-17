@@ -151,16 +151,48 @@ class Indexer:
 
     # ---- public API ----
 
-    def run(self, *, full: bool = False) -> IndexResult:
-        """Walk pages, project changed ones into LanceDB, refresh indexes."""
+    def run(
+        self,
+        *,
+        full: bool = False,
+        only_paths: list[Path] | None = None,
+    ) -> IndexResult:
+        """Walk pages, project changed ones into LanceDB, refresh indexes.
+
+        Modes:
+          - **Default** (`full=False`, `only_paths=None`): scan
+            `pages/`, skip files whose `content_hash` matches the indexed
+            row, project the rest, delete LanceDB rows whose backing
+            file is gone. The "incremental" mode used by every
+            auto-trigger after a write.
+          - **Full** (`full=True`): same scan + same stale-id sweep,
+            but every file is force-re-projected (no hash short-circuit).
+            Used by `reindex_all` (C-9).
+          - **Targeted** (`only_paths=[...]`): only the listed files are
+            considered. Force-re-projection (the hash check is skipped
+            — the caller's asking explicitly). The stale-id sweep is
+            SKIPPED — this isn't a full corpus walk, so we don't know
+            which ids are "stale" relative to disk. Used by
+            `reindex_page` (C-9).
+        """
         started = perf_counter()
         result = IndexResult()
 
-        files = iter_page_files(paths.pages_dir(self.smalt_root))
+        if only_paths is not None:
+            files = list(only_paths)
+            # only_paths is always a force-reindex: the caller explicitly
+            # asked. Skip the hash check.
+            force_full = True
+            do_stale_sweep = False
+        else:
+            files = iter_page_files(paths.pages_dir(self.smalt_root))
+            force_full = full
+            do_stale_sweep = True
+
         result.scanned = len(files)
         self._emit_progress(result, phase="scanning", current_file=None)
 
-        existing_hashes: dict[str, str] = {} if full else lance.existing_page_hashes(self.db)
+        existing_hashes: dict[str, str] = {} if force_full else lance.existing_page_hashes(self.db)
         seen_ids: set[str] = set()
 
         # Parse each file; collect those that need (re)indexing.
@@ -198,12 +230,15 @@ class Indexer:
             self._emit_progress(result, phase="scanning", current_file=parsed.rel_path)
             to_index.append(parsed)
 
-        # Pages indexed previously whose files are gone.
-        for stale_id in set(existing_hashes) - seen_ids:
-            self._delete_page(stale_id)
-            result.deleted += 1
-            self.progress(f"  [del]  {stale_id}")
-            self._emit_progress(result, phase="scanning", current_file=stale_id)
+        # Pages indexed previously whose files are gone. Skipped in
+        # targeted mode (only_paths set) — the caller's not doing a full
+        # corpus walk, so "stale" can't be inferred from this scan.
+        if do_stale_sweep:
+            for stale_id in set(existing_hashes) - seen_ids:
+                self._delete_page(stale_id)
+                result.deleted += 1
+                self.progress(f"  [del]  {stale_id}")
+                self._emit_progress(result, phase="scanning", current_file=stale_id)
 
         # Embed bodies in one batch and project to LanceDB.
         if to_index:
