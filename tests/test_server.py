@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from fastapi.testclient import TestClient
 
@@ -108,6 +109,80 @@ def _call_tool_raw_text(
     return contents[0]["text"]
 
 
+# ---- C-13 task-polling helpers ----
+
+
+def _await_task_completion(
+    client: TestClient,
+    session_id: str,
+    task_id: str,
+    *,
+    req_id_base: int = 9000,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 0.05,
+) -> dict:
+    """Poll `task_status(task_id)` until terminal state, then return the
+    final task dict. Raises TimeoutError if the task doesn't finish in
+    `timeout_seconds`.
+
+    Used by tests that exercise C-13's async tools (reindex_all and
+    later: any heavy op that returns a task_id). The poll interval is
+    tight by default — work runs on a real thread via asyncio.to_thread
+    so the loop ticks are cheap.
+    """
+    import time as _time
+
+    deadline = _time.time() + timeout_seconds
+    req_id = req_id_base
+    terminal = {"succeeded", "failed", "cancelled"}
+    while _time.time() < deadline:
+        status = _call_tool(
+            client, session_id, "task_status", {"task_id": task_id}, req_id=req_id
+        )
+        req_id += 1
+        if status.get("error") == "not_found":
+            raise AssertionError(
+                f"task {task_id} not found while polling — likely GC'd or never created"
+            )
+        if status.get("state") in terminal:
+            return status
+        _time.sleep(poll_interval)
+    raise TimeoutError(
+        f"task {task_id} did not reach terminal state in {timeout_seconds}s; "
+        f"last poll: {status}"
+    )
+
+
+def _reindex_all_sync(
+    client: TestClient,
+    session_id: str,
+    *,
+    req_id: int = 9500,
+    timeout_seconds: float = 30.0,
+) -> dict:
+    """Trigger `reindex_all`, wait for the task to finish, return
+    the work function's result payload.
+
+    Convenience for tests that pre-date C-13's async pattern — they
+    used to call reindex_all and read `{wiped_tables, recreated_tables,
+    index_result}` straight from the response. After C-13 the same
+    payload lives in `task.result` after polling to terminal. This
+    helper bridges the two so test sites don't all need polling
+    boilerplate.
+    """
+    enqueue = _call_tool(client, session_id, "reindex_all", {}, req_id=req_id)
+    assert "task_id" in enqueue, f"reindex_all didn't enqueue: {enqueue}"
+    final = _await_task_completion(
+        client,
+        session_id,
+        enqueue["task_id"],
+        req_id_base=req_id * 10 + 1,
+        timeout_seconds=timeout_seconds,
+    )
+    assert final["state"] == "succeeded", f"reindex_all failed: {final}"
+    return final["result"]
+
+
 # ---------------------------------------------------------------------------
 # HTTP routes
 
@@ -141,11 +216,16 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (8 read-only + 5 read-write + 4 remove-destructive = 17) should be
-    # listed. Proposal / experiment / gap tools moved to ebony-enriching.
+    # (12 read-only + 11 read-write + 4 remove-destructive = 27) should
+    # be listed. Proposal / experiment / gap tools moved to
+    # ebony-enriching. C-5 added: add_links + add_claims (bulk
+    # variants). C-6 added: write_batch. C-8 added: index_status. C-9
+    # added: reindex_page + reindex_all. C-12 added: source_similarity.
+    # C-13 added: task_status + task_list (RO) and task_cancel (RW).
     assert names == {
-        # READ_ONLY (8)
+        # READ_ONLY (12)
         "status",
+        "index_status",
         "list_pages",
         "read_page",
         "find_by_alias",
@@ -153,12 +233,21 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "traverse",
         "search",
         "list_domains",
-        # READ_WRITE (5)
+        "source_similarity",
+        "task_status",
+        "task_list",
+        # READ_WRITE (11)
         "bootstrap",
         "write_page",
         "write_pages",
         "add_link",
+        "add_links",
         "add_claim",
+        "add_claims",
+        "write_batch",
+        "reindex_page",
+        "reindex_all",
+        "task_cancel",
         # REMOVE_DESTRUCTIVE (4)
         "remove_page",
         "update_claim",
@@ -184,6 +273,183 @@ def test_unknown_tool_returns_structured_error(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "does_not_exist", {}, req_id=11)
     assert result.get("error") == "unknown_tool"
+
+
+# ---- /admin/health + index_status MCP tool (C-8) ----
+
+
+def _trigger_indexer_run(mcp_client: TestClient, sid: str) -> None:
+    """Trigger an indexer pass so App observability state is populated.
+
+    Writes a throwaway entity page — write_page auto-runs the indexer,
+    which calls app.record_indexer_run().
+    """
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-trigger-indexer", "trigger")},
+        req_id=1200,
+    )
+
+
+def test_admin_health_payload_shape(mcp_client: TestClient):
+    """GET /admin/health returns the full index_status payload.
+    Verify the top-level shape + a few field types."""
+    # Trigger an indexer pass first so observability state is non-null.
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+
+    r = mcp_client.get("/admin/health")
+    assert r.status_code == 200
+    body = r.json()
+    # Top-level fields present.
+    assert {"smalt_dir", "smalt_exists", "tables", "indexer", "indexes", "embedding", "mutex"} <= body.keys()
+    assert body["smalt_exists"] is True
+    # Tables: every canonical LanceDB table with a row_count.
+    assert {"pages", "embeddings", "links", "claims", "sources"} <= body["tables"].keys()
+    for table_info in body["tables"].values():
+        assert "row_count" in table_info
+        assert isinstance(table_info["row_count"], int)
+    # Indexer state populated after the trigger.
+    assert body["indexer"]["last_run_at"] is not None
+    assert body["indexer"]["last_run_duration_seconds"] is not None
+    assert body["indexer"]["last_result"] is not None
+    # Indexes section present (FTS + vector; may be None on a fresh
+    # session where no refresh actually ran — but the trigger above
+    # changed the corpus, so refresh did run).
+    assert "fts" in body["indexes"]
+    assert "vector" in body["indexes"]
+    # Embedding: provider + dim + model_loaded.
+    assert body["embedding"]["provider"] == "fake"
+    assert body["embedding"]["dim"] == 384
+    assert isinstance(body["embedding"]["model_loaded"], bool)
+    # Mutex: locked-now flag + contention counters.
+    m = body["mutex"]
+    assert m["locked"] is False  # not held when the response was being built
+    assert m["holder"] is None
+    assert m["acquire_count"] >= 1  # the trigger acquired the mutex
+    assert m["total_wait_seconds"] >= 0.0
+    assert m["mean_wait_ms"] >= 0.0
+
+
+def test_index_status_mcp_tool_matches_admin_health(mcp_client: TestClient):
+    """The `index_status` MCP tool returns the same payload as
+    `GET /admin/health` (modulo non-deterministic fields like
+    last_run_at, mutex contention counters that move between calls)."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+
+    mcp_payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1210)
+    http_payload = mcp_client.get("/admin/health").json()
+
+    # Same top-level keys.
+    assert mcp_payload.keys() == http_payload.keys()
+    # Stable fields match exactly.
+    assert mcp_payload["smalt_dir"] == http_payload["smalt_dir"]
+    assert mcp_payload["smalt_exists"] == http_payload["smalt_exists"]
+    assert mcp_payload["embedding"] == http_payload["embedding"]
+    # Tables: same keys; row_counts may have drifted by 0 between calls.
+    assert mcp_payload["tables"].keys() == http_payload["tables"].keys()
+
+
+def test_index_status_fts_status_per_field(mcp_client: TestClient):
+    """C-8 surfaces FTS status per field (title + body). After a normal
+    indexer run, both should be 'ok'."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1220)
+    fts = payload["indexes"]["fts"]
+    # Per-field shape: {title: {status, error}, body: {status, error}}.
+    assert set(fts.keys()) >= {"title", "body"}
+    for field, status in fts.items():
+        if field.startswith("_"):
+            continue  # `_call` is the defensive shape; ignore here
+        assert status["status"] in {"ok", "failed"}
+        if status["status"] == "ok":
+            assert status["error"] is None
+
+
+def test_index_status_vector_skipped_below_threshold(mcp_client: TestClient):
+    """Seed Smalt has <256 embeddings → ANN index is intentionally skipped
+    (brute-force scan is fine at that scale). C-8 surfaces this as
+    `status: 'skipped'` with a reason — not a failure."""
+    sid = _initialize(mcp_client)
+    _trigger_indexer_run(mcp_client, sid)
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1230)
+    vec = payload["indexes"]["vector"]
+    assert vec["status"] == "skipped"
+    assert vec["error"] is None
+    assert vec["reason"] and "256" in vec["reason"]
+
+
+def test_index_status_mutex_contention_counters_advance(mcp_client: TestClient):
+    """The mutex acquire_count + total_wait_seconds grow over the session.
+    Two consecutive writes → at least two more acquires + non-decreasing
+    wait time."""
+    sid = _initialize(mcp_client)
+    before = _call_tool(mcp_client, sid, "index_status", {}, req_id=1240)
+    before_count = before["mutex"]["acquire_count"]
+    before_wait = before["mutex"]["total_wait_seconds"]
+
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-contention-1", "x")},
+        req_id=1241,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-contention-2", "y")},
+        req_id=1242,
+    )
+
+    after = _call_tool(mcp_client, sid, "index_status", {}, req_id=1243)
+    assert after["mutex"]["acquire_count"] >= before_count + 2
+    assert after["mutex"]["total_wait_seconds"] >= before_wait  # monotonic
+
+
+def test_index_status_surfaces_fts_failure(mcp_client: TestClient, tmp_path, monkeypatch):
+    """Deliberately corrupt the FTS rebuild path → status is reported
+    as `failed` with a structured error. Proves the silent-failure-
+    surfacing is wired end-to-end (the C-8 motivation: previously the
+    lance.py wrapper used contextlib.suppress(Exception) and the failure
+    would never reach the operator).
+
+    Monkey-patch `create_or_refresh_fts` to raise, trigger a write to
+    invoke the indexer, then read index_status."""
+    sid = _initialize(mcp_client)
+
+    from smalt_mcp.storage import lance
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("fake FTS rebuild failure for C-8 test")
+
+    monkeypatch.setattr(lance, "create_or_refresh_fts", _boom)
+    # Trigger a write — the indexer runs, the FTS rebuild raises, the
+    # indexer captures the failure on result.fts_status, and
+    # app.record_indexer_run propagates it to app.last_fts_status.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c8-fts-fail-trigger", "fail")},
+        req_id=1250,
+    )
+
+    payload = _call_tool(mcp_client, sid, "index_status", {}, req_id=1251)
+    fts = payload["indexes"]["fts"]
+    # The defensive top-level capture in indexer._refresh_indexes uses
+    # the key `_call`; we just check that SOMETHING in the FTS payload
+    # is marked failed with an error message.
+    found_failure = any(
+        isinstance(v, dict) and v.get("status") == "failed" and v.get("error")
+        for v in fts.values()
+    )
+    assert found_failure, f"expected a failed FTS status, got {fts!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +478,169 @@ def test_list_pages_filter_by_prefix(mcp_client: TestClient):
     result = _call_tool(mcp_client, sid, "list_pages", {"prefix": "con-"}, req_id=22)
     ids = {p["id"] for p in result["pages"]}
     assert ids == {"con-cs", "con-embedding", "con-index"}
+
+
+# ---- property filters on list_pages (C-2) ----
+
+
+def test_list_pages_filter_by_glossary(mcp_client: TestClient):
+    """Seed: con-embedding + con-index both have `glossary: true`; con-cs has
+    `is_domain: true` (and no glossary field)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"glossary": True}, req_id=110
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"con-embedding", "con-index"} <= ids
+    assert "con-cs" not in ids  # is_domain, not glossary
+    assert "ent-alice" not in ids  # not a concept
+    assert result["truncated"] is False
+
+
+def test_list_pages_filter_by_is_domain(mcp_client: TestClient):
+    """Seed: con-cs is the only `is_domain: true` page."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"is_domain": True}, req_id=111
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert "con-cs" in ids
+    assert "con-embedding" not in ids
+    assert "con-index" not in ids
+
+
+def test_list_pages_filter_by_domain(mcp_client: TestClient):
+    """Seed: ent-alice, con-embedding, con-index, src-doc1 all tag `domains: [con-cs]`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"domain": "con-cs"}, req_id=112
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"ent-alice", "con-embedding", "con-index", "src-doc1"} <= ids
+    # ent-bob has no `domains:` field; con-cs doesn't self-tag.
+    assert "ent-bob" not in ids
+    assert "con-cs" not in ids
+
+
+def test_list_pages_filter_by_has_aliases_containing(mcp_client: TestClient):
+    """Seed: ent-alice has `aliases: [Alicia]`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"has_aliases_containing": "Alicia"},
+        req_id=113,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_list_pages_filter_by_fetched_at_range(mcp_client: TestClient):
+    """Write two SourcePages with explicit fetched_at; filter by both endpoints
+    of the date range. (Seed src-doc1 has no fetched_at — won't match either
+    fetched_at filter under SQL-NULL semantics.)"""
+    sid = _initialize(mcp_client)
+    # Write an old source.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "src-fetched-2020",
+                "type": "source",
+                "title": "Old source",
+                "location_uri": "file:/tmp/old.md",
+                "location_kind": "file",
+                "fetched_at": "2020-01-15T00:00:00",
+            },
+        },
+        req_id=114,
+    )
+    # Write a new source.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "src-fetched-2025",
+                "type": "source",
+                "title": "New source",
+                "location_uri": "file:/tmp/new.md",
+                "location_kind": "file",
+                "fetched_at": "2025-08-01T00:00:00",
+            },
+        },
+        req_id=115,
+    )
+
+    # fetched_at_before=2024 → old source only.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_before": "2024-01-01T00:00:00"},
+        req_id=116,
+    )
+    original_ids = set()
+    for p in result["pages"]:
+        # write_page mangles ids; the original is in aliases. We don't need
+        # the original here — we just check that the old source's canonical
+        # id (which starts with the caller id) is in the result.
+        original_ids.add(p["id"])
+    matched_old = [pid for pid in original_ids if pid.startswith("src-fetched-2020-")]
+    matched_new = [pid for pid in original_ids if pid.startswith("src-fetched-2025-")]
+    assert len(matched_old) >= 1
+    assert len(matched_new) == 0
+    # Seed src-doc1 has no fetched_at, so SQL-NULL semantics excludes it.
+    assert "src-doc1" not in original_ids
+
+    # fetched_at_after=2024 → new source only.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_after": "2024-01-01T00:00:00"},
+        req_id=117,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    matched_old = [pid for pid in ids if pid.startswith("src-fetched-2020-")]
+    matched_new = [pid for pid in ids if pid.startswith("src-fetched-2025-")]
+    assert len(matched_old) == 0
+    assert len(matched_new) >= 1
+
+
+def test_list_pages_filter_combined_type_and_glossary(mcp_client: TestClient):
+    """AND-composed: type=concept AND glossary=True returns the two glossary
+    concepts only (excludes con-cs which is a concept but not glossary)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"type": "concept", "glossary": True},
+        req_id=118,
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"con-embedding", "con-index"} <= ids
+    assert "con-cs" not in ids
+    assert all(p["type"] == "concept" for p in result["pages"])
+
+
+def test_list_pages_filter_validation_error_on_bad_datetime(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"fetched_at_before": "not-a-real-date"},
+        req_id=119,
+    )
+    assert result["error"] == "validation_error"
+    assert "fetched_at_before" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +683,14 @@ def test_traverse_one_hop(mcp_client: TestClient):
     result = _call_tool(mcp_client, sid, "traverse", {"from_id": "con-index"}, req_id=40)
     assert result["from_id"] == "con-index"
     assert result["count"] == 1
+    assert result["hops"] == 1
     edge = result["edges"][0]
     assert edge["from_id"] == "con-index"
     assert edge["to_id"] == "con-embedding"
     assert edge["label"] == "built_over"
+    # Multi-hop fields present even at 1-hop.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding"}
+    assert result["truncated"] is False
 
 
 def test_traverse_with_label_filter(mcp_client: TestClient):
@@ -288,6 +721,133 @@ def test_traverse_no_outgoing(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "traverse", {"from_id": "ent-alice"}, req_id=43)
     assert result["count"] == 0
+    # Even with no outgoing edges, visited_nodes contains the seed.
+    assert result["visited_nodes"] == ["ent-alice"]
+
+
+# ---- multi-hop ----
+
+
+def test_traverse_two_hops_walks_chain(mcp_client: TestClient):
+    """con-index --built_over--> con-embedding --example_of--> ent-alice.
+
+    A 2-hop walk from con-index should collect BOTH edges and visit all
+    three nodes. The seed Smalt's link chain (set up in conftest.py) is
+    deterministic, so we can assert exact counts.
+    """
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "traverse", {"from_id": "con-index", "hops": 2}, req_id=44
+    )
+    assert result["hops"] == 2
+    # Two edges total: con-index->con-embedding (hop 1) + con-embedding->ent-alice (hop 2).
+    assert result["count"] == 2
+    edge_keys = {(e["from_id"], e["to_id"], e["label"]) for e in result["edges"]}
+    assert ("con-index", "con-embedding", "built_over") in edge_keys
+    assert ("con-embedding", "ent-alice", "example_of") in edge_keys
+    # Visited contains seed + both reached nodes.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding", "ent-alice"}
+
+
+def test_traverse_label_filter_applied_per_hop(mcp_client: TestClient):
+    """label=built_over walks con-index->con-embedding but stops there
+    (con-embedding's outgoing edge to ent-alice is labeled example_of,
+    not built_over). With hops=3 the walk still terminates at hop 1."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 3, "label": "built_over"},
+        req_id=45,
+    )
+    assert result["count"] == 1
+    assert result["edges"][0]["to_id"] == "con-embedding"
+    # Walk stopped: ent-alice is reachable in 2 hops but only via
+    # example_of, which the per-hop filter excludes.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding"}
+    assert "ent-alice" not in result["visited_nodes"]
+
+
+def test_traverse_handles_cycle_without_infinite_loop(mcp_client: TestClient):
+    """Build a cycle A->B->A and walk with hops=5; BFS visited-set prevents
+    re-expansion. Both edges should appear; no duplicate node visits."""
+    sid = _initialize(mcp_client)
+    # Create the cycle: two new entity pages + reciprocal links.
+    a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-cycle-a", "cycle a")},
+        req_id=46,
+    )
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-cycle-b", "cycle b")},
+        req_id=47,
+    )
+    a_id, b_id = a["id"], b["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": a_id, "to_id": b_id, "label": "next"},
+        req_id=48,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": b_id, "to_id": a_id, "label": "next"},
+        req_id=49,
+    )
+    # Walk from A with hops well beyond the cycle length.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": a_id, "hops": 5, "label": "next"},
+        req_id=50,
+    )
+    # Two distinct edges total (A->B and B->A); both should be present.
+    edge_keys = {(e["from_id"], e["to_id"]) for e in result["edges"]}
+    assert (a_id, b_id) in edge_keys
+    assert (b_id, a_id) in edge_keys
+    assert result["count"] == 2  # exactly two edges, not more (no infinite loop)
+    assert set(result["visited_nodes"]) == {a_id, b_id}
+
+
+def test_traverse_rejects_hops_too_high(mcp_client: TestClient):
+    """hops > 5 is rejected at the MCP input-schema layer (the tool spec
+    declares `maximum: 5`). MCP returns a plain-text error before the
+    handler runs."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 99},
+        req_id=51,
+    )
+    assert "maximum" in text.lower() or "5" in text
+
+
+def test_traverse_rejects_hops_too_low(mcp_client: TestClient):
+    """hops < 1 is rejected at the MCP input-schema layer (the tool spec
+    declares `minimum: 1`). The handler's defense-in-depth runtime check
+    catches anything that slips past (e.g. if future MCP servers loosen
+    the schema enforcement)."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 0},
+        req_id=52,
+    )
+    assert "minimum" in text.lower() or "1" in text
 
 
 # ---------------------------------------------------------------------------
@@ -449,12 +1009,100 @@ def test_search_requires_query(mcp_client: TestClient):
     assert "query" in text and ("required" in text.lower() or "missing" in text.lower())
 
 
+# ---- property filters on search (C-2) ----
+
+
+def test_search_filter_by_glossary(mcp_client: TestClient):
+    """search('embedding') over the seed surfaces con-embedding (glossary),
+    con-index (glossary), and src-doc1 (source). With glossary=True, the
+    source drops out and only the two concept-glossary entries remain."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "embedding", "glossary": True, "top_k": 10},
+        req_id=180,
+    )
+    ids = {r["id"] for r in result["results"]}
+    # The two glossary concepts must appear; the source must NOT.
+    assert {"con-embedding", "con-index"} <= ids
+    assert "src-doc1" not in ids
+    # Every returned result must be a glossary concept (defense against
+    # FTS/vector noise pulling in non-matching pages).
+    for r in result["results"]:
+        assert r["type"] == "concept"
+
+
+def test_search_filter_by_domain(mcp_client: TestClient):
+    """search('Alice') with domain=con-cs returns only pages tagged with
+    that domain. ent-alice has domains:[con-cs] in the seed; ent-bob has
+    no domains → excluded."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "Alice", "domain": "con-cs", "top_k": 10},
+        req_id=181,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_search_filter_by_has_aliases_containing(mcp_client: TestClient):
+    """ent-alice's `aliases: [Alicia]` makes it match
+    has_aliases_containing='Alicia'."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "fictional person", "has_aliases_containing": "Alicia"},
+        req_id=182,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids
+    assert "ent-bob" not in ids
+
+
+def test_search_filter_no_matches_returns_empty(mcp_client: TestClient):
+    """A filter that excludes every retrieved candidate returns an empty list
+    (not an error)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "embedding", "domain": "no-such-domain"},
+        req_id=183,
+    )
+    assert result["count"] == 0
+    assert result["results"] == []
+
+
+def test_search_filter_validation_error_on_bad_datetime(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "anything", "fetched_at_after": "not-a-real-date"},
+        req_id=184,
+    )
+    assert result["error"] == "validation_error"
+    assert "fetched_at_after" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # bootstrap
 
 
 def test_bootstrap_idempotent(mcp_client: TestClient):
-    """Second bootstrap call must be a complete no-op."""
+    """Second bootstrap call must be a complete no-op for dirs/files/tables.
+    `index_result` is non-empty either way (the indexer runs to materialize
+    or refresh the canonical IndexPages); just check the field exists."""
     sid = _initialize(mcp_client)
     # First call: may create some of the dirs/files the conftest didn't —
     # we don't assert specifics, just that the call succeeds and returns
@@ -464,12 +1112,180 @@ def test_bootstrap_idempotent(mcp_client: TestClient):
     assert isinstance(first["created_dirs"], list)
     assert isinstance(first["created_files"], list)
     assert isinstance(first["created_tables"], list)
+    # C-3: bootstrap now runs the indexer to materialize the IndexPages.
+    assert isinstance(first["index_result"], dict)
 
-    # Second call: every canonical dir / file / table is already in place.
+    # Second call: every canonical dir / file / table is already in place;
+    # IndexPages already exist with up-to-date content (since corpus
+    # didn't change between the two bootstrap calls), so indexer skips
+    # the regeneration write.
     second = _call_tool(mcp_client, sid, "bootstrap", {}, req_id=61)
     assert second["created_dirs"] == []
     assert second["created_files"] == []
     assert second["created_tables"] == []
+    assert isinstance(second["index_result"], dict)
+
+
+# ---------------------------------------------------------------------------
+# IndexPage (C-3)
+
+
+def test_bootstrap_materializes_canonical_index_pages(mcp_client: TestClient):
+    """After bootstrap (which runs at session start via conftest), the two
+    canonical IndexPages exist in the indexed page set with the expected ids
+    + types + auto_generated flag."""
+    sid = _initialize(mcp_client)
+    # idx-glossary
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=420
+    )
+    assert glossary.get("error") is None
+    assert glossary["type"] == "index"
+    assert glossary["title"] == "Glossary"
+    assert glossary["frontmatter"]["auto_generated"] is True
+    assert glossary["frontmatter"]["stored_query"] == {
+        "kind": "concept_flag",
+        "flag": "glossary",
+    }
+    # The seed has con-embedding + con-index both flagged glossary: true
+    # → body must reference both ids.
+    assert "con-embedding" in glossary["body"]
+    assert "con-index" in glossary["body"]
+
+    # idx-domains
+    domains = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-domains"}, req_id=421
+    )
+    assert domains.get("error") is None
+    assert domains["type"] == "index"
+    assert domains["title"] == "Domains"
+    assert domains["frontmatter"]["auto_generated"] is True
+    assert domains["frontmatter"]["stored_query"] == {
+        "kind": "concept_flag",
+        "flag": "is_domain",
+    }
+    # Seed has only con-cs flagged is_domain: true.
+    assert "con-cs" in domains["body"]
+
+
+def test_index_pages_listed_with_type_filter(mcp_client: TestClient):
+    """list_pages(type='index') returns exactly the two canonical IndexPages."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"type": "index"}, req_id=422
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"idx-glossary", "idx-domains"} <= ids
+    assert all(p["type"] == "index" for p in result["pages"])
+
+
+def test_index_page_regenerates_on_new_glossary_concept(mcp_client: TestClient):
+    """Adding a `glossary: true` ConceptPage triggers the auto-indexer; the
+    pages/glossary.md IndexPage's body should now reference the new concept."""
+    sid = _initialize(mcp_client)
+    # Add a new glossary concept.
+    new_concept = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "con-regen-probe",
+                "type": "concept",
+                "title": "Regen Probe Concept",
+                "glossary": True,
+            },
+            "body": "First sentence is the definition. Second sentence too.",
+        },
+        req_id=423,
+    )
+    canonical = new_concept["id"]
+    # Read back the glossary IndexPage; it should now reference the new
+    # canonical id in its body.
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=424
+    )
+    assert canonical in glossary["body"]
+    # The first sentence should appear as the definition.
+    assert "First sentence is the definition." in glossary["body"]
+
+
+def test_index_page_skips_rewrite_when_corpus_unchanged(mcp_client: TestClient):
+    """Bootstrap twice in succession — the second run must skip the
+    IndexPage rewrite (content_hash stays stable across runs). We verify
+    by reading the IndexPage and seeing its frontmatter is well-formed
+    after a no-op-change indexer pass."""
+    sid = _initialize(mcp_client)
+    # First bootstrap (idempotent; runs the indexer).
+    _call_tool(mcp_client, sid, "bootstrap", {}, req_id=425)
+    before = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=426
+    )
+    # Second bootstrap — no corpus change between them.
+    _call_tool(mcp_client, sid, "bootstrap", {}, req_id=427)
+    after = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=428
+    )
+    # Body should be byte-identical (no rewrite happened).
+    assert before["body"] == after["body"]
+    # Frontmatter should also be identical.
+    assert before["frontmatter"] == after["frontmatter"]
+
+
+def test_write_page_rejects_index_page(mcp_client: TestClient):
+    """Direct writes to type='index' are rejected (the indexer is the only
+    writer for IndexPages)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "idx-custom-attempt",
+                "type": "index",
+                "title": "Should Fail",
+                "auto_generated": True,
+                "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+            },
+        },
+        req_id=429,
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["type"] == "index"
+
+
+def test_write_pages_batch_rejects_index_page_entry(mcp_client: TestClient):
+    """One index entry in a batch aborts the whole batch (validate-all-then-act)."""
+    sid = _initialize(mcp_client)
+    pages_arg = [
+        # An otherwise-valid concept page (would succeed on its own).
+        {
+            "frontmatter": _ent_fm("ent-batch-w-idx-ok", "OK"),
+            "body": "",
+        },
+        # An IndexPage entry — should abort the batch at validation time.
+        {
+            "frontmatter": {
+                "id": "idx-rejected-batch",
+                "type": "index",
+                "title": "Should Fail",
+                "auto_generated": True,
+                "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+            },
+            "body": "",
+        },
+    ]
+    result = _call_tool(
+        mcp_client, sid, "write_pages", {"pages": pages_arg}, req_id=430
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["index"] == 1
+    # The valid first entry must NOT have been written (all-or-nothing).
+    probe = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-batch-w-idx-ok"}, req_id=431
+    )
+    assert probe.get("error") == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +1658,1214 @@ def test_add_claim_unknown_page(mcp_client: TestClient):
 
 
 # ---------------------------------------------------------------------------
+# add_links (C-5) — bulk variant
+
+
+def test_add_links_batch_happy_path(mcp_client: TestClient):
+    """Batch of 5 distinct links — all written; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-links-src", "src")},
+        req_id=900,
+    )
+    src_id = src["id"]
+    # 5 distinct targets via new entity pages.
+    target_ids = []
+    for i in range(5):
+        t = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _ent_fm(f"ent-bulk-links-t{i}", f"t{i}")},
+            req_id=901 + i,
+        )
+        target_ids.append(t["id"])
+    links_arg = [{"target": tid, "label": "knows"} for tid in target_ids]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": src_id, "links": links_arg},
+        req_id=910,
+    )
+    assert result.get("error") is None, result
+    assert result["added_count"] == 5
+    assert result["duplicate_count"] == 0
+    assert all(r["added"] is True for r in result["results"])
+    # One indexer run at the end.
+    assert result["index_result"] is not None
+    # Round-trip: traverse from src finds all 5 targets.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src_id, "label": "knows"},
+        req_id=911,
+    )
+    trav_targets = {e["to_id"] for e in trav["edges"]}
+    for tid in target_ids:
+        assert tid in trav_targets
+
+
+def test_add_links_batch_with_existing_duplicate(mcp_client: TestClient):
+    """A batch containing one already-existing link reports that one as
+    duplicate; the others still get added; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-src", "src")},
+        req_id=920,
+    )
+    src_id = src["id"]
+    # Pre-existing target + link.
+    t_existing = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-existing-t", "t")},
+        req_id=921,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src_id, "to_id": t_existing["id"], "label": "knows"},
+        req_id=922,
+    )
+    # Two new targets.
+    t_new_a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-new-a", "a")},
+        req_id=923,
+    )
+    t_new_b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-dup-new-b", "b")},
+        req_id=924,
+    )
+    # Batch: 3 links, one of which duplicates the existing one.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src_id,
+            "links": [
+                {"target": t_existing["id"], "label": "knows"},  # duplicate
+                {"target": t_new_a["id"], "label": "knows"},
+                {"target": t_new_b["id"], "label": "knows"},
+            ],
+        },
+        req_id=925,
+    )
+    assert result["added_count"] == 2
+    assert result["duplicate_count"] == 1
+    # Per-item results in order: first is duplicate, others added.
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate"
+    assert result["results"][1]["added"] is True
+    assert result["results"][2]["added"] is True
+
+
+def test_add_links_in_batch_duplicate_detected(mcp_client: TestClient):
+    """Two identical links in the SAME batch — the second is reported as
+    duplicate (matched against the first in-batch item, not the on-disk
+    state). Only one is actually appended."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-inbatch-src", "src")},
+        req_id=930,
+    )
+    t = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-inbatch-t", "t")},
+        req_id=931,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": t["id"], "label": "knows"},
+                {"target": t["id"], "label": "knows"},  # identical
+            ],
+        },
+        req_id=932,
+    )
+    assert result["added_count"] == 1
+    assert result["duplicate_count"] == 1
+    assert result["results"][0]["added"] is True
+    assert result["results"][1]["added"] is False
+
+
+def test_add_links_all_duplicates_skips_indexer(mcp_client: TestClient):
+    """If every item in the batch is a duplicate, the write + indexer pass
+    is skipped — `index_result` is null."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-skip-src", "src")},
+        req_id=940,
+    )
+    t = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-skip-t", "t")},
+        req_id=941,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src["id"], "to_id": t["id"], "label": "knows"},
+        req_id=942,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": src["id"], "links": [{"target": t["id"], "label": "knows"}]},
+        req_id=943,
+    )
+    assert result["added_count"] == 0
+    assert result["duplicate_count"] == 1
+    assert result["index_result"] is None
+
+
+def test_add_links_validation_aborts_batch(mcp_client: TestClient):
+    """One invalid entry (missing required `target`) aborts the whole batch.
+    The MCP input-schema validator catches this before the handler runs
+    (each link item declares `required: ['target']` in the tool spec).
+    Either way the post-condition holds: no partial commit happens, the
+    valid first entry is NOT written."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-abort-src", "src")},
+        req_id=950,
+    )
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": "ent-bob", "label": "knows"},  # valid
+                {"label": "knows"},  # missing target → MCP schema rejects whole call
+            ],
+        },
+        req_id=951,
+    )
+    assert "target" in text and (
+        "required" in text.lower() or "missing" in text.lower()
+    )
+    # Post-condition: the valid first entry was NOT written (no partial commit).
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src["id"]},
+        req_id=952,
+    )
+    assert trav["count"] == 0
+
+
+def test_add_links_handler_validation_rejects_unknown_field(mcp_client: TestClient):
+    """Handler-side: an extra field on a link (extra='forbid' on `Link`)
+    bypasses MCP-level checks but Pydantic catches it. This proves the
+    handler's `validate-all-then-act` phase actually runs and aborts the
+    batch with a structured JSON error (not just the MCP plain-text)."""
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-handler-abort-src", "src")},
+        req_id=955,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": src["id"],
+            "links": [
+                {"target": "ent-bob", "label": "knows"},  # valid
+                {"target": "ent-bob", "label": "knows", "bogus_field": "x"},  # extra
+            ],
+        },
+        req_id=956,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # The valid first entry must NOT be written.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": src["id"]},
+        req_id=957,
+    )
+    assert trav["count"] == 0
+
+
+def test_add_links_unknown_page_returns_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {
+            "page_id": "ent-no-such-page-AbCdEfGhIjKlMnOpQrStUv",
+            "links": [{"target": "ent-bob"}],
+        },
+        req_id=960,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_add_links_empty_list_rejected(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_links",
+        {"page_id": "ent-alice", "links": []},
+        req_id=961,
+    )
+    assert result["error"] == "missing_argument"
+
+
+# ---------------------------------------------------------------------------
+# add_claims (C-5) — bulk variant
+
+
+def test_add_claims_batch_happy_path(mcp_client: TestClient):
+    """Batch of 3 distinct claims — all added; one indexer pass at end."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-host", "host")},
+        req_id=970,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "bc1", "text": "first"},
+                {"id": "bc2", "text": "second", "confidence": 0.7},
+                {"id": "bc3", "text": "third"},
+            ],
+        },
+        req_id=971,
+    )
+    assert result.get("error") is None, result
+    assert result["added_count"] == 3
+    assert result["duplicate_count"] == 0
+    assert result["index_result"] is not None
+    # Round-trip via read_page — claims on the page.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page["id"]}, req_id=972
+    )
+    claim_ids = {c["id"] for c in read["frontmatter"]["claims"]}
+    assert {"bc1", "bc2", "bc3"} <= claim_ids
+
+
+def test_add_claims_batch_with_existing_duplicate(mcp_client: TestClient):
+    """One claim id already present → reported as duplicate; others added."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-dup", "host")},
+        req_id=980,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page["id"], "claim": {"id": "preexisting", "text": "ohai"}},
+        req_id=981,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "preexisting", "text": "duplicate attempt"},  # dup
+                {"id": "fresh1", "text": "fresh one"},
+                {"id": "fresh2", "text": "fresh two"},
+            ],
+        },
+        req_id=982,
+    )
+    assert result["added_count"] == 2
+    assert result["duplicate_count"] == 1
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate_claim_id"
+
+
+def test_add_claims_in_batch_duplicate_id_detected(mcp_client: TestClient):
+    """Two claims with the same id in one batch — second is duplicate."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-inbatch", "host")},
+        req_id=990,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "twin", "text": "first"},
+                {"id": "twin", "text": "second"},
+            ],
+        },
+        req_id=991,
+    )
+    assert result["added_count"] == 1
+    assert result["duplicate_count"] == 1
+    assert result["results"][1]["reason"] == "duplicate_claim_id"
+
+
+def test_add_claims_validation_aborts_batch(mcp_client: TestClient):
+    """Invalid claim (e.g., confidence out of range) aborts the whole batch."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-bulk-claims-abort", "host")},
+        req_id=995,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "add_claims",
+        {
+            "page_id": page["id"],
+            "claims": [
+                {"id": "ok1", "text": "valid"},
+                {"id": "bad", "text": "x", "confidence": 5.0},  # out of [0,1]
+            ],
+        },
+        req_id=996,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # The valid first entry must NOT be written.
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page["id"]}, req_id=997
+    )
+    claim_ids = {c["id"] for c in (read["frontmatter"].get("claims") or [])}
+    assert "ok1" not in claim_ids
+
+
+# ---------------------------------------------------------------------------
+# write_batch (C-6) — mixed-op transaction
+
+
+def test_write_batch_mixed_ops_happy_path(mcp_client: TestClient):
+    """Batch: write a new entity + add a link from it to ent-alice + add a
+    claim to ent-alice. One indexer pass at the end; all three ops commit."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-mix-author", "Mixed-batch author"),
+                    "body": "author body",
+                },
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-alice",
+                    "to_id": "ent-bob",
+                    "label": "wb_link",
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": "ent-alice",
+                    "claim": {"id": "wb-claim-mix", "text": "from a batch"},
+                },
+            ]
+        },
+        req_id=1000,
+    )
+    assert result.get("committed") is True
+    assert result["count"] == 3
+    # Only one indexer pass for the whole batch.
+    assert result["index_result"] is not None
+    # Per-op result inspection.
+    write_res = result["results"][0]
+    assert write_res["kind"] == "write_page"
+    assert write_res["mangled"] is True
+    assert write_res["original_id"] == "ent-wb-mix-author"
+    link_res = result["results"][1]
+    assert link_res["kind"] == "add_link"
+    assert link_res["added"] is True
+    claim_res = result["results"][2]
+    assert claim_res["kind"] == "add_claim"
+    assert claim_res["added"] is True
+    assert claim_res["claim_id"] == "wb-claim-mix"
+    # Round-trip via traverse + read_page.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "ent-alice", "label": "wb_link"},
+        req_id=1001,
+    )
+    assert any(e["to_id"] == "ent-bob" for e in trav["edges"])
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-alice"}, req_id=1002
+    )
+    claim_ids = {c["id"] for c in read["frontmatter"]["claims"]}
+    assert "wb-claim-mix" in claim_ids
+
+
+def test_write_batch_unknown_kind_rejected_at_mcp(mcp_client: TestClient):
+    """Op[1] has an invalid kind → MCP schema enum rejects the whole call.
+    Post-condition: nothing in the batch was committed."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-abort-mcp", "should not be written"),
+                },
+                {"kind": "this-is-not-a-real-kind", "page_id": "ent-alice"},
+            ]
+        },
+        req_id=1010,
+    )
+    assert "kind" in text.lower() or "enum" in text.lower()
+    # ent-wb-abort-mcp must NOT have been written.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-abort-mcp"},
+        req_id=1011,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_handler_validation_aborts_no_partial_commit(mcp_client: TestClient):
+    """Handler-side validation (the JSON-schema check covers `kind`, but the
+    *frontmatter* is just `object` — invalid frontmatter slips past MCP and
+    hits the handler's Pydantic check). Op[1]'s missing `title` aborts the
+    batch; op[0] never executes."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-abort-victim", "valid"),
+                },
+                {
+                    "kind": "write_page",
+                    # Missing required `title` — Pydantic rejects in handler.
+                    "frontmatter": {"id": "ent-wb-no-title", "type": "entity"},
+                },
+            ]
+        },
+        req_id=1012,
+    )
+    assert result["error"] == "validation_error"
+    assert result["index"] == 1
+    # ent-wb-abort-victim must NOT have been written (validate-all-then-act).
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-abort-victim"},
+        req_id=1013,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_existence_check_aborts_at_phase_two(mcp_client: TestClient):
+    """add_link to a page that doesn't exist → phase 2 abort; the
+    write_page op (op[0]) doesn't execute either (validate-all-then-act)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": _ent_fm("ent-wb-existence-victim", "fresh"),
+                },
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-does-not-exist-AbCdEfGhIjKlMnOpQrStUv",
+                    "to_id": "ent-bob",
+                },
+            ]
+        },
+        req_id=1020,
+    )
+    assert result["error"] == "not_found"
+    assert result["index"] == 1
+    # Phase 2 happens AFTER phase 1's validation; but phase 3 (commit)
+    # never runs. ent-wb-existence-victim must NOT have been written.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-wb-existence-victim"},
+        req_id=1021,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_cross_op_reference_within_batch_rejected(mcp_client: TestClient):
+    """Documented limitation: an add_link to a page created EARLIER in the
+    SAME batch is rejected (existence check uses pre-batch LanceDB state).
+    The agent must use two separate batches for create-then-reference flows."""
+    sid = _initialize(mcp_client)
+    # write_page mode='create' with a section id is deterministic — we
+    # can predict the canonical id is what we passed (no mangling).
+    section_id = "src-wb-cross::created.py"
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": {
+                        "id": section_id,
+                        "type": "source",
+                        "title": "Created in batch",
+                        "location_uri": "file:/tmp/x",
+                        "location_kind": "file",
+                    },
+                },
+                {
+                    # Will fail — the page exists on disk after op[0] writes,
+                    # but LanceDB doesn't see it until the indexer runs at
+                    # the end.
+                    "kind": "add_link",
+                    "from_id": section_id,
+                    "to_id": "ent-bob",
+                },
+            ]
+        },
+        req_id=1030,
+    )
+    assert result["error"] == "not_found"
+    assert result["index"] == 1
+    # Neither op committed. find_by_alias has no entry for the section id
+    # (section ids don't generate aliases), so probe by list_pages prefix.
+    probe = _call_tool(
+        mcp_client,
+        sid,
+        "list_pages",
+        {"prefix": "src-wb-cross"},
+        req_id=1031,
+    )
+    assert probe["count"] == 0
+
+
+def test_write_batch_duplicates_reported_per_op_not_error(mcp_client: TestClient):
+    """add_link + add_claim ops with duplicate targets are reported
+    per-op (added: false) — they do NOT abort the batch. Matches the
+    single-call semantics."""
+    sid = _initialize(mcp_client)
+    # Pre-populate one link + one claim on ent-alice via single-call tools.
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": "ent-alice", "to_id": "ent-bob", "label": "wb_dup_link"},
+        req_id=1040,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": "ent-alice", "claim": {"id": "wb-dup-claim", "text": "pre"}},
+        req_id=1041,
+    )
+    # Batch: each tries to add the same thing → duplicates.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "add_link",
+                    "from_id": "ent-alice",
+                    "to_id": "ent-bob",
+                    "label": "wb_dup_link",
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": "ent-alice",
+                    "claim": {"id": "wb-dup-claim", "text": "attempt"},
+                },
+            ]
+        },
+        req_id=1042,
+    )
+    assert result.get("committed") is True
+    assert result["count"] == 2
+    assert result["results"][0]["added"] is False
+    assert result["results"][0]["reason"] == "duplicate"
+    assert result["results"][1]["added"] is False
+    assert result["results"][1]["reason"] == "duplicate_claim_id"
+
+
+def test_write_batch_update_claim_then_add_claim_same_page(mcp_client: TestClient):
+    """Two ops on the same page (update_claim + add_claim) commit
+    correctly — RMW per op, mutex-protected; final state reflects both."""
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-wb-same-page", "host")},
+        req_id=1050,
+    )
+    page_id = page["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page_id, "claim": {"id": "c-pre", "text": "v1"}},
+        req_id=1051,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "update_claim",
+                    "page_id": page_id,
+                    "claim_id": "c-pre",
+                    "new_claim": {"id": "c-pre", "text": "v2"},
+                },
+                {
+                    "kind": "add_claim",
+                    "page_id": page_id,
+                    "claim": {"id": "c-added", "text": "new"},
+                },
+            ]
+        },
+        req_id=1052,
+    )
+    assert result.get("committed") is True
+    read = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1053
+    )
+    by_id = {c["id"]: c for c in read["frontmatter"]["claims"]}
+    assert by_id["c-pre"]["text"] == "v2"
+    assert by_id["c-added"]["text"] == "new"
+
+
+def test_write_batch_empty_ops_rejected(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "write_batch", {"ops": []}, req_id=1060
+    )
+    assert result["error"] == "missing_argument"
+
+
+def test_write_batch_rejects_index_page_in_write_op(mcp_client: TestClient):
+    """IndexPage writes are rejected even inside a batch (matches the
+    single-call write_page behavior added in C-3)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_batch",
+        {
+            "ops": [
+                {
+                    "kind": "write_page",
+                    "frontmatter": {
+                        "id": "idx-batch-attempt",
+                        "type": "index",
+                        "title": "Should Fail",
+                        "auto_generated": True,
+                        "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+                    },
+                },
+            ]
+        },
+        req_id=1070,
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["index"] == 0
+
+
+# ---------------------------------------------------------------------------
+# reindex_page + reindex_all (C-9)
+
+
+def test_reindex_page_reflects_disk_edit(mcp_client: TestClient):
+    """Edit a page file on disk (bypassing the MCP write path); call
+    reindex_page; verify read_page returns the new content. Uses a
+    section page (no mangling — id stable + predictable path)."""
+    sid = _initialize(mcp_client)
+    # Write a section page so we have a predictable id + path.
+    section_id = "src-rxp-disk::test.py"
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(section_id, "before"),
+            "body": "before body",
+        },
+        req_id=1300,
+    )
+    assert write.get("error") is None, write
+    rel_path = write["path"]
+
+    # Edit the file directly on disk.
+    from smalt_mcp.server import _app_instance
+    abs_path = _app_instance.cfg.smalt_dir / rel_path
+    import frontmatter
+
+    post = frontmatter.load(str(abs_path))
+    post.metadata["title"] = "after edit"
+    post.content = "after edit body"
+    abs_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    # Before reindex_page: LanceDB still has the OLD title (we bypassed
+    # the indexer).
+    pre = _call_tool(mcp_client, sid, "read_page", {"page_id": section_id}, req_id=1301)
+    assert pre["title"] == "before"
+
+    # reindex_page picks up the change.
+    rxr = _call_tool(
+        mcp_client, sid, "reindex_page", {"page_id": section_id}, req_id=1302
+    )
+    assert rxr.get("error") is None, rxr
+    assert rxr["page_id"] == section_id
+    assert rxr["path"] == rel_path
+    # `index_result` is the per-page IndexResult summary.
+    assert isinstance(rxr["index_result"], dict)
+
+    # After reindex_page: read_page reflects the edit.
+    after = _call_tool(mcp_client, sid, "read_page", {"page_id": section_id}, req_id=1303)
+    assert after["title"] == "after edit"
+    assert after["body"] == "after edit body"
+
+
+def test_reindex_page_finds_file_not_in_lancedb(mcp_client: TestClient):
+    """A page exists on disk but has never been indexed (e.g., restored
+    from a Restic backup that excluded `index/lance/`, or manually
+    placed by an operator). reindex_page walks the filesystem and
+    projects it."""
+    sid = _initialize(mcp_client)
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import paths as smalt_paths
+
+    # Hand-write a markdown file directly into pages/entities/ —
+    # bypass write_page entirely, so it's never in LanceDB.
+    page_id = "ent-rxp-disk-only"
+    rel = f"pages/entities/{page_id}.md"
+    abs_path = _app_instance.cfg.smalt_dir / rel
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(
+        f"---\nid: {page_id}\ntype: entity\ntitle: Disk Only\nentity_kind: test\n---\n"
+        "body content for disk-only test\n",
+        encoding="utf-8",
+    )
+
+    # Confirm: read_page can't find it yet (LanceDB has no row).
+    miss = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1310)
+    assert miss.get("error") == "not_found"
+
+    # reindex_page falls back to filesystem walk.
+    rxr = _call_tool(mcp_client, sid, "reindex_page", {"page_id": page_id}, req_id=1311)
+    assert rxr.get("error") is None, rxr
+    assert rxr["page_id"] == page_id
+
+    # Now read_page works.
+    hit = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=1312)
+    assert hit["id"] == page_id
+    assert hit["title"] == "Disk Only"
+    # Clean up the hand-written file so subsequent tests' filesystem
+    # state is unaffected.
+    abs_path.unlink()
+
+
+def test_reindex_page_not_found(mcp_client: TestClient):
+    """Unknown id (neither in LanceDB nor on disk) returns structured not_found."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "reindex_page",
+        {"page_id": "ent-genuinely-missing-AbCdEfGhIjKlMnOpQrStUv"},
+        req_id=1320,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_reindex_page_file_gone_returns_specific_error(mcp_client: TestClient):
+    """A page is indexed in LanceDB but the file was deleted from disk.
+    reindex_page returns file_not_found (distinct from plain not_found)
+    so the caller knows to use remove_page."""
+    sid = _initialize(mcp_client)
+    # Write a section page, then unlink it on disk.
+    section_id = "src-rxp-gone::ghost.py"
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section(section_id, "soon to be gone")},
+        req_id=1330,
+    )
+    rel = write["path"]
+    from smalt_mcp.server import _app_instance
+    abs_path = _app_instance.cfg.smalt_dir / rel
+    abs_path.unlink()
+
+    # reindex_page sees indexed-row but no file.
+    rxr = _call_tool(
+        mcp_client, sid, "reindex_page", {"page_id": section_id}, req_id=1331
+    )
+    assert rxr["error"] == "file_not_found"
+    assert rxr["indexed_path"] == rel
+
+
+def test_reindex_all_rebuilds_from_disk(mcp_client: TestClient):
+    """reindex_all wipes the LanceDB tables and rebuilds from `pages/`.
+    All pages that were listed before are still listed after.
+
+    C-13: reindex_all is now async — returns a task_id; we poll via
+    the `_reindex_all_sync` helper which wraps enqueue + await."""
+    sid = _initialize(mcp_client)
+    # Trigger an indexer pass to ensure the state is fresh.
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rxa-trigger", "trigger")},
+        req_id=1400,
+    )
+    before = _call_tool(
+        mcp_client, sid, "list_pages", {"limit": 10_000}, req_id=1401
+    )
+    before_ids = {p["id"] for p in before["pages"]}
+    assert before["count"] > 0
+
+    # Wipe + rebuild — async; helper polls until done and returns the
+    # work-function result payload (same shape as pre-C-13).
+    result = _reindex_all_sync(mcp_client, sid, req_id=1402)
+    assert "wiped_tables" in result
+    assert "recreated_tables" in result
+    assert isinstance(result["index_result"], dict)
+
+    # Every page id from before is back. Reindex preserves on-disk
+    # content (which is the source of truth).
+    after = _call_tool(
+        mcp_client, sid, "list_pages", {"limit": 10_000}, req_id=1403
+    )
+    after_ids = {p["id"] for p in after["pages"]}
+    # Subset check — reindex_all auto-regenerates IndexPages which are
+    # always present after the rebuild.
+    assert before_ids <= after_ids
+
+
+def test_reindex_all_preserves_index_pages(mcp_client: TestClient):
+    """After reindex_all, the canonical IndexPages (glossary, domains)
+    are still present (the indexer's auto-regen step runs at the end
+    of the rebuild pass)."""
+    sid = _initialize(mcp_client)
+    _reindex_all_sync(mcp_client, sid, req_id=1410)
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=1411
+    )
+    assert glossary.get("error") is None
+    assert glossary["type"] == "index"
+
+
+def test_reindex_all_search_still_works(mcp_client: TestClient):
+    """After reindex_all, search returns hits — proves FTS + vector
+    indexes get rebuilt on the new tables."""
+    sid = _initialize(mcp_client)
+    _reindex_all_sync(mcp_client, sid, req_id=1420)
+    result = _call_tool(
+        mcp_client, sid, "search", {"query": "Alice", "top_k": 5}, req_id=1421
+    )
+    # Should find at least ent-alice (FTS body match on the seed).
+    ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" in ids, f"search didn't surface ent-alice after reindex_all: {ids}"
+
+
+# ---------------------------------------------------------------------------
+# Aliases LanceDB column (C-10)
+
+
+def test_pages_table_has_aliases_column(mcp_client: TestClient):
+    """The pages table schema includes a first-class `aliases` list<string>
+    column after C-10."""
+    sid = _initialize(mcp_client)
+    # Trigger an indexer pass to make sure ensure_tables ran (it does on
+    # conftest's seed bootstrap, but be explicit).
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c10-trigger", "trigger")},
+        req_id=1500,
+    )
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    assert "aliases" in table.schema.names
+    # Field type is list<string>.
+    aliases_field = table.schema.field("aliases")
+    import pyarrow as pa
+    assert pa.types.is_list(aliases_field.type)
+    assert pa.types.is_string(aliases_field.type.value_type)
+
+
+def test_alias_indexed_after_write_page(mcp_client: TestClient):
+    """A page written via the v0.5.0 always-mangle path has its caller-id
+    in `aliases`; after the write+indexer pass, that alias is in the
+    LanceDB column (not just in frontmatter_json)."""
+    sid = _initialize(mcp_client)
+    write = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c10-indexed-alias", "test")},
+        req_id=1510,
+    )
+    canonical = write["id"]
+    assert canonical.startswith("ent-c10-indexed-alias-")  # mangled
+
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    arrow = (
+        table.search()
+        .where(f"id = {lance.sql_str(canonical)}")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    aliases = arrow.column("aliases")[0].as_py()
+    # The original caller id is in the indexed aliases column.
+    assert "ent-c10-indexed-alias" in aliases
+
+
+def test_find_by_alias_uses_array_has_predicate(mcp_client: TestClient):
+    """find_by_alias returns matches via the indexed column. Hard to
+    distinguish 'indexed' vs 'scanned' from the response shape alone —
+    so this test mostly checks behavioral equivalence with the legacy
+    scan path."""
+    sid = _initialize(mcp_client)
+    # Seed: ent-alice has aliases: [Alicia].
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "Alicia"},
+        req_id=1520,
+    )
+    ids = {m["id"] for m in result["matches"]}
+    assert "ent-alice" in ids
+
+
+def test_search_alias_match_uses_indexed_column(mcp_client: TestClient):
+    """search() with a query that's an alias (the C-2 path that uses
+    _find_alias_matches) keeps working — but now via array_has under the
+    hood. Behavioral assertion: the alias-only page surfaces in search
+    results, same as it did pre-C-10."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _ent_fm("ent-c10-search-alias", "no body match"),
+            "body": "unrelated body content nothing matching the query",
+        },
+        req_id=1530,
+    )
+    canonical = create["id"]
+    # Search for the alias verbatim — FTS won't match (body is
+    # unrelated), but alias retrieval via array_has should.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "search",
+        {"query": "ent-c10-search-alias", "top_k": 5},
+        req_id=1531,
+    )
+    ids = {r["id"] for r in result["results"]}
+    assert canonical in ids, f"search via alias missed canonical {canonical}; got {ids}"
+
+
+def test_migration_adds_aliases_column_to_pre_c10_table(tmp_path):
+    """An existing pages table without the aliases column is migrated
+    (additively) on ensure_tables — column appears, existing rows get
+    NULL for aliases (no data loss)."""
+    import pyarrow as pa
+    from smalt_mcp.storage import lance
+
+    # Build a pre-C-10 schema (without aliases) + create a table with it.
+    pre_c10_schema = pa.schema(
+        [
+            pa.field("id", pa.string(), nullable=False),
+            pa.field("path", pa.string(), nullable=False),
+            pa.field("type", pa.string(), nullable=False),
+            pa.field("title", pa.string()),
+            pa.field("body", pa.string()),
+            pa.field("frontmatter_json", pa.string()),
+            pa.field("content_hash", pa.string()),
+            pa.field("created_at", pa.timestamp("us", tz="UTC")),
+            pa.field("updated_at", pa.timestamp("us", tz="UTC")),
+        ]
+    )
+    smalt_root = tmp_path / "migrate-smalt"
+    smalt_root.mkdir()
+    db = lance.connect(smalt_root)
+    db.create_table(lance.TABLE_PAGES, schema=pre_c10_schema, mode="create")
+    # Insert one row so the migration has something to operate on.
+    db.open_table(lance.TABLE_PAGES).add(
+        [
+            {
+                "id": "ent-legacy",
+                "path": "pages/entities/ent-legacy.md",
+                "type": "entity",
+                "title": "Legacy",
+                "body": "old data",
+                "frontmatter_json": "{}",
+                "content_hash": "deadbeef",
+                "created_at": None,
+                "updated_at": None,
+            }
+        ]
+    )
+
+    # Sanity: column is NOT there yet.
+    assert "aliases" not in db.open_table(lance.TABLE_PAGES).schema.names
+
+    # ensure_tables runs the migration.
+    created = lance.ensure_tables(smalt_root, embedding_dim=384)
+    # pages already existed → not in `created`; other tables created.
+    assert lance.TABLE_PAGES not in created
+
+    # After migration: column exists.
+    table = db.open_table(lance.TABLE_PAGES)
+    assert "aliases" in table.schema.names
+    # The legacy row's aliases is NULL (migration default).
+    arrow = (
+        table.search()
+        .where("id = 'ent-legacy'")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    assert arrow.column("aliases")[0].as_py() is None
+
+
+def test_migration_is_idempotent(tmp_path):
+    """Running ensure_tables twice doesn't error — the migration
+    short-circuits when the column is already present."""
+    from smalt_mcp.storage import lance
+
+    smalt_root = tmp_path / "idempotent-smalt"
+    smalt_root.mkdir()
+    # First call creates everything; second is a no-op (column present).
+    lance.ensure_tables(smalt_root, embedding_dim=384)
+    lance.ensure_tables(smalt_root, embedding_dim=384)
+    # No exception is the assertion. (LanceDB add_columns would raise
+    # if called with a duplicate column name.)
+    db = lance.connect(smalt_root)
+    assert "aliases" in db.open_table(lance.TABLE_PAGES).schema.names
+
+
+def test_reindex_all_populates_aliases_column(mcp_client: TestClient):
+    """reindex_all rebuilds the table from disk; pages with `aliases:` in
+    their frontmatter end up with the column populated. The seed Smalt's
+    ent-alice has `aliases: [Alicia]` — assert that after reindex_all
+    the column reflects this."""
+    sid = _initialize(mcp_client)
+    _reindex_all_sync(mcp_client, sid, req_id=1540)
+    from smalt_mcp.server import _app_instance
+    from smalt_mcp.storage import lance
+
+    table = _app_instance.db().open_table(lance.TABLE_PAGES)
+    arrow = (
+        table.search()
+        .where("id = 'ent-alice'")
+        .select(["id", "aliases"])
+        .limit(1)
+        .to_arrow()
+    )
+    assert arrow.num_rows == 1
+    aliases = arrow.column("aliases")[0].as_py() or []
+    assert "Alicia" in aliases
+
+
+# ---------------------------------------------------------------------------
 # ID validation (path traversal + portability)
 #
 # Schema-level: rejected ids should never reach the filesystem. Every test
@@ -904,6 +2928,297 @@ def test_write_page_rejects_windows_reserved_names(mcp_client: TestClient):
         )
         assert result["error"] == "validation_error", f"{bad!r} should have been rejected"
         assert "windows" in result["message"].lower() or "reserved" in result["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Section page id format (C-4)
+
+
+def _src_fm_section(section_id: str, title: str = "section") -> dict:
+    """Build a minimal SourcePage frontmatter for a section page."""
+    return {
+        "id": section_id,
+        "type": "source",
+        "title": title,
+        "location_uri": f"file:/tmp/{section_id.replace('::', '__')}",
+        "location_kind": "file",
+    }
+
+
+def test_section_id_round_trip(mcp_client: TestClient):
+    """Write a section-shaped SourcePage; the canonical id is NOT mangled
+    (it's already canonical by construction); the file lands at
+    `pages/sources/<src>/<rel>.md`; read_page returns it."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-sec-rt::src/utils.py", "utils.py section"
+            ),
+            "body": "section body",
+        },
+        req_id=350,
+    )
+    assert result.get("error") is None, result
+    # No mangling for section ids.
+    assert result["id"] == "src-sec-rt::src/utils.py"
+    assert result["mangled"] is False
+    assert result["upserted"] is False  # first write, didn't already exist
+    # File path: `::` → `/`, then `.md` appended.
+    assert result["path"] == "pages/sources/src-sec-rt/src/utils.py.md"
+    # Round-trip via read_page.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "src-sec-rt::src/utils.py"},
+        req_id=351,
+    )
+    assert read.get("error") is None
+    assert read["id"] == "src-sec-rt::src/utils.py"
+    assert read["title"] == "utils.py section"
+    assert read["body"] == "section body"
+
+
+def test_section_id_second_write_upserts(mcp_client: TestClient):
+    """A second write_page with the same section id overwrites in place
+    (upsert semantics: the id IS the canonical address)."""
+    sid = _initialize(mcp_client)
+    first = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section("src-sec-upsert::main.py", "v1"),
+            "body": "first body",
+        },
+        req_id=352,
+    )
+    assert first["upserted"] is False
+    second = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section("src-sec-upsert::main.py", "v2"),
+            "body": "second body",
+        },
+        req_id=353,
+    )
+    assert second["upserted"] is True
+    assert second["id"] == first["id"]  # canonical id stable
+    assert second["path"] == first["path"]
+    # Read back — body and title reflect the second write.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "src-sec-upsert::main.py"},
+        req_id=354,
+    )
+    assert read["title"] == "v2"
+    assert read["body"] == "second body"
+
+
+def test_section_id_index_special_case(mcp_client: TestClient):
+    """`<src>::index` is the natural way to write the multi-file source's
+    root index page → file at `pages/sources/<src>/index.md`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-multi-index::index", "Multi-file source root"
+            ),
+            "body": "index body — points at sections",
+        },
+        req_id=355,
+    )
+    assert result.get("error") is None, result
+    assert result["path"] == "pages/sources/src-multi-index/index.md"
+
+
+def test_section_id_nested_subdirs(mcp_client: TestClient):
+    """Deeply nested rel-paths are honored — multi-component paths
+    translate to multi-level filesystem directories."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-deep::a/b/c/d/file.py", "deep section"
+            ),
+            "body": "",
+        },
+        req_id=356,
+    )
+    assert result["path"] == "pages/sources/src-deep/a/b/c/d/file.py.md"
+
+
+def test_section_id_rejects_path_traversal(mcp_client: TestClient):
+    """`..` in the rel-path is rejected at the schema validator
+    (before reaching the filesystem)."""
+    sid = _initialize(mcp_client)
+    bad_ids = [
+        "src-foo::../escape",
+        "src-foo::a/../b",
+        "src-foo::./hidden",
+        "src-foo::../../top",
+    ]
+    for i, bad in enumerate(bad_ids):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _src_fm_section(bad)},
+            req_id=357 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should reject"
+
+
+def test_section_id_rejects_absolute_rel_path(mcp_client: TestClient):
+    """Rel-path starting with `/` is an absolute path → rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::/abs/path.py")},
+        req_id=370,
+    )
+    assert result["error"] == "validation_error"
+    assert "/" in result["message"] or "absolute" in result["message"].lower()
+
+
+def test_section_id_rejects_empty_rel_path(mcp_client: TestClient):
+    """Section id with empty rel-path (just `<src>::`) is rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::")},
+        req_id=371,
+    )
+    assert result["error"] == "validation_error"
+    assert "rel-path" in result["message"] or "non-empty" in result["message"].lower()
+
+
+def test_section_id_rejects_double_slash(mcp_client: TestClient):
+    """`//` in rel-path (empty component) is rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::a//b")},
+        req_id=372,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_section_id_rejects_multiple_separators(mcp_client: TestClient):
+    """Section id with more than one `::` is rejected (ambiguous parse)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::a::b")},
+        req_id=373,
+    )
+    assert result["error"] == "validation_error"
+    assert "::" in result["message"]
+
+
+def test_section_id_rejects_windows_reserved_component(mcp_client: TestClient):
+    """A rel-path component whose base (pre-extension) is a Windows-reserved
+    name (CON, NUL, COM1, ...) is rejected case-insensitively."""
+    sid = _initialize(mcp_client)
+    bad_ids = ["src-foo::con.py", "src-foo::sub/nul.txt", "src-foo::COM1.h"]
+    for i, bad in enumerate(bad_ids):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _src_fm_section(bad)},
+            req_id=380 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should reject"
+
+
+def test_section_id_rejects_hidden_file_component(mcp_client: TestClient):
+    """A rel-path component starting with `.` (hidden file convention) is
+    rejected — the leading-alphanumeric rule. Stops `.git/config` style
+    paths from accidentally being treated as section ids."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::.hidden")},
+        req_id=390,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_section_id_with_dot_in_filename_ok(mcp_client: TestClient):
+    """Dots in the middle of a filename are fine (`utils.py`, `package.json`,
+    `data.test.json`); only LEADING dots are rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-dot-mid::pkg/data.test.json", "multi-dot filename"
+            ),
+            "body": "",
+        },
+        req_id=391,
+    )
+    assert result.get("error") is None
+    assert result["path"] == "pages/sources/src-dot-mid/pkg/data.test.json.md"
+
+
+def test_section_id_in_batch_write_pages(mcp_client: TestClient):
+    """write_pages handles section-id entries with upsert semantics
+    alongside slug-id (mangled) entries in the same batch."""
+    sid = _initialize(mcp_client)
+    pages_arg = [
+        {
+            "frontmatter": _ent_fm("ent-batch-with-section", "slug entry"),
+            "body": "slug",
+        },
+        {
+            "frontmatter": _src_fm_section(
+                "src-batch-sec::file.py", "section entry"
+            ),
+            "body": "section",
+        },
+    ]
+    result = _call_tool(
+        mcp_client, sid, "write_pages", {"pages": pages_arg}, req_id=392
+    )
+    assert result.get("error") is None, result
+    assert result["count"] == 2
+    by_id = {w.get("original_id") or w["id"]: w for w in result["written"]}
+    # Slug-id entry was mangled.
+    slug_entry = by_id["ent-batch-with-section"]
+    assert slug_entry["mangled"] is True
+    # Section-id entry was NOT mangled; upserted=False (first write).
+    section_entry = by_id["src-batch-sec::file.py"]
+    assert section_entry["mangled"] is False
+    assert section_entry["upserted"] is False
+    assert section_entry["path"] == "pages/sources/src-batch-sec/file.py.md"
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +3563,1165 @@ def test_read_page_unknown_id_or_alias_still_returns_not_found(mcp_client: TestC
     )
     assert result["error"] == "not_found"
     assert result["page_id"] == "ent-truly-missing"
+
+
+# ---------------------------------------------------------------------------
+# C-11: fuzzy alias match (trigram-Jaccard fallback on find_by_alias +
+# read_page). Search retrieval stays exact-only.
+
+
+def test_c11_trigram_set_helper():
+    """Unit test of the trigram helper: short strings → empty set,
+    long strings → all 3-grams."""
+    from smalt_mcp.tools import _trigram_set
+
+    assert _trigram_set("") == set()
+    assert _trigram_set("a") == set()
+    assert _trigram_set("ab") == set()
+    assert _trigram_set("abc") == {"abc"}
+    assert _trigram_set("abcd") == {"abc", "bcd"}
+    # Case-insensitive: same trigrams for upper/lower variants.
+    assert _trigram_set("ABC") == {"abc"}
+    assert _trigram_set("AbCd") == _trigram_set("abcd")
+
+
+def test_c11_jaccard_known_cases():
+    """Unit test of the Jaccard scoring on cases the docstring promises."""
+    from smalt_mcp.tools import _jaccard_trigram
+
+    # Identical strings: 1.0.
+    assert _jaccard_trigram("ent-alice", "ent-alice") == 1.0
+    # Empty operand: 0.0.
+    assert _jaccard_trigram("", "ent-alice") == 0.0
+    assert _jaccard_trigram("ab", "ent-alice") == 0.0  # both < 3 chars
+
+    # Near-miss "ent-alic" vs "ent-alice" — docstring claims ~0.857.
+    score = _jaccard_trigram("ent-alic", "ent-alice")
+    assert 0.8 < score < 0.9
+
+    # Unrelated "ent-bob" vs "ent-alice" — docstring claims well below 0.6.
+    score = _jaccard_trigram("ent-bob", "ent-alice")
+    assert score < 0.4
+
+
+def test_c11_find_by_alias_fuzzy_finds_near_miss(mcp_client: TestClient):
+    """Misspelled query finds the page via fuzzy fallback when exact match
+    returns zero. Response includes fuzzy=true, fuzzy_score, matched_alias."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-alice-readback", "Fuzzy Alice")},
+        req_id=600,
+    )
+    canonical = create["id"]
+    # Query a typo of the original caller-id (the alias).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-alice-readbak"},  # missing the 'c' before 'k'
+        req_id=601,
+    )
+    assert result["fuzzy"] is True, result
+    assert result["count"] >= 1
+    assert "fuzzy_threshold" in result
+    ids = {m["id"] for m in result["matches"]}
+    assert canonical in ids
+    # Per-row fuzzy fields populated.
+    target = next(m for m in result["matches"] if m["id"] == canonical)
+    assert target["matched_alias"] == "ent-fuzzy-alice-readback"
+    assert 0.6 <= target["fuzzy_score"] <= 1.0
+
+
+def test_c11_find_by_alias_exact_match_does_not_trigger_fuzzy(mcp_client: TestClient):
+    """Exact alias match returns fuzzy=false — fuzzy fallback is only
+    invoked when exact returns zero."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-exact-only", "Exact only")},
+        req_id=610,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-exact-only"},
+        req_id=611,
+    )
+    assert result["fuzzy"] is False
+    assert result["count"] >= 1
+    # Exact-match rows don't carry the fuzzy_score field.
+    for m in result["matches"]:
+        assert "fuzzy_score" not in m
+        assert "matched_alias" not in m
+
+
+def test_c11_find_by_alias_fuzzy_can_be_disabled(mcp_client: TestClient):
+    """fuzzy=false disables the fallback — a near-miss returns count=0
+    even though the fuzzy path would have found something."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-optout-target", "Opt out")},
+        req_id=620,
+    )
+    # Near-miss with fuzzy disabled → empty result.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "ent-fuzzy-optout-targt", "fuzzy": False},  # missing 'e'
+        req_id=621,
+    )
+    assert result["fuzzy"] is False
+    assert result["count"] == 0
+    assert result["matches"] == []
+
+
+def test_c11_find_by_alias_fuzzy_skips_unrelated(mcp_client: TestClient):
+    """Trigram threshold keeps unrelated strings out of the result —
+    a query string with no near-match returns count=0 with fuzzy=false
+    (the fuzzy pass ran but found nothing above threshold)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "find_by_alias",
+        {"alias": "xyzzy-cryptic-incantation-no-overlap"},
+        req_id=630,
+    )
+    # The fuzzy path ran but yielded zero matches; `fuzzy` flag is
+    # False because the response includes no fuzzy-matched rows.
+    assert result["count"] == 0
+    assert result["matches"] == []
+    assert result["fuzzy"] is False
+
+
+def test_c11_read_page_fuzzy_resolves_typo(mcp_client: TestClient):
+    """read_page with a misspelled alias finds the page via fuzzy fallback;
+    response includes resolved_via_alias + fuzzy=true + score + matched_alias."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-readpage", "Fuzzy read")},
+        req_id=640,
+    )
+    canonical = create["id"]
+    # Typo: drop the 'p' from 'readpage' → 'readage'.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-readage"},
+        req_id=641,
+    )
+    assert read.get("error") is None, read
+    assert read["id"] == canonical
+    assert read["title"] == "Fuzzy read"
+    assert read["resolved_via_alias"] == "ent-fuzzy-readage"
+    assert read["fuzzy"] is True
+    assert read["matched_alias"] == "ent-fuzzy-readpage"
+    assert 0.6 <= read["fuzzy_score"] <= 1.0
+
+
+def test_c11_read_page_fuzzy_ambiguous_returns_match_list(mcp_client: TestClient):
+    """When the typo near-matches two distinct canonical pages, read_page
+    returns ambiguous_alias with fuzzy=true and the candidate list."""
+    sid = _initialize(mcp_client)
+    a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-ambig-target-one", "One")},
+        req_id=650,
+    )
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-ambig-target-two", "Two")},
+        req_id=651,
+    )
+    # Typo close to BOTH aliases — drop the last token entirely.
+    # Both "ent-fuzzy-ambig-target-one" and "ent-fuzzy-ambig-target-two"
+    # share the "ent-fuzzy-ambig-target-" prefix; the trigram intersection
+    # is large enough that a query for the shared prefix lands above threshold
+    # for both.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-ambig-target-on"},  # near-miss to both
+        req_id=652,
+    )
+    assert read["error"] == "ambiguous_alias"
+    assert read["fuzzy"] is True
+    assert "fuzzy_threshold" in read
+    ids = {m["id"] for m in read["matches"]}
+    assert a["id"] in ids
+    assert b["id"] in ids
+    # All matches in the list carry fuzzy scoring fields.
+    for m in read["matches"]:
+        assert "fuzzy_score" in m
+        assert "matched_alias" in m
+
+
+def test_c11_read_page_fuzzy_can_be_disabled(mcp_client: TestClient):
+    """read_page with fuzzy=false sees only exact resolution — a near-miss
+    returns not_found instead of fuzzy-resolving."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-readpage-noopt", "No opt-in")},
+        req_id=660,
+    )
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "ent-fuzzy-readpage-nopt", "fuzzy": False},  # near-miss
+        req_id=661,
+    )
+    assert read["error"] == "not_found"
+    # When fuzzy is disabled, response shouldn't claim a fuzzy pass ran.
+    assert "fuzzy" not in read or read.get("fuzzy") is not True
+
+
+def test_c11_read_page_fuzzy_unknown_returns_not_found_with_flag(mcp_client: TestClient):
+    """An unknown id with no near-matches returns not_found, but with
+    fuzzy=true to signal the fuzzy pass was attempted (so callers
+    distinguish 'no match at any threshold' from 'fuzzy was disabled')."""
+    sid = _initialize(mcp_client)
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "xyzzy-no-such-handle-anywhere-in-smalt"},
+        req_id=670,
+    )
+    assert read["error"] == "not_found"
+    assert read["fuzzy"] is True
+    assert "fuzzy_threshold" in read
+
+
+def test_c11_fuzzy_threshold_env_var_tunable(mcp_client: TestClient):
+    """Setting SMALT_FUZZY_ALIAS_THRESHOLD=0.99 (very strict) makes a
+    typo that previously matched stop matching. Resetting restores
+    default behavior. Verifies the env-var knob actually moves the bar."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-fuzzy-threshold-tunable", "Tunable")},
+        req_id=680,
+    )
+    typo = "ent-fuzzy-threshold-tunabl"  # missing trailing 'e'
+
+    # Sanity: default threshold matches the typo.
+    default_result = _call_tool(
+        mcp_client, sid, "find_by_alias", {"alias": typo}, req_id=681
+    )
+    assert default_result["fuzzy"] is True
+    assert default_result["count"] >= 1
+
+    # Crank threshold above any realistic match → fuzzy stops finding.
+    os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "0.99"
+    try:
+        strict_result = _call_tool(
+            mcp_client, sid, "find_by_alias", {"alias": typo}, req_id=682
+        )
+        assert strict_result["count"] == 0
+        assert strict_result["fuzzy"] is False  # nothing fuzzy-matched
+        assert strict_result["fuzzy_threshold"] == 0.99
+    finally:
+        del os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"]
+
+
+def test_c11_fuzzy_threshold_env_var_invalid_falls_back(mcp_client: TestClient):
+    """Garbage env values don't break resolution — invalid values fall
+    back to the default 0.6 (and log a warning, but tests don't capture
+    logs)."""
+    from smalt_mcp.tools import _fuzzy_alias_threshold, _DEFAULT_FUZZY_ALIAS_THRESHOLD
+
+    os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "not-a-number"
+    try:
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "2.5"  # out of range
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = "-0.1"  # out of range
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+        os.environ["SMALT_FUZZY_ALIAS_THRESHOLD"] = ""  # empty
+        assert _fuzzy_alias_threshold() == _DEFAULT_FUZZY_ALIAS_THRESHOLD
+    finally:
+        os.environ.pop("SMALT_FUZZY_ALIAS_THRESHOLD", None)
+
+
+def test_c11_search_alias_retrieval_stays_exact_only(mcp_client: TestClient):
+    """Search's alias retrieval must NOT fuzzy-match (per the plan: 'fuzzy
+    in search would noise the RRF'). A typo in the search query should not
+    surface the near-matched page via the alias path."""
+    sid = _initialize(mcp_client)
+    _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-search-fuzzy-isolated-token-xyz", "Isolated")},
+        req_id=690,
+    )
+    # Typo of the unique token. If alias retrieval fuzzy-matched, this
+    # would surface in the search results via the alias path. It must
+    # not — search alias matching stays exact-only.
+    from smalt_mcp.tools import _find_alias_matches
+    from smalt_mcp.server import _app_instance
+
+    typo = "ent-search-fuzzy-isolated-token-xy"  # missing trailing 'z'
+    alias_hits = _find_alias_matches(_app_instance, typo)
+    # No exact alias match for the typo; the helper must return empty
+    # rather than fuzzy-promoting the close alias.
+    assert alias_hits == []
+
+
+# ---------------------------------------------------------------------------
+# C-12: source_similarity (vector-search using a page's stored embedding
+# as the query vector). Tests use the FakeEmbedder (deterministic SHA-256
+# hashing → uncorrelated vectors regardless of body similarity), so the
+# "near-duplicate adjacency" semantic property is tested via a hand-built
+# scenario rather than relying on the embedder to cluster meaningfully.
+# Semantic quality with the real fastembed model is verified out-of-band.
+
+
+def test_c12_source_similarity_missing_argument(mcp_client: TestClient):
+    """source_id is required by the MCP input schema; calls without it
+    are rejected with a JSON-schema validation error (raw text, not
+    our handler's structured `{error: 'missing_argument'}`)."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client, sid, "source_similarity", {}, req_id=700
+    )
+    assert "source_id" in raw
+    assert "required" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_invalid_top_k_zero(mcp_client: TestClient):
+    """top_k has `minimum: 1` in the input schema; MCP rejects top_k=0
+    before the handler sees it."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 0},
+        req_id=701,
+    )
+    assert "less than the minimum" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_invalid_top_k_negative(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": -5},
+        req_id=702,
+    )
+    assert "less than the minimum" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c12_source_similarity_not_found_for_unknown_source(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-no-such-page-in-smalt"},
+        req_id=703,
+    )
+    assert result["error"] == "not_found"
+    assert result["source_id"] == "ent-no-such-page-in-smalt"
+    assert "reindex_page" in result["message"]
+
+
+def test_c12_source_similarity_excludes_source_itself(mcp_client: TestClient):
+    """The source page must never appear in its own similarity results."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100},
+        req_id=704,
+    )
+    assert "results" in result
+    result_ids = {r["id"] for r in result["results"]}
+    assert "ent-alice" not in result_ids
+
+
+def test_c12_source_similarity_respects_top_k(mcp_client: TestClient):
+    """Result count is bounded by top_k."""
+    sid = _initialize(mcp_client)
+    # Seed Smalt has 6 pages → at most 5 similar pages (excluding source).
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 2},
+        req_id=705,
+    )
+    assert result["count"] <= 2
+    assert len(result["results"]) == result["count"]
+
+
+def test_c12_source_similarity_returns_canonical_shape(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 3},
+        req_id=706,
+    )
+    assert result["source_id"] == "ent-alice"
+    assert isinstance(result["results"], list)
+    assert "types_filter" in result
+    assert result["types_filter"] is None
+    for r in result["results"]:
+        # Each result has the expected fields and types.
+        assert set(r.keys()) >= {
+            "id",
+            "title",
+            "type",
+            "path",
+            "aliases",
+            "similarity",
+        }
+        assert isinstance(r["id"], str)
+        assert isinstance(r["title"], str)
+        assert isinstance(r["aliases"], list)
+        # Similarity is the cosine-derived score; for the fake embedder
+        # the vectors are roughly random so similarity floats around 0,
+        # but it must be a real number, not NaN/None.
+        assert isinstance(r["similarity"], (int, float))
+        assert r["similarity"] == r["similarity"]  # NaN check
+
+
+def test_c12_source_similarity_results_sorted_by_similarity_desc(
+    mcp_client: TestClient,
+):
+    """Whatever the absolute scores look like, results MUST be sorted by
+    similarity descending. The fake embedder produces uncorrelated
+    vectors; verifying sort order doesn't depend on semantic similarity
+    being meaningful."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100},
+        req_id=707,
+    )
+    sims = [r["similarity"] for r in result["results"]]
+    for i in range(len(sims) - 1):
+        assert sims[i] >= sims[i + 1], (
+            f"results not sorted desc at index {i}: "
+            f"{sims[i]} < {sims[i + 1]}"
+        )
+
+
+def test_c12_source_similarity_types_filter_restricts(mcp_client: TestClient):
+    """`types: ['source']` filter returns only SourcePages."""
+    sid = _initialize(mcp_client)
+    # Seed Smalt has 1 SourcePage (src-doc1) plus the source-similarity
+    # source. Filter excludes everything that isn't a source.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 100, "types": ["source"]},
+        req_id=708,
+    )
+    assert result["types_filter"] == ["source"]
+    for r in result["results"]:
+        assert r["type"] == "source"
+
+
+def test_c12_source_similarity_types_filter_multiple(mcp_client: TestClient):
+    """Multi-value `types` filter allows any of the listed types."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {
+            "source_id": "ent-alice",
+            "top_k": 100,
+            "types": ["concept", "entity"],
+        },
+        req_id=709,
+    )
+    for r in result["results"]:
+        assert r["type"] in {"concept", "entity"}
+
+
+def test_c12_source_similarity_types_filter_rejects_unknown_at_mcp(
+    mcp_client: TestClient,
+):
+    """An unknown type-name in `types` is caught by the MCP input-schema
+    enum (`items.enum`); the handler's defensive check is unreachable
+    via the MCP transport but kept for direct handler-call hygiene."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "types": ["entity", "notatype"]},
+        req_id=710,
+    )
+    assert "notatype" in raw
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+def test_c12_source_similarity_types_filter_rejects_malformed_at_mcp(
+    mcp_client: TestClient,
+):
+    """Non-string items in `types` are rejected by the MCP input schema
+    (items.enum is all strings); reaches the JSON-schema validator
+    before the handler."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "types": [123]},
+        req_id=711,
+    )
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+async def test_c12_source_similarity_handler_rejects_malformed_types_directly():
+    """Direct-handler test of the defensive `types` validation —
+    verifies the handler's own check catches non-list `types` values
+    (which the MCP schema's `type: array` would normally block, but
+    direct callers can bypass)."""
+    from smalt_mcp.tools import source_similarity
+    from smalt_mcp.server import _app_instance
+
+    # types as a string instead of a list — handler must reject.
+    result = await source_similarity(
+        _app_instance, {"source_id": "ent-alice", "types": "source"}
+    )
+    assert result["error"] == "invalid_argument"
+    assert "types" in result["message"]
+
+
+async def test_c12_source_similarity_handler_rejects_unknown_type_directly():
+    """Direct-handler test: an unknown type in the list (bypassing the
+    MCP enum check) is caught by the handler's validation."""
+    from smalt_mcp.tools import source_similarity
+    from smalt_mcp.server import _app_instance
+
+    result = await source_similarity(
+        _app_instance,
+        {"source_id": "ent-alice", "types": ["entity", "notatype"]},
+    )
+    assert result["error"] == "invalid_argument"
+    assert "notatype" in result["message"]
+
+
+def test_c12_source_similarity_default_top_k_is_10(mcp_client: TestClient):
+    """When `top_k` is omitted, the default is 10. With the seed Smalt's
+    5 indexable other pages, the response should be capped by available
+    pages (≤5), but the request itself must not error."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice"},
+        req_id=712,
+    )
+    assert result.get("error") is None, result
+    assert result["count"] <= 10
+
+
+def test_c12_source_similarity_after_write_page(mcp_client: TestClient):
+    """A newly-written page (mangled id) becomes a valid source_id for
+    similarity queries — the write_page indexer pass projects the
+    embedding, so source_similarity finds it immediately."""
+    sid = _initialize(mcp_client)
+    create = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-c12-newly-written-source", "New source")},
+        req_id=713,
+    )
+    canonical = create["id"]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": canonical, "top_k": 5},
+        req_id=714,
+    )
+    assert result.get("error") is None, result
+    # Source-itself exclusion still applies for the mangled canonical id.
+    assert all(r["id"] != canonical for r in result["results"])
+
+
+def test_c12_source_similarity_truncated_flag_when_filter_exhausts_pool(
+    mcp_client: TestClient,
+):
+    """`truncated: true` fires only when a types filter is set AND
+    the over-fetched pool didn't yield enough post-filter matches.
+    With an unset filter, truncated stays False."""
+    sid = _initialize(mcp_client)
+    # No types filter → truncated must be False even when top_k
+    # exceeds the available match pool.
+    no_filter = _call_tool(
+        mcp_client,
+        sid,
+        "source_similarity",
+        {"source_id": "ent-alice", "top_k": 1000},
+        req_id=715,
+    )
+    assert no_filter["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# C-13: async task scheduler. Two layers of tests:
+#   1. Unit tests of the Scheduler class (no HTTP, no MCP, no asyncio
+#      event loop — just direct dataclass + state checks where possible,
+#      and a few minimal asyncio.run() exercises for lifecycle flow).
+#   2. Integration: reindex_all (async via task_id), task_status,
+#      task_list, task_cancel — all via the MCP surface.
+
+
+# ---- C-13 unit: Scheduler class ----
+
+
+def test_c13_task_id_uniqueness():
+    """Task ids are short URL-safe strings; should never collide in
+    practice."""
+    from smalt_mcp.scheduler import _new_task_id
+
+    ids = {_new_task_id() for _ in range(10_000)}
+    assert len(ids) == 10_000, "task id collision in 10k samples"
+
+
+def test_c13_task_to_dict_shape():
+    """Task.to_dict() returns the documented field set with correct
+    serialization (datetimes → ISO strings; nested dicts copied)."""
+    from smalt_mcp.scheduler import Task, TaskState
+
+    t = Task(id="abc123", kind="reindex_all")
+    d = t.to_dict()
+    assert d["task_id"] == "abc123"
+    assert d["kind"] == "reindex_all"
+    assert d["state"] == "pending"
+    # created_at is ISO; started/finished are None
+    assert isinstance(d["created_at"], str)
+    assert "T" in d["created_at"]
+    assert d["started_at"] is None
+    assert d["finished_at"] is None
+    assert d["progress"] == {}
+    assert d["result"] is None
+    assert d["error"] is None
+    assert d["cancel_requested"] is False
+
+    # Mutating the returned progress shouldn't affect the task
+    d["progress"]["mutated"] = True
+    assert "mutated" not in t.progress
+
+
+def test_c13_task_check_cancel_raises_when_requested():
+    """task.check_cancel() raises CancelledError exactly when
+    cancel_requested is set."""
+    import asyncio
+    from smalt_mcp.scheduler import Task
+
+    t = Task(id="x", kind="k")
+    # No-op when not requested.
+    t.check_cancel()
+    t.cancel_requested = True
+    try:
+        t.check_cancel()
+    except asyncio.CancelledError as e:
+        assert "x" in str(e)
+    else:
+        raise AssertionError("check_cancel should have raised")
+
+
+def test_c13_scheduler_enqueue_succeeds_path():
+    """A successful work function transitions through pending →
+    running → succeeded. Final state has result set, error None,
+    finished_at populated."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            await asyncio.sleep(0)  # one tick
+            return {"ok": True, "value": 42}
+
+        task = sched.enqueue("kind-a", _work)
+        # Initial: pending (until the first await tick gives the runner CPU).
+        assert task.state in {TaskState.PENDING, TaskState.RUNNING}
+        # Wait for the runner to finish.
+        await task._asyncio_task
+        assert task.state == TaskState.SUCCEEDED
+        assert task.result == {"ok": True, "value": 42}
+        assert task.error is None
+        assert task.finished_at is not None
+        assert task.started_at is not None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_enqueue_failed_path():
+    """An exception in the work function transitions to FAILED with
+    error string populated."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            raise RuntimeError("oh no")
+
+        task = sched.enqueue("kind-b", _work)
+        await task._asyncio_task
+        assert task.state == TaskState.FAILED
+        assert task.error is not None
+        assert "RuntimeError" in task.error
+        assert "oh no" in task.error
+        assert task.result is None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_pending_immediately():
+    """Cancelling a freshly-enqueued task before it runs transitions
+    directly to CANCELLED."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+        ran = []
+
+        async def _work(task):
+            ran.append(True)
+            return None
+
+        task = sched.enqueue("kind-c", _work)
+        # Cancel before the runner has had a chance to start.
+        cancelled = sched.cancel(task.id)
+        assert cancelled is task
+        assert task.cancel_requested is True
+        # The async runner sees the cancel; await its completion.
+        try:
+            await task._asyncio_task
+        except asyncio.CancelledError:
+            pass
+        # The work function may or may not have entered (race), but the
+        # task's final state must be CANCELLED either way.
+        assert task.state == TaskState.CANCELLED
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_running_via_check_cancel():
+    """A running task that calls check_cancel() at a safe boundary
+    transitions to CANCELLED."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+        started = asyncio.Event()
+
+        async def _work(task):
+            started.set()
+            # Loop until cancel arrives.
+            for _ in range(1000):
+                await asyncio.sleep(0.001)
+                task.check_cancel()
+            return "didnt-get-cancelled"
+
+        task = sched.enqueue("kind-d", _work)
+        await started.wait()
+        sched.cancel(task.id)
+        try:
+            await task._asyncio_task
+        except asyncio.CancelledError:
+            pass
+        assert task.state == TaskState.CANCELLED
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_terminal_is_noop():
+    """Cancelling an already-terminal task is a no-op; returns the
+    existing task unchanged."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            return "done"
+
+        task = sched.enqueue("kind-e", _work)
+        await task._asyncio_task
+        assert task.state == TaskState.SUCCEEDED
+
+        result = sched.cancel(task.id)
+        assert result is task
+        assert task.state == TaskState.SUCCEEDED
+        # cancel_requested stays False — we don't flip it on a terminal task.
+        assert task.cancel_requested is False
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_unknown_returns_none():
+    """Cancelling an unknown task_id returns None."""
+    from smalt_mcp.scheduler import Scheduler
+
+    sched = Scheduler()
+    assert sched.cancel("nope") is None
+
+
+def test_c13_scheduler_list_filters_by_state_and_kind():
+    """list(state=..., kind=...) returns most-recent-first, AND-composed."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _ok(task):
+            return None
+
+        async def _fail(task):
+            raise ValueError("x")
+
+        t1 = sched.enqueue("kind-a", _ok)
+        t2 = sched.enqueue("kind-b", _ok)
+        t3 = sched.enqueue("kind-a", _fail)
+        for t in (t1, t2, t3):
+            try:
+                await t._asyncio_task
+            except Exception:
+                pass
+
+        # state=succeeded → t1 + t2 (not t3 which failed)
+        succeeded = sched.list(state=TaskState.SUCCEEDED)
+        ids = {t.id for t in succeeded}
+        assert ids == {t1.id, t2.id}
+
+        # kind=kind-a → t1 + t3
+        kind_a = sched.list(kind="kind-a")
+        ids = {t.id for t in kind_a}
+        assert ids == {t1.id, t3.id}
+
+        # AND: state=succeeded AND kind=kind-a → just t1
+        both = sched.list(state=TaskState.SUCCEEDED, kind="kind-a")
+        assert {t.id for t in both} == {t1.id}
+
+        # limit applies after filtering
+        limited = sched.list(state=TaskState.SUCCEEDED, limit=1)
+        assert len(limited) == 1
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_gc_purges_old_terminal_tasks():
+    """GC removes terminal tasks whose finished_at is older than TTL."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+    from smalt_mcp.scheduler import Scheduler
+
+    async def _go():
+        sched = Scheduler(gc_ttl_seconds=1)
+
+        async def _work(task):
+            return None
+
+        task = sched.enqueue("k", _work)
+        await task._asyncio_task
+
+        # Backdate finished_at past the TTL.
+        task.finished_at = datetime.now(UTC) - timedelta(seconds=5)
+        removed = sched._gc_once()
+        assert removed == 1
+        assert sched.get(task.id) is None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_gc_preserves_recent_terminal_tasks():
+    """GC leaves recent terminal tasks alone (within TTL)."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler
+
+    async def _go():
+        sched = Scheduler(gc_ttl_seconds=3600)
+
+        async def _work(task):
+            return None
+
+        task = sched.enqueue("k", _work)
+        await task._asyncio_task
+
+        removed = sched._gc_once()
+        assert removed == 0
+        assert sched.get(task.id) is task
+
+    asyncio.run(_go())
+
+
+# ---- C-13 integration: MCP-facing task tools ----
+
+
+def test_c13_reindex_all_returns_task_id(mcp_client: TestClient):
+    """reindex_all is now async — response includes task_id, kind,
+    state, created_at, message (NOT the work-function payload)."""
+    sid = _initialize(mcp_client)
+    response = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=720
+    )
+    assert "task_id" in response
+    assert response["kind"] == "reindex_all"
+    assert response["state"] in {"pending", "running"}
+    assert "created_at" in response
+    assert "message" in response
+    # Pre-C-13 fields don't appear in the enqueue response.
+    assert "wiped_tables" not in response
+    assert "recreated_tables" not in response
+    assert "index_result" not in response
+    # Wait for it to finish so it doesn't bleed into later tests.
+    _await_task_completion(
+        mcp_client, sid, response["task_id"], req_id_base=7200
+    )
+
+
+def test_c13_task_status_reflects_terminal_state(mcp_client: TestClient):
+    """After reindex_all enqueues + completes, task_status returns
+    state='succeeded' with the full IndexResult in task.result."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=721
+    )
+    task_id = enqueue["task_id"]
+    final = _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7210
+    )
+    assert final["state"] == "succeeded"
+    assert final["task_id"] == task_id
+    assert final["kind"] == "reindex_all"
+    assert final["finished_at"] is not None
+    assert final["error"] is None
+    # The work-function payload is now in task.result.
+    assert "wiped_tables" in final["result"]
+    assert "recreated_tables" in final["result"]
+    assert "index_result" in final["result"]
+
+
+def test_c13_task_status_missing_arg(mcp_client: TestClient):
+    """task_status requires task_id (input-schema validation)."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client, sid, "task_status", {}, req_id=722
+    )
+    assert "task_id" in raw
+    assert "required" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c13_task_status_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "task_status",
+        {"task_id": "no-such-task-id"},
+        req_id=723,
+    )
+    assert result["error"] == "not_found"
+    assert result["task_id"] == "no-such-task-id"
+
+
+def test_c13_task_list_returns_recent_tasks(mcp_client: TestClient):
+    """task_list returns the most recent tasks, including any
+    enqueued in this test session (reindex_all from earlier
+    tests)."""
+    sid = _initialize(mcp_client)
+    # Enqueue a fresh task so we have something concrete to find.
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=724
+    )
+    task_id = enqueue["task_id"]
+    _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7240
+    )
+
+    listed = _call_tool(
+        mcp_client, sid, "task_list", {"limit": 100}, req_id=725
+    )
+    assert "tasks" in listed
+    assert listed["count"] >= 1
+    ids = {t["task_id"] for t in listed["tasks"]}
+    assert task_id in ids
+
+
+def test_c13_task_list_filters_by_state(mcp_client: TestClient):
+    """task_list(state='succeeded') returns only succeeded tasks."""
+    sid = _initialize(mcp_client)
+    # Make sure at least one succeeded task exists.
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=726
+    )
+    _await_task_completion(
+        mcp_client, sid, enqueue["task_id"], req_id_base=7260
+    )
+
+    listed = _call_tool(
+        mcp_client,
+        sid,
+        "task_list",
+        {"state": "succeeded", "limit": 100},
+        req_id=727,
+    )
+    for t in listed["tasks"]:
+        assert t["state"] == "succeeded"
+    assert listed["state_filter"] == "succeeded"
+
+
+def test_c13_task_list_filters_by_kind(mcp_client: TestClient):
+    """task_list(kind='reindex_all') returns only reindex_all tasks."""
+    sid = _initialize(mcp_client)
+    listed = _call_tool(
+        mcp_client,
+        sid,
+        "task_list",
+        {"kind": "reindex_all", "limit": 100},
+        req_id=728,
+    )
+    for t in listed["tasks"]:
+        assert t["kind"] == "reindex_all"
+    assert listed["kind_filter"] == "reindex_all"
+
+
+def test_c13_task_list_rejects_invalid_state_at_mcp(mcp_client: TestClient):
+    """Unknown state values fail JSON-schema enum validation."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "task_list",
+        {"state": "nopenope"},
+        req_id=729,
+    )
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+def test_c13_task_cancel_unknown_returns_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "task_cancel",
+        {"task_id": "no-such-task"},
+        req_id=730,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_c13_task_cancel_terminal_is_noop(mcp_client: TestClient):
+    """Cancelling an already-succeeded task returns it unchanged."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=731
+    )
+    task_id = enqueue["task_id"]
+    _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7310
+    )
+    cancel = _call_tool(
+        mcp_client,
+        sid,
+        "task_cancel",
+        {"task_id": task_id},
+        req_id=732,
+    )
+    assert cancel.get("error") is None
+    # State stays succeeded.
+    assert cancel["state"] == "succeeded"
+    assert cancel.get("was_terminal_at_call") is True
+
+
+def test_c13_task_status_includes_progress(mcp_client: TestClient):
+    """After completion, the task's progress dict has the 'complete'
+    phase recorded (set by reindex_all's _work function)."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=733
+    )
+    final = _await_task_completion(
+        mcp_client, sid, enqueue["task_id"], req_id_base=7330
+    )
+    assert "progress" in final
+    assert final["progress"].get("phase") == "complete"
+    # Mid-flight phase fields are also captured.
+    assert "wiped_tables" in final["progress"]
+    assert "recreated_tables" in final["progress"]
+
+
+def test_c13_reindex_all_unblocked_with_uninitialized_smalt():
+    """When the Smalt dir doesn't exist, reindex_all returns the
+    pre-existing `smalt_not_initialized` error (NOT a task_id). The
+    error path runs synchronously — no point enqueuing work that can't
+    run."""
+    import asyncio
+    from pathlib import Path
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+    from smalt_mcp.tools import reindex_all
+
+    # Construct an App whose smalt_dir doesn't exist.
+    nonexistent = Path("/tmp/c13-this-does-not-exist-12345")
+    if nonexistent.exists():
+        import shutil
+        shutil.rmtree(nonexistent)
+    cfg = Config(
+        smalt_dir=nonexistent,
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+
+    async def _go():
+        return await reindex_all(app, {})
+
+    result = asyncio.run(_go())
+    assert "error" in result
+    assert "task_id" not in result
 
 
 # ---------------------------------------------------------------------------

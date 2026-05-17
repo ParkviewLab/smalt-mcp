@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+import frontmatter
 from pydantic import ValidationError
 
 from smalt_mcp.schema import Page
@@ -50,6 +52,26 @@ logger = logging.getLogger(__name__)
 EMBED_BODY_CHAR_BUDGET = 2000
 
 
+# ---- canonical IndexPages ----
+#
+# Two auto-generated IndexPages are regenerated at the end of every indexer
+# run from the current `pages` table contents. Listed here as `(filename,
+# id, title, flag)`. New canonical IndexPages can be added in later C PRs
+# (entities, sources, etc.) by appending to this list. User-defined custom
+# IndexPages (planned for a future PR) will load their stored_query from
+# disk; this constant is just the bootstrap-time defaults.
+_CANONICAL_INDEX_PAGES: tuple[tuple[str, str, str, str], ...] = (
+    ("glossary.md", "idx-glossary", "Glossary", "glossary"),
+    ("domains.md",  "idx-domains",  "Domains",  "is_domain"),
+)
+
+
+# Glossary body length cap per entry — keeps the generated file readable
+# even with hundreds of glossary terms. The first sentence of the
+# concept's body is included; longer entries are elided.
+_INDEX_ENTRY_DEFINITION_MAX_CHARS = 300
+
+
 @dataclass
 class IndexResult:
     """Summary of one `Indexer.run()` call."""
@@ -63,6 +85,12 @@ class IndexResult:
     failures: list[tuple[Path, str]] = field(default_factory=list)
     duration_seconds: float = 0.0
     cancelled: bool = False
+    # C-8 observability: per-index rebuild status (None when no refresh
+    # was needed this run — e.g., the run touched zero pages so
+    # `_refresh_indexes` wasn't called). Shapes match what the lance.py
+    # helpers return; see `create_or_refresh_fts` / `create_or_refresh_vector_index`.
+    fts_status: dict[str, dict[str, Any]] | None = None
+    vector_status: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable summary for MCP responses."""
@@ -76,6 +104,8 @@ class IndexResult:
             "failures": [(str(p), msg) for p, msg in self.failures],
             "duration_seconds": self.duration_seconds,
             "cancelled": self.cancelled,
+            "fts_status": self.fts_status,
+            "vector_status": self.vector_status,
         }
 
 
@@ -121,16 +151,48 @@ class Indexer:
 
     # ---- public API ----
 
-    def run(self, *, full: bool = False) -> IndexResult:
-        """Walk pages, project changed ones into LanceDB, refresh indexes."""
+    def run(
+        self,
+        *,
+        full: bool = False,
+        only_paths: list[Path] | None = None,
+    ) -> IndexResult:
+        """Walk pages, project changed ones into LanceDB, refresh indexes.
+
+        Modes:
+          - **Default** (`full=False`, `only_paths=None`): scan
+            `pages/`, skip files whose `content_hash` matches the indexed
+            row, project the rest, delete LanceDB rows whose backing
+            file is gone. The "incremental" mode used by every
+            auto-trigger after a write.
+          - **Full** (`full=True`): same scan + same stale-id sweep,
+            but every file is force-re-projected (no hash short-circuit).
+            Used by `reindex_all` (C-9).
+          - **Targeted** (`only_paths=[...]`): only the listed files are
+            considered. Force-re-projection (the hash check is skipped
+            — the caller's asking explicitly). The stale-id sweep is
+            SKIPPED — this isn't a full corpus walk, so we don't know
+            which ids are "stale" relative to disk. Used by
+            `reindex_page` (C-9).
+        """
         started = perf_counter()
         result = IndexResult()
 
-        files = iter_page_files(paths.pages_dir(self.smalt_root))
+        if only_paths is not None:
+            files = list(only_paths)
+            # only_paths is always a force-reindex: the caller explicitly
+            # asked. Skip the hash check.
+            force_full = True
+            do_stale_sweep = False
+        else:
+            files = iter_page_files(paths.pages_dir(self.smalt_root))
+            force_full = full
+            do_stale_sweep = True
+
         result.scanned = len(files)
         self._emit_progress(result, phase="scanning", current_file=None)
 
-        existing_hashes: dict[str, str] = {} if full else lance.existing_page_hashes(self.db)
+        existing_hashes: dict[str, str] = {} if force_full else lance.existing_page_hashes(self.db)
         seen_ids: set[str] = set()
 
         # Parse each file; collect those that need (re)indexing.
@@ -168,19 +230,35 @@ class Indexer:
             self._emit_progress(result, phase="scanning", current_file=parsed.rel_path)
             to_index.append(parsed)
 
-        # Pages indexed previously whose files are gone.
-        for stale_id in set(existing_hashes) - seen_ids:
-            self._delete_page(stale_id)
-            result.deleted += 1
-            self.progress(f"  [del]  {stale_id}")
-            self._emit_progress(result, phase="scanning", current_file=stale_id)
+        # Pages indexed previously whose files are gone. Skipped in
+        # targeted mode (only_paths set) — the caller's not doing a full
+        # corpus walk, so "stale" can't be inferred from this scan.
+        if do_stale_sweep:
+            for stale_id in set(existing_hashes) - seen_ids:
+                self._delete_page(stale_id)
+                result.deleted += 1
+                self.progress(f"  [del]  {stale_id}")
+                self._emit_progress(result, phase="scanning", current_file=stale_id)
 
         # Embed bodies in one batch and project to LanceDB.
         if to_index:
             self._emit_progress(result, phase="indexing", current_file=None)
             self._project(to_index)
             self._emit_progress(result, phase="refreshing", current_file=None)
-            self._refresh_indexes()
+            self._refresh_indexes(result)
+
+        # Regenerate the canonical IndexPages from the current pages
+        # table (after the run's writes have landed). Each IndexPage that
+        # actually changed gets re-projected so callers see the updated
+        # body immediately via list_pages / read_page.
+        self._emit_progress(result, phase="regenerating_indexes", current_file=None)
+        index_changed = self._regenerate_index_pages()
+        if index_changed:
+            self._project(index_changed)
+            # IndexPages are concepts in the FTS+ANN indexes too — refresh
+            # so a search() right after a write_page that updated an index
+            # returns the new body.
+            self._refresh_indexes(result)
 
         result.duration_seconds = perf_counter() - started
         self._emit_progress(result, phase="done", current_file=None)
@@ -263,16 +341,121 @@ class Indexer:
         claims = self.db.open_table(lance.TABLE_CLAIMS)
         claims.delete(f"page_id = {quoted}")
 
-    def _refresh_indexes(self) -> None:
-        """Rebuild FTS and ANN after a batch of writes."""
+    def _refresh_indexes(self, result: IndexResult) -> None:
+        """Rebuild FTS and ANN after a batch of writes.
+
+        Captures per-index status onto `result` for observability (C-8).
+        The lance.py helpers no longer suppress exceptions internally;
+        failures arrive as `{"status": "failed", "error": ...}` payloads
+        and we propagate them rather than logging-and-forgetting. The
+        indexer itself does NOT raise — a failed FTS rebuild still
+        leaves the page rows intact, so the run is "succeeded with a
+        degraded index" not "failed."
+        """
         try:
-            lance.create_or_refresh_fts(self.db)
-        except Exception as e:  # pragma: no cover — best effort
-            logger.warning("FTS index refresh failed: %s", e)
+            result.fts_status = lance.create_or_refresh_fts(self.db)
+        except Exception as e:  # noqa: BLE001 — defensive; lance helper is supposed to capture per-field
+            logger.warning("FTS index refresh raised unexpectedly: %s", e)
+            result.fts_status = {
+                "_call": {
+                    "status": "failed",
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                }
+            }
         try:
-            lance.create_or_refresh_vector_index(self.db)
-        except Exception as e:  # pragma: no cover — best effort
-            logger.warning("Vector index refresh failed: %s", e)
+            result.vector_status = lance.create_or_refresh_vector_index(self.db)
+        except Exception as e:  # noqa: BLE001 — same defensive shape as above
+            logger.warning("Vector index refresh raised unexpectedly: %s", e)
+            result.vector_status = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "reason": None,
+            }
+
+    def _regenerate_index_pages(self) -> list[ParsedPage]:
+        """Rewrite the canonical IndexPages from current corpus state.
+
+        Returns the list of IndexPages whose on-disk content actually
+        changed (or were created); these must be projected to LanceDB so
+        list_pages / read_page surface the new bodies. Skipped IndexPages
+        (already up-to-date) are not returned.
+        """
+        pages_dir = paths.pages_dir(self.smalt_root)
+        pages_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pull all concept pages in one query; partition by flag client-side.
+        concept_entries = self._collect_concept_entries()
+
+        changed: list[ParsedPage] = []
+        for filename, page_id, title, flag in _CANONICAL_INDEX_PAGES:
+            entries = concept_entries.get(flag, [])
+            target = pages_dir / filename
+            new_content = _format_index_page(
+                page_id=page_id,
+                title=title,
+                flag=flag,
+                entries=entries,
+            )
+            if _file_content_matches(target, new_content):
+                continue
+            _atomic_write_text(target, new_content)
+            try:
+                parsed = parse_page(target, smalt_root=self.smalt_root)
+            except (ValidationError, ValueError, OSError) as e:
+                # Shouldn't happen: we just wrote a well-formed file. Log
+                # and skip projection; next run will retry.
+                logger.warning("regenerated IndexPage %s failed to parse: %s", filename, e)
+                continue
+            changed.append(parsed)
+        return changed
+
+    def _collect_concept_entries(self) -> dict[str, list[dict[str, Any]]]:
+        """Walk the pages table for `type='concept'` rows; bucket by flag.
+
+        Returns `{flag: [{id, title, body, domains, ...}, ...]}` for each
+        flag declared in `_CANONICAL_INDEX_PAGES` (only `glossary` and
+        `is_domain` today). The buckets are sorted by `id` so the
+        regenerated body is deterministic across runs (and across
+        machines — important for back-merge cascade hygiene).
+        """
+        try:
+            pages_table = self.db.open_table(lance.TABLE_PAGES)
+        except FileNotFoundError:
+            return {}
+
+        arrow = (
+            pages_table.search()
+            .where(f"type = {lance.sql_str('concept')}")
+            .select(["id", "title", "body", "frontmatter_json"])
+            .limit(100_000)  # honest cap; if a Smalt has >100k concept pages, IndexPages
+                              # need a different rendering strategy than "every entry inline"
+            .to_arrow()
+        )
+
+        bucket: dict[str, list[dict[str, Any]]] = {flag: [] for _, _, _, flag in _CANONICAL_INDEX_PAGES}
+
+        for i in range(arrow.num_rows):
+            pid = arrow.column("id")[i].as_py()
+            title = arrow.column("title")[i].as_py()
+            body = arrow.column("body")[i].as_py() or ""
+            fm_raw = arrow.column("frontmatter_json")[i].as_py()
+            try:
+                fm = json.loads(fm_raw) if fm_raw else {}
+            except json.JSONDecodeError:
+                continue
+            entry = {
+                "id": pid,
+                "title": title,
+                "body": body,
+                "domains": list(fm.get("domains") or []),
+            }
+            for flag in bucket:
+                if fm.get(flag) is True:
+                    bucket[flag].append(entry)
+
+        for flag in bucket:
+            bucket[flag].sort(key=lambda e: e["id"])
+        return bucket
 
     def _fetch_created_at(self, page_ids: set[str]) -> dict[str, datetime]:
         """Look up existing `created_at` so updates preserve the original value.
@@ -301,6 +484,14 @@ def _page_row(
 ) -> dict[str, Any]:
     fm = parsed.frontmatter
     created = existing_created_at.get(fm.id, now)
+    # C-10: project `aliases` into its own list<string> column so the
+    # find_by_alias / read_page-alias-fallback / search-alias-retrieval
+    # paths can use `array_has(aliases, X)` — O(1) — rather than scanning
+    # frontmatter_json for every page. Empty list (rather than NULL) when
+    # the page has no aliases — keeps the column "indexer-touched" so
+    # operators can distinguish "indexed but no aliases" from "row
+    # pre-dates the migration."
+    aliases = list(fm.aliases) if fm.aliases else []
     return {
         "id": fm.id,
         "path": parsed.rel_path,
@@ -311,6 +502,7 @@ def _page_row(
         "content_hash": parsed.content_hash,
         "created_at": created,
         "updated_at": now,
+        "aliases": aliases,
     }
 
 
@@ -327,10 +519,12 @@ def _link_rows(page: Page, *, page_id: str) -> list[dict[str, Any]]:
 
 
 def _claim_rows(page: Page, *, page_id: str) -> list[dict[str, Any]]:
-    # All four Page subtypes (entity, concept, source, synthesis) declare
-    # `claims: list[Claim]` directly; no need for getattr-with-default.
+    # Entity / Concept / Source / Synthesis declare `claims: list[Claim]`
+    # directly. IndexPage doesn't carry claims (auto-generated pages have
+    # no per-page assertions to track); handle that case by returning [].
+    claims = getattr(page, "claims", None) or []
     rows: list[dict[str, Any]] = []
-    for c in page.claims:
+    for c in claims:
         # Coerce any typed value to a string for the columnar table; the
         # `value_type` column lets readers decode it.
         value_str = None if c.value is None else str(c.value)
@@ -364,3 +558,105 @@ def _short_error(e: BaseException) -> str:
     if len(text) > 200:
         text = text[:200] + "…"
     return text
+
+
+# ---- IndexPage regeneration helpers ----
+
+
+def _format_index_page(
+    *,
+    page_id: str,
+    title: str,
+    flag: str,
+    entries: list[dict[str, Any]],
+) -> str:
+    """Build the full text content (frontmatter + body) for an IndexPage.
+
+    Body format:
+      - Sorted markdown list, one bullet per entry.
+      - Each bullet: `- **<title>** (<id>[, <domain1>, <domain2>]) — <definition>`
+        where the trailing definition is the first sentence of the
+        concept's body (truncated at `_INDEX_ENTRY_DEFINITION_MAX_CHARS`).
+      - Empty corpus → header + a "no entries yet" note.
+
+    The output is a frontmatter+markdown string ready for atomic write.
+    """
+    fm: dict[str, Any] = {
+        "id": page_id,
+        "type": "index",
+        "title": title,
+        "auto_generated": True,
+        "stored_query": {"kind": "concept_flag", "flag": flag},
+    }
+
+    if not entries:
+        body = (
+            f"# {title}\n\n"
+            f"_Auto-generated by the indexer. No entries yet — "
+            f"add a concept page with `{flag}: true` and re-run an indexer "
+            f"pass (any write_page call auto-triggers one)._\n"
+        )
+    else:
+        lines: list[str] = [f"# {title}", "", f"_Auto-generated by the indexer. {len(entries)} entries._", ""]
+        for entry in entries:
+            ident = entry["id"]
+            entry_title = entry["title"]
+            domains = entry["domains"]
+            paren_parts = [ident, *domains]
+            paren = ", ".join(paren_parts)
+            bullet = f"- **{entry_title}** ({paren})"
+            definition = _first_sentence(entry["body"], _INDEX_ENTRY_DEFINITION_MAX_CHARS)
+            if definition:
+                bullet += f" — {definition}"
+            lines.append(bullet)
+        lines.append("")
+        body = "\n".join(lines)
+
+    post = frontmatter.Post(body)
+    post.metadata.update(fm)
+    return frontmatter.dumps(post)
+
+
+def _first_sentence(body: str, max_chars: int) -> str:
+    """Pull the first sentence (up to max_chars) from a page body.
+
+    Strips leading whitespace; treats the first `. `, `.\\n`, or end of body
+    as the sentence break. Returns "" if the body is empty.
+    """
+    text = body.lstrip()
+    if not text:
+        return ""
+    # Find the first sentence-ending period followed by whitespace or end.
+    # Simple heuristic — good enough for glossary-entry intros.
+    end = len(text)
+    for i, ch in enumerate(text):
+        if ch == "." and (i + 1 == len(text) or text[i + 1] in " \t\n"):
+            end = i + 1
+            break
+    first = text[:end].strip()
+    if len(first) > max_chars:
+        first = first[: max_chars - 1].rstrip() + "…"
+    return first
+
+
+def _file_content_matches(path: Path, expected: str) -> bool:
+    """True if `path` exists and its UTF-8 contents equal `expected`."""
+    if not path.exists():
+        return False
+    try:
+        return path.read_text(encoding="utf-8") == expected
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Tmp-then-rename write; same shape as the tools.py write helper.
+
+    Lives here (duplicated) to keep `indexer.py` free of `tools.py`
+    imports (circular). Both helpers should evolve together if the write
+    invariants change.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, target)

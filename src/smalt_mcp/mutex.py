@@ -22,6 +22,7 @@ with a name so traces and logs make it obvious what's serializing.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -33,6 +34,20 @@ class CorpusWriteMutex:
         with mutex.acquire("indexer"):
             # apply page writes + index updates here
             ...
+
+    **Contention metrics (C-8).** The mutex tracks two counters used by
+    the `/admin/health` route + `index_status` MCP tool:
+
+    - `acquire_count` — total number of acquires since server start.
+    - `total_wait_seconds` — cumulative time threads spent blocked on
+      `self._lock.acquire()`. For a never-contended mutex this stays at 0.
+
+    Both counters are server-lifetime totals (never reset). The derived
+    `mean_wait_ms` property converts to a per-acquire mean — `0.0` if
+    `acquire_count` is 0, otherwise `total_wait_seconds * 1000 /
+    acquire_count`. v0 doesn't track per-tool breakdowns (we just sum
+    across all holder names); per-tool histograms can come later if a
+    real workload demands it.
     """
 
     def __init__(self) -> None:
@@ -43,12 +58,21 @@ class CorpusWriteMutex:
         # but messy on a status display.
         self._holder_lock = threading.Lock()
         self._holder: str | None = None
+        # Contention counters (C-8). Both protected by `_holder_lock` —
+        # we already hold it on every acquire/release; piggy-backing is
+        # cheaper than a third lock.
+        self._acquire_count: int = 0
+        self._total_wait_seconds: float = 0.0
 
     @contextmanager
     def acquire(self, holder_name: str) -> Iterator[None]:
+        wait_start = time.perf_counter()
         self._lock.acquire()
+        wait_seconds = time.perf_counter() - wait_start
         with self._holder_lock:
             self._holder = holder_name
+            self._acquire_count += 1
+            self._total_wait_seconds += wait_seconds
         try:
             yield
         finally:
@@ -65,3 +89,23 @@ class CorpusWriteMutex:
     @property
     def locked(self) -> bool:
         return self._lock.locked()
+
+    @property
+    def acquire_count(self) -> int:
+        """Total acquires since server start (server-lifetime counter)."""
+        with self._holder_lock:
+            return self._acquire_count
+
+    @property
+    def total_wait_seconds(self) -> float:
+        """Cumulative wait time across all acquires."""
+        with self._holder_lock:
+            return self._total_wait_seconds
+
+    @property
+    def mean_wait_ms(self) -> float:
+        """Mean wait time per acquire, in ms. 0.0 if no acquires yet."""
+        with self._holder_lock:
+            if self._acquire_count == 0:
+                return 0.0
+            return (self._total_wait_seconds / self._acquire_count) * 1000.0

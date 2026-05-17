@@ -123,14 +123,21 @@ mcp_asgi = MCPASGIApp()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvlog = logging.getLogger("uvicorn.error")
-    async with session_manager.run():
-        uvlog.info(
-            "smalt-mcp v%s ready (scope=%s, smalt_dir=%s)",
-            VERSION,
-            _SERVER_SCOPE.value,
-            _app_instance.cfg.smalt_dir,
-        )
-        yield
+    # C-13: start the async-task scheduler's GC loop. Shutdown is
+    # handled in the finally so we always cancel running tasks +
+    # stop the GC loop, even on lifespan errors.
+    _app_instance.scheduler.start_gc()
+    try:
+        async with session_manager.run():
+            uvlog.info(
+                "smalt-mcp v%s ready (scope=%s, smalt_dir=%s)",
+                VERSION,
+                _SERVER_SCOPE.value,
+                _app_instance.cfg.smalt_dir,
+            )
+            yield
+    finally:
+        await _app_instance.scheduler.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +175,21 @@ async def admin_version() -> AdminVersion:
         smalt_dir=str(_app_instance.cfg.smalt_dir),
         smalt_exists=_app_instance.smalt_exists(),
     )
+
+
+# `/admin/health` returns the detailed observability payload assembled
+# by `App.index_status_payload()`. Same payload as the `index_status` MCP
+# tool — use whichever channel is more convenient.
+#
+# Distinct from `/health` (deliberately minimal load-balancer probe):
+# this endpoint is for operators + monitoring, the other is for "is the
+# process up?" checks. The shape is intentionally not pinned to a
+# `response_model` Pydantic class — the payload is rich enough that
+# pinning would force a parallel-maintained schema, and the only
+# downside is no automatic OpenAPI schema gen for the body.
+@router.get("/admin/health", tags=["admin"])
+async def admin_health() -> dict[str, Any]:
+    return _app_instance.index_status_payload()
 
 
 # ---------------------------------------------------------------------------

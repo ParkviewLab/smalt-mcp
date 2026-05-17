@@ -16,32 +16,48 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---- id validation ----
 #
-# Page ids become path components on disk (`pages/<subdir>/<id>.md`).
-# Reject anything that:
+# Two id shapes are accepted:
 #
-#   - would escape its target directory (`..`, `/`, `\`, leading `.`)
+# 1. **Slug ids** (entities, concepts, syntheses, source-root pages,
+#    index pages): alphanumeric start, alphanumeric/underscore/hyphen
+#    body, 1..254 chars. Become a single path component on disk
+#    (`pages/<subdir>/<id>.md`).
+#
+# 2. **Section ids** (M3 hybrid layout): `<source-id>::<rel-path>`. The
+#    source-id part is a slug id; the rel-path part is one or more
+#    /-separated path components. Become a nested path on disk
+#    (`pages/sources/<source-id>/<rel-path>.md` — the `::` translates
+#    to `/`). Section ids are the M3 hybrid-layout case where a
+#    multi-file source has one page per file. The id encodes the
+#    file's location within the source, which keeps the canonical id
+#    stable across renames at the source-root level.
+#
+# In both shapes we reject anything that:
+#   - would escape its target directory (`..`, leading `/`, leading `.`)
 #   - is non-portable across Windows/macOS/Linux (`<>:"|?*`, whitespace,
-#     control chars, leading dash/underscore, Windows-reserved filenames
-#     like CON / NUL / COM1)
-#   - is empty or longer than ~250 chars (most filesystems cap filenames
-#     at 255 bytes; we leave headroom for the `.md` extension)
+#     control chars, Windows-reserved filenames like CON / NUL / COM1)
+#   - is empty or longer than 254 chars total (most filesystems cap
+#     filenames at 255 bytes; we leave headroom for the `.md` extension)
 #
-# The regex below enforces the structural rule; the reserved-name check
-# catches the names that fit the regex but break on Windows.
-#
-# **Section ids** (the planned `<source-id>::<rel-path>` shape from M3
-# ingest) are intentionally NOT permitted by this rule yet — they require
-# a different validator that allows `::` and `/`. When section pages land
-# the validator gets a second mode; for now everything must conform to
-# this stricter slug-shape.
+# Each path component in a section id is itself validated against the
+# (relaxed) per-component regex below — alphanumeric / underscore /
+# hyphen / dot, must start with alphanumeric. The leading-alphanumeric
+# rule means hidden files (.foo) are rejected; the dot-in-body allowance
+# lets real filenames like `utils.py` or `package.json` through.
 
 _PAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,253}$")
+"""Slug id shape — used directly for non-section ids; used for the
+source-id portion of section ids."""
+
+_SECTION_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+"""Per-component shape for the rel-path portion of a section id.
+Same alphabet as slug ids plus dots — for real filename extensions."""
 
 _WINDOWS_RESERVED: frozenset[str] = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -51,11 +67,24 @@ _WINDOWS_RESERVED: frozenset[str] = frozenset(
 
 
 def _validate_id(value: str) -> str:
-    """Validate a string that will become a path component (filename or subdir).
+    """Validate a page id. Routes by shape:
 
-    Returns the value unchanged on success; raises ValueError with a clear
-    message on failure (Pydantic surfaces this as the validation error).
+    - Contains `::` → section id (`<source-id>::<rel-path>`) → validated
+      via `_validate_section_id`.
+    - Otherwise → slug id → validated via `_validate_slug_id`.
+
+    Returns the value unchanged on success; raises ValueError with a
+    clear message on failure (Pydantic surfaces this as the validation
+    error).
     """
+    if "::" in value:
+        return _validate_section_id(value)
+    return _validate_slug_id(value)
+
+
+def _validate_slug_id(value: str) -> str:
+    """Standard slug-shape id — used directly for non-section pages and
+    for the source-id portion of section ids."""
     if not _PAGE_ID_RE.match(value):
         raise ValueError(
             f"id must match {_PAGE_ID_RE.pattern!r}: alphanumeric start, "
@@ -65,6 +94,74 @@ def _validate_id(value: str) -> str:
         raise ValueError(
             f"id {value!r} is a Windows-reserved filename; pick a different slug"
         )
+    return value
+
+
+def _validate_section_id(value: str) -> str:
+    """Validate a section page id: `<source-id>::<rel-path>`.
+
+    The rel-path may contain `/` separating components. Each component
+    is alphanumeric+`._-` with an alphanumeric leading char (no hidden
+    files via `.foo`; no path-escape via `..`; no absolute-path escape
+    via leading `/`).
+    """
+    if len(value) > 254:
+        raise ValueError(
+            f"section id too long ({len(value)} chars, max 254 — leaves "
+            f"headroom for the .md extension on disk); got {value!r}"
+        )
+    if value.count("::") != 1:
+        raise ValueError(
+            f"section id must contain exactly one '::' separator; got {value!r}"
+        )
+
+    source_id, rel_path = value.split("::", 1)
+
+    # Source-id part: standard slug.
+    try:
+        _validate_slug_id(source_id)
+    except ValueError as e:
+        raise ValueError(
+            f"section id source-id part {source_id!r} is invalid: {e}"
+        ) from e
+
+    # Rel-path part: non-empty, no leading slash, components valid.
+    if not rel_path:
+        raise ValueError(
+            f"section id rel-path (after '::') must be non-empty; got {value!r}"
+        )
+    if rel_path.startswith("/"):
+        raise ValueError(
+            f"section id rel-path must not start with '/' (absolute paths "
+            f"would escape the source directory); got {value!r}"
+        )
+
+    components = rel_path.split("/")
+    for comp in components:
+        if not comp:
+            raise ValueError(
+                f"section id rel-path must not contain '//' (empty component); got {value!r}"
+            )
+        if comp in (".", ".."):
+            raise ValueError(
+                f"section id rel-path must not contain '{comp}' (path traversal); "
+                f"got {value!r}"
+            )
+        if not _SECTION_PATH_COMPONENT_RE.match(comp):
+            raise ValueError(
+                f"section id rel-path component {comp!r} contains disallowed "
+                f"characters; allowed: alphanumeric / underscore / hyphen / dot, "
+                f"must start with alphanumeric; got {value!r}"
+            )
+        # Windows-reserved check on component base (filename without extension).
+        # `con.py` is rejected because `con` (the base) is reserved on Windows.
+        base = comp.split(".", 1)[0]
+        if base.lower() in _WINDOWS_RESERVED:
+            raise ValueError(
+                f"section id rel-path component {comp!r} starts with "
+                f"Windows-reserved filename {base!r}; pick a different path"
+            )
+
     return value
 
 # ---- enums ----
@@ -77,6 +174,7 @@ class PageType(StrEnum):
     CONCEPT = "concept"
     SOURCE = "source"
     SYNTHESIS = "synthesis"  # cross-source pages, written by Cogitate (Phase 2)
+    INDEX = "index"          # auto-generated index pages (glossary, domains, ...); see IndexPage
 
 
 class LocationKind(StrEnum):
@@ -337,11 +435,50 @@ class SynthesisPage(PageBase):
     claims: list[Claim] = Field(default_factory=list)
 
 
+class IndexPage(PageBase):
+    """An auto-generated index page.
+
+    The indexer rewrites the body of every IndexPage at the end of every
+    run by executing the `stored_query` against the current corpus state.
+    Humans/agents should NOT hand-edit the body — it'll be regenerated on
+    the next indexer pass. To customize an index, change its
+    `stored_query` (manually on disk for now; a tool-driven path may
+    arrive later).
+
+    Bootstrap creates two canonical IndexPages:
+      - `pages/glossary.md` (id `idx-glossary`) — over `glossary: true`
+        ConceptPages.
+      - `pages/domains.md` (id `idx-domains`) — over `is_domain: true`
+        ConceptPages.
+
+    Future: `pages/entities.md`, `pages/sources.md`, and custom
+    user-defined queries (with `auto_generated: true` always set).
+
+    Direct writes to IndexPages via `write_page` / `write_pages` are
+    rejected (`forbidden_page_type`); the indexer is the only writer.
+    Note though that `remove_page` IS still allowed — useful for retiring
+    a no-longer-wanted custom IndexPage. The two canonical IndexPages
+    will be regenerated on the next bootstrap.
+    """
+
+    type: Literal[PageType.INDEX] = PageType.INDEX  # type: ignore[assignment]
+    auto_generated: Literal[True] = True
+    stored_query: dict[str, Any] = Field(
+        description=(
+            "Query that defines this index's contents. Initial shape: "
+            "`{'kind': 'concept_flag', 'flag': 'glossary' | 'is_domain'}`. "
+            "Future kinds (e.g. tag-set, type-and-domain) can be added "
+            "non-breakingly — unknown kinds are ignored at regeneration "
+            "time."
+        ),
+    )
+
+
 # ---- discriminated union for round-tripping ----
 
 
 Page = Annotated[
-    EntityPage | ConceptPage | SourcePage | SynthesisPage,
+    EntityPage | ConceptPage | SourcePage | SynthesisPage | IndexPage,
     Field(discriminator="type"),
 ]
 """Any Smalt page, discriminated on `type`."""
