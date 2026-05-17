@@ -1457,6 +1457,297 @@ def test_write_page_rejects_windows_reserved_names(mcp_client: TestClient):
 
 
 # ---------------------------------------------------------------------------
+# Section page id format (C-4)
+
+
+def _src_fm_section(section_id: str, title: str = "section") -> dict:
+    """Build a minimal SourcePage frontmatter for a section page."""
+    return {
+        "id": section_id,
+        "type": "source",
+        "title": title,
+        "location_uri": f"file:/tmp/{section_id.replace('::', '__')}",
+        "location_kind": "file",
+    }
+
+
+def test_section_id_round_trip(mcp_client: TestClient):
+    """Write a section-shaped SourcePage; the canonical id is NOT mangled
+    (it's already canonical by construction); the file lands at
+    `pages/sources/<src>/<rel>.md`; read_page returns it."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-sec-rt::src/utils.py", "utils.py section"
+            ),
+            "body": "section body",
+        },
+        req_id=350,
+    )
+    assert result.get("error") is None, result
+    # No mangling for section ids.
+    assert result["id"] == "src-sec-rt::src/utils.py"
+    assert result["mangled"] is False
+    assert result["upserted"] is False  # first write, didn't already exist
+    # File path: `::` → `/`, then `.md` appended.
+    assert result["path"] == "pages/sources/src-sec-rt/src/utils.py.md"
+    # Round-trip via read_page.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "src-sec-rt::src/utils.py"},
+        req_id=351,
+    )
+    assert read.get("error") is None
+    assert read["id"] == "src-sec-rt::src/utils.py"
+    assert read["title"] == "utils.py section"
+    assert read["body"] == "section body"
+
+
+def test_section_id_second_write_upserts(mcp_client: TestClient):
+    """A second write_page with the same section id overwrites in place
+    (upsert semantics: the id IS the canonical address)."""
+    sid = _initialize(mcp_client)
+    first = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section("src-sec-upsert::main.py", "v1"),
+            "body": "first body",
+        },
+        req_id=352,
+    )
+    assert first["upserted"] is False
+    second = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section("src-sec-upsert::main.py", "v2"),
+            "body": "second body",
+        },
+        req_id=353,
+    )
+    assert second["upserted"] is True
+    assert second["id"] == first["id"]  # canonical id stable
+    assert second["path"] == first["path"]
+    # Read back — body and title reflect the second write.
+    read = _call_tool(
+        mcp_client,
+        sid,
+        "read_page",
+        {"page_id": "src-sec-upsert::main.py"},
+        req_id=354,
+    )
+    assert read["title"] == "v2"
+    assert read["body"] == "second body"
+
+
+def test_section_id_index_special_case(mcp_client: TestClient):
+    """`<src>::index` is the natural way to write the multi-file source's
+    root index page → file at `pages/sources/<src>/index.md`."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-multi-index::index", "Multi-file source root"
+            ),
+            "body": "index body — points at sections",
+        },
+        req_id=355,
+    )
+    assert result.get("error") is None, result
+    assert result["path"] == "pages/sources/src-multi-index/index.md"
+
+
+def test_section_id_nested_subdirs(mcp_client: TestClient):
+    """Deeply nested rel-paths are honored — multi-component paths
+    translate to multi-level filesystem directories."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-deep::a/b/c/d/file.py", "deep section"
+            ),
+            "body": "",
+        },
+        req_id=356,
+    )
+    assert result["path"] == "pages/sources/src-deep/a/b/c/d/file.py.md"
+
+
+def test_section_id_rejects_path_traversal(mcp_client: TestClient):
+    """`..` in the rel-path is rejected at the schema validator
+    (before reaching the filesystem)."""
+    sid = _initialize(mcp_client)
+    bad_ids = [
+        "src-foo::../escape",
+        "src-foo::a/../b",
+        "src-foo::./hidden",
+        "src-foo::../../top",
+    ]
+    for i, bad in enumerate(bad_ids):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _src_fm_section(bad)},
+            req_id=357 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should reject"
+
+
+def test_section_id_rejects_absolute_rel_path(mcp_client: TestClient):
+    """Rel-path starting with `/` is an absolute path → rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::/abs/path.py")},
+        req_id=370,
+    )
+    assert result["error"] == "validation_error"
+    assert "/" in result["message"] or "absolute" in result["message"].lower()
+
+
+def test_section_id_rejects_empty_rel_path(mcp_client: TestClient):
+    """Section id with empty rel-path (just `<src>::`) is rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::")},
+        req_id=371,
+    )
+    assert result["error"] == "validation_error"
+    assert "rel-path" in result["message"] or "non-empty" in result["message"].lower()
+
+
+def test_section_id_rejects_double_slash(mcp_client: TestClient):
+    """`//` in rel-path (empty component) is rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::a//b")},
+        req_id=372,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_section_id_rejects_multiple_separators(mcp_client: TestClient):
+    """Section id with more than one `::` is rejected (ambiguous parse)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::a::b")},
+        req_id=373,
+    )
+    assert result["error"] == "validation_error"
+    assert "::" in result["message"]
+
+
+def test_section_id_rejects_windows_reserved_component(mcp_client: TestClient):
+    """A rel-path component whose base (pre-extension) is a Windows-reserved
+    name (CON, NUL, COM1, ...) is rejected case-insensitively."""
+    sid = _initialize(mcp_client)
+    bad_ids = ["src-foo::con.py", "src-foo::sub/nul.txt", "src-foo::COM1.h"]
+    for i, bad in enumerate(bad_ids):
+        result = _call_tool(
+            mcp_client,
+            sid,
+            "write_page",
+            {"frontmatter": _src_fm_section(bad)},
+            req_id=380 + i,
+        )
+        assert result["error"] == "validation_error", f"{bad!r} should reject"
+
+
+def test_section_id_rejects_hidden_file_component(mcp_client: TestClient):
+    """A rel-path component starting with `.` (hidden file convention) is
+    rejected — the leading-alphanumeric rule. Stops `.git/config` style
+    paths from accidentally being treated as section ids."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _src_fm_section("src-foo::.hidden")},
+        req_id=390,
+    )
+    assert result["error"] == "validation_error"
+
+
+def test_section_id_with_dot_in_filename_ok(mcp_client: TestClient):
+    """Dots in the middle of a filename are fine (`utils.py`, `package.json`,
+    `data.test.json`); only LEADING dots are rejected."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": _src_fm_section(
+                "src-dot-mid::pkg/data.test.json", "multi-dot filename"
+            ),
+            "body": "",
+        },
+        req_id=391,
+    )
+    assert result.get("error") is None
+    assert result["path"] == "pages/sources/src-dot-mid/pkg/data.test.json.md"
+
+
+def test_section_id_in_batch_write_pages(mcp_client: TestClient):
+    """write_pages handles section-id entries with upsert semantics
+    alongside slug-id (mangled) entries in the same batch."""
+    sid = _initialize(mcp_client)
+    pages_arg = [
+        {
+            "frontmatter": _ent_fm("ent-batch-with-section", "slug entry"),
+            "body": "slug",
+        },
+        {
+            "frontmatter": _src_fm_section(
+                "src-batch-sec::file.py", "section entry"
+            ),
+            "body": "section",
+        },
+    ]
+    result = _call_tool(
+        mcp_client, sid, "write_pages", {"pages": pages_arg}, req_id=392
+    )
+    assert result.get("error") is None, result
+    assert result["count"] == 2
+    by_id = {w.get("original_id") or w["id"]: w for w in result["written"]}
+    # Slug-id entry was mangled.
+    slug_entry = by_id["ent-batch-with-section"]
+    assert slug_entry["mangled"] is True
+    # Section-id entry was NOT mangled; upserted=False (first write).
+    section_entry = by_id["src-batch-sec::file.py"]
+    assert section_entry["mangled"] is False
+    assert section_entry["upserted"] is False
+    assert section_entry["path"] == "pages/sources/src-batch-sec/file.py.md"
+
+
+# ---------------------------------------------------------------------------
 # write_page mode: create (always-mangle) / update (canonical id required)
 
 
