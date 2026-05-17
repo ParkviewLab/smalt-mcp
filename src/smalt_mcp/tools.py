@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import logging
 import os
@@ -94,6 +95,49 @@ class ToolDef:
     spec: types.Tool
     scope: Scope
     handler: Handler
+
+
+# ---- E-2 (concurrency): sync-handler → thread-pool wrapper ----
+#
+# Tool handlers used to be `async def` but call sync code inside
+# (LanceDB queries, file I/O, fastembed inference). That blocks the
+# event loop for the duration of every operation, so two concurrent
+# MCP requests serialize. E-2 introduces this decorator: handlers
+# whose bodies are sync are written as plain `def`, decorated with
+# `@_wrap_sync_in_thread`, and dispatch via `asyncio.to_thread` to
+# the loop's default ThreadPoolExecutor (sized by
+# `cfg.thread_pool_workers`, default 32).
+#
+# The handler signature visible to `dispatch` stays the same — the
+# decorator produces an async wrapper, so `await tool.handler(...)`
+# works unchanged.
+#
+# Handlers that genuinely use async/await internally (today only
+# `reindex_all`, which uses `await asyncio.to_thread` + the
+# scheduler) stay as `async def` and are NOT decorated.
+
+
+def _wrap_sync_in_thread(
+    sync_fn: Callable[["App", dict[str, Any]], dict[str, Any]],
+) -> Handler:
+    """Turn a sync handler `(app, arguments) -> dict` into an async
+    handler that runs the work in the asyncio loop's default
+    ThreadPoolExecutor via `asyncio.to_thread`.
+
+    Use as a decorator on every tool handler whose body is sync
+    (LanceDB queries, file I/O, fastembed inference, etc.) so that
+    concurrent MCP requests don't serialize on the event loop.
+
+    The wrapped handler is reported by `functools.wraps`-preserved
+    metadata as the original sync function, so introspection
+    (logging, tool-name reporting) is unchanged.
+    """
+
+    @functools.wraps(sync_fn)
+    async def wrapper(app: "App", arguments: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(sync_fn, app, arguments)
+
+    return wrapper
 
 
 # ---- shared helpers ----
@@ -313,7 +357,8 @@ def _apply_property_filters(fm: dict[str, Any], filters: dict[str, Any]) -> bool
 # ---- handler: status ----
 
 
-async def status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Report Smalt path, existence, table inventory, page count, mutex state."""
     smalt_dir = str(app.cfg.smalt_dir)
     exists = app.smalt_exists()
@@ -359,7 +404,8 @@ async def status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: index_status (C-8) ----
 
 
-async def index_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def index_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Report detailed index + indexer state.
 
     Returns the same payload as the `GET /admin/health` HTTP route
@@ -386,7 +432,8 @@ async def index_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: list_pages ----
 
 
-async def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """List indexed pages, optionally filtered by `type` / `prefix` (LanceDB-side)
     and/or any of the property filters (`glossary`, `is_domain`, `domain`,
     `fetched_at_before`, `fetched_at_after`, `has_aliases_containing`,
@@ -565,7 +612,8 @@ def _fetch_page_row(app: App, canonical_id: str) -> dict[str, Any] | None:
 # ---- handler: read_page ----
 
 
-async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Return the frontmatter (parsed) + body of a single page.
 
     Lookup order:
@@ -658,7 +706,8 @@ async def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: find_by_alias ----
 
 
-async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """List every page whose `aliases` contains `alias`.
 
     Use this when you have a memorable handle (the original caller-id
@@ -720,7 +769,8 @@ _MAX_TRAVERSE_HOPS = 5
 _PER_HOP_EDGE_LIMIT = 1000
 
 
-async def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Multi-hop outgoing-link graph traversal via BFS.
 
     Returns the union of outgoing edges discovered within `hops` hops of
@@ -818,7 +868,8 @@ async def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: incoming_links (READ_ONLY) ----
 
 
-async def incoming_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def incoming_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """List every link whose `to_id` matches `page_id` — the "what points
     at me" view.
 
@@ -1110,7 +1161,8 @@ def _find_pages_by_alias_fuzzy(
     return [row for _, _, row in results]
 
 
-async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Hybrid search over the pages corpus: FTS (body) + vector (embeddings) +
     alias retrieval, RRF-fused, with optional property filters applied
     post-fusion before the top_k cap.
@@ -1260,7 +1312,8 @@ async def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # ---- handler: list_domains (READ_ONLY) ----
 
 
-async def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """List ConceptPages flagged `is_domain: true`.
 
     Domain hierarchy itself (which domain is a subdomain of which) lives in
@@ -1320,7 +1373,8 @@ async def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # `embeddings` table doesn't carry a type column.
 
 
-async def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Pages most similar to `source_id`'s embedding by cosine similarity.
 
     Excludes the source page itself from the result list. Returns up to
@@ -1520,7 +1574,8 @@ async def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, An
 # should poll on a faster cadence than the TTL.
 
 
-async def task_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def task_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """Return the current state of one scheduled task by `task_id`.
 
     Tasks transition pending → running → terminal (succeeded /
@@ -1558,7 +1613,8 @@ async def task_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     return task.to_dict()
 
 
-async def task_list(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+@_wrap_sync_in_thread
+def task_list(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     """List scheduled tasks, most-recent-first, optionally filtered.
 
     Filters:
