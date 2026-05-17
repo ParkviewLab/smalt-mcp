@@ -368,12 +368,36 @@ async def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
 # ---- handler: traverse ----
 
+# Hard cap on hops. Set high enough that real Cogitate observer walks fit
+# (entity-cluster detection typically wants 2-3 hops); low enough that a
+# pathologically dense graph can't blow up the response. Configurable via the
+# call (`hops` arg) up to this ceiling; calls above this ceiling return an
+# `invalid_argument` error rather than silently clamping.
+_MAX_TRAVERSE_HOPS = 5
+
+# Per-hop edge cap. The single-hop v0 limit was 1000; same limit per BFS
+# level for multi-hop. If a single hop's outgoing-edge set exceeds this,
+# the response sets `truncated: true` so the caller knows the walk was
+# incomplete.
+_PER_HOP_EDGE_LIMIT = 1000
+
 
 async def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """1-hop graph traversal from `from_id` via the links table.
+    """Multi-hop outgoing-link graph traversal via BFS.
 
-    Returns the outgoing edges; optionally filtered by `label`. `hops > 1` is
-    accepted but not yet implemented; the v0 surface returns 1-hop only.
+    Returns the union of outgoing edges discovered within `hops` hops of
+    `from_id`, plus the set of nodes visited (including `from_id` as the
+    seed). Optional `label` filter is applied **per hop** — only edges with
+    that label are followed; nodes reachable only via other labels don't
+    expand.
+
+    Cycle handling: revisited nodes don't re-expand (BFS visited-set).
+    Self-loops are collected as edges but don't re-expand.
+    `hops` defaults to 1; max is `_MAX_TRAVERSE_HOPS` (5); calls above the
+    ceiling get `invalid_argument`.
+
+    Each hop's outgoing-edge query is capped at `_PER_HOP_EDGE_LIMIT` (1000)
+    rows; if a hop hits the cap, the response sets `truncated: true`.
     """
     ok, err = _ensure_initialized(app)
     if not ok:
@@ -384,33 +408,73 @@ async def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"error": "missing_argument", "message": "from_id is required"}
     label = arguments.get("label")
     hops = int(arguments.get("hops", 1))
-    if hops > 1:
-        logger.info("traverse: hops=%s requested but v0 returns 1-hop only", hops)
+    if hops < 1:
+        return {
+            "error": "invalid_argument",
+            "message": f"hops must be >= 1; got {hops}",
+        }
+    if hops > _MAX_TRAVERSE_HOPS:
+        return {
+            "error": "invalid_argument",
+            "message": (
+                f"hops must be <= {_MAX_TRAVERSE_HOPS}; got {hops}. "
+                "Higher hop counts risk huge result sets on dense graphs; "
+                "raise the cap or paginate client-side if your case really needs it."
+            ),
+        }
 
     db = app.db()
-    links = db.open_table(lance.TABLE_LINKS)
+    links_table = db.open_table(lance.TABLE_LINKS)
 
-    where = f"from_id = {lance.sql_str(from_id)}"
-    if label:
-        where += f" AND label = {lance.sql_str(label)}"
+    visited: set[str] = {from_id}
+    edges: list[dict[str, Any]] = []
+    frontier: list[str] = [from_id]
+    truncated = False
 
-    arrow = (
-        links.search()
-        .where(where)
-        .select(["from_id", "to_id", "label"])
-        .limit(1000)
-        .to_arrow()
-    )
-    edges = [
-        {"from_id": f, "to_id": t, "label": lbl}
-        for f, t, lbl in zip(
-            arrow.column("from_id").to_pylist(),
-            arrow.column("to_id").to_pylist(),
-            arrow.column("label").to_pylist(),
-            strict=True,
+    for _hop in range(hops):
+        if not frontier:
+            break
+
+        # Build WHERE clause: from_id IN (...) [AND label = ?]. The IN-list
+        # syntax mirrors the search handler's hit-set hydration query (see
+        # search handler — `quoted = ", ".join(lance.sql_str(p) ...)`).
+        quoted_ids = ", ".join(lance.sql_str(node) for node in frontier)
+        where = f"from_id IN ({quoted_ids})"
+        if label:
+            where += f" AND label = {lance.sql_str(label)}"
+
+        arrow = (
+            links_table.search()
+            .where(where)
+            .select(["from_id", "to_id", "label"])
+            .limit(_PER_HOP_EDGE_LIMIT)
+            .to_arrow()
         )
-    ]
-    return {"from_id": from_id, "edges": edges, "count": len(edges)}
+
+        n_rows = arrow.num_rows
+        if n_rows >= _PER_HOP_EDGE_LIMIT:
+            truncated = True
+
+        from_ids = arrow.column("from_id").to_pylist()
+        to_ids = arrow.column("to_id").to_pylist()
+        labels = arrow.column("label").to_pylist()
+
+        next_frontier: list[str] = []
+        for f, t, lbl in zip(from_ids, to_ids, labels, strict=True):
+            edges.append({"from_id": f, "to_id": t, "label": lbl})
+            if t not in visited:
+                visited.add(t)
+                next_frontier.append(t)
+        frontier = next_frontier
+
+    return {
+        "from_id": from_id,
+        "hops": hops,
+        "edges": edges,
+        "count": len(edges),
+        "visited_nodes": sorted(visited),
+        "truncated": truncated,
+    }
 
 
 # ---- handler: incoming_links (READ_ONLY) ----
@@ -1499,10 +1563,20 @@ TOOLS: list[ToolDef] = [
         spec=types.Tool(
             name="traverse",
             description=(
-                "Walk outgoing links from a page. Returns the edges "
-                "(from_id, to_id, label) that originate at `from_id`, "
-                "optionally filtered by edge `label`. v0 returns 1-hop only; "
-                "`hops > 1` is accepted but currently ignored."
+                "Multi-hop outgoing-link graph traversal via BFS.\n\n"
+                "Returns every edge discovered within `hops` hops of "
+                "`from_id`, plus `visited_nodes` — the set of nodes "
+                "touched (including `from_id` as the seed). Optional "
+                "`label` filter is applied **per hop** (only edges with "
+                "that label are followed; nodes reachable only via other "
+                "labels don't expand).\n\n"
+                "Cycle handling: revisited nodes don't re-expand. "
+                "Self-loops are collected but don't re-expand. `hops` "
+                "defaults to 1; max is 5 (calls above the ceiling return "
+                "`invalid_argument`). Per-hop edge query is capped at "
+                "1000 rows; if a hop hits the cap, the response sets "
+                "`truncated: true` so the caller knows the walk was "
+                "incomplete."
             ),
             inputSchema={
                 "type": "object",
@@ -1513,12 +1587,21 @@ TOOLS: list[ToolDef] = [
                     },
                     "label": {
                         "type": "string",
-                        "description": "Optional edge-label filter.",
+                        "description": (
+                            "Optional edge-label filter, applied per hop "
+                            "(only matching edges are followed)."
+                        ),
                     },
                     "hops": {
                         "type": "integer",
-                        "description": "Number of hops to walk. v0 only honors 1.",
+                        "description": (
+                            "Number of hops to walk via BFS. Default 1; "
+                            "max 5. Values outside [1, 5] return "
+                            "`invalid_argument`."
+                        ),
                         "default": 1,
+                        "minimum": 1,
+                        "maximum": 5,
                     },
                 },
                 "required": ["from_id"],

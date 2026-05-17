@@ -254,10 +254,14 @@ def test_traverse_one_hop(mcp_client: TestClient):
     result = _call_tool(mcp_client, sid, "traverse", {"from_id": "con-index"}, req_id=40)
     assert result["from_id"] == "con-index"
     assert result["count"] == 1
+    assert result["hops"] == 1
     edge = result["edges"][0]
     assert edge["from_id"] == "con-index"
     assert edge["to_id"] == "con-embedding"
     assert edge["label"] == "built_over"
+    # Multi-hop fields present even at 1-hop.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding"}
+    assert result["truncated"] is False
 
 
 def test_traverse_with_label_filter(mcp_client: TestClient):
@@ -288,6 +292,133 @@ def test_traverse_no_outgoing(mcp_client: TestClient):
     sid = _initialize(mcp_client)
     result = _call_tool(mcp_client, sid, "traverse", {"from_id": "ent-alice"}, req_id=43)
     assert result["count"] == 0
+    # Even with no outgoing edges, visited_nodes contains the seed.
+    assert result["visited_nodes"] == ["ent-alice"]
+
+
+# ---- multi-hop ----
+
+
+def test_traverse_two_hops_walks_chain(mcp_client: TestClient):
+    """con-index --built_over--> con-embedding --example_of--> ent-alice.
+
+    A 2-hop walk from con-index should collect BOTH edges and visit all
+    three nodes. The seed Smalt's link chain (set up in conftest.py) is
+    deterministic, so we can assert exact counts.
+    """
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "traverse", {"from_id": "con-index", "hops": 2}, req_id=44
+    )
+    assert result["hops"] == 2
+    # Two edges total: con-index->con-embedding (hop 1) + con-embedding->ent-alice (hop 2).
+    assert result["count"] == 2
+    edge_keys = {(e["from_id"], e["to_id"], e["label"]) for e in result["edges"]}
+    assert ("con-index", "con-embedding", "built_over") in edge_keys
+    assert ("con-embedding", "ent-alice", "example_of") in edge_keys
+    # Visited contains seed + both reached nodes.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding", "ent-alice"}
+
+
+def test_traverse_label_filter_applied_per_hop(mcp_client: TestClient):
+    """label=built_over walks con-index->con-embedding but stops there
+    (con-embedding's outgoing edge to ent-alice is labeled example_of,
+    not built_over). With hops=3 the walk still terminates at hop 1."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 3, "label": "built_over"},
+        req_id=45,
+    )
+    assert result["count"] == 1
+    assert result["edges"][0]["to_id"] == "con-embedding"
+    # Walk stopped: ent-alice is reachable in 2 hops but only via
+    # example_of, which the per-hop filter excludes.
+    assert set(result["visited_nodes"]) == {"con-index", "con-embedding"}
+    assert "ent-alice" not in result["visited_nodes"]
+
+
+def test_traverse_handles_cycle_without_infinite_loop(mcp_client: TestClient):
+    """Build a cycle A->B->A and walk with hops=5; BFS visited-set prevents
+    re-expansion. Both edges should appear; no duplicate node visits."""
+    sid = _initialize(mcp_client)
+    # Create the cycle: two new entity pages + reciprocal links.
+    a = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-cycle-a", "cycle a")},
+        req_id=46,
+    )
+    b = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-cycle-b", "cycle b")},
+        req_id=47,
+    )
+    a_id, b_id = a["id"], b["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": a_id, "to_id": b_id, "label": "next"},
+        req_id=48,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": b_id, "to_id": a_id, "label": "next"},
+        req_id=49,
+    )
+    # Walk from A with hops well beyond the cycle length.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": a_id, "hops": 5, "label": "next"},
+        req_id=50,
+    )
+    # Two distinct edges total (A->B and B->A); both should be present.
+    edge_keys = {(e["from_id"], e["to_id"]) for e in result["edges"]}
+    assert (a_id, b_id) in edge_keys
+    assert (b_id, a_id) in edge_keys
+    assert result["count"] == 2  # exactly two edges, not more (no infinite loop)
+    assert set(result["visited_nodes"]) == {a_id, b_id}
+
+
+def test_traverse_rejects_hops_too_high(mcp_client: TestClient):
+    """hops > 5 is rejected at the MCP input-schema layer (the tool spec
+    declares `maximum: 5`). MCP returns a plain-text error before the
+    handler runs."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 99},
+        req_id=51,
+    )
+    assert "maximum" in text.lower() or "5" in text
+
+
+def test_traverse_rejects_hops_too_low(mcp_client: TestClient):
+    """hops < 1 is rejected at the MCP input-schema layer (the tool spec
+    declares `minimum: 1`). The handler's defense-in-depth runtime check
+    catches anything that slips past (e.g. if future MCP servers loosen
+    the schema enforcement)."""
+    sid = _initialize(mcp_client)
+    text = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": "con-index", "hops": 0},
+        req_id=52,
+    )
+    assert "minimum" in text.lower() or "1" in text
 
 
 # ---------------------------------------------------------------------------
