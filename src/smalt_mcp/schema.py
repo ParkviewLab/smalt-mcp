@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -77,6 +77,7 @@ class PageType(StrEnum):
     CONCEPT = "concept"
     SOURCE = "source"
     SYNTHESIS = "synthesis"  # cross-source pages, written by Cogitate (Phase 2)
+    INDEX = "index"          # auto-generated index pages (glossary, domains, ...); see IndexPage
 
 
 class LocationKind(StrEnum):
@@ -337,11 +338,50 @@ class SynthesisPage(PageBase):
     claims: list[Claim] = Field(default_factory=list)
 
 
+class IndexPage(PageBase):
+    """An auto-generated index page.
+
+    The indexer rewrites the body of every IndexPage at the end of every
+    run by executing the `stored_query` against the current corpus state.
+    Humans/agents should NOT hand-edit the body — it'll be regenerated on
+    the next indexer pass. To customize an index, change its
+    `stored_query` (manually on disk for now; a tool-driven path may
+    arrive later).
+
+    Bootstrap creates two canonical IndexPages:
+      - `pages/glossary.md` (id `idx-glossary`) — over `glossary: true`
+        ConceptPages.
+      - `pages/domains.md` (id `idx-domains`) — over `is_domain: true`
+        ConceptPages.
+
+    Future: `pages/entities.md`, `pages/sources.md`, and custom
+    user-defined queries (with `auto_generated: true` always set).
+
+    Direct writes to IndexPages via `write_page` / `write_pages` are
+    rejected (`forbidden_page_type`); the indexer is the only writer.
+    Note though that `remove_page` IS still allowed — useful for retiring
+    a no-longer-wanted custom IndexPage. The two canonical IndexPages
+    will be regenerated on the next bootstrap.
+    """
+
+    type: Literal[PageType.INDEX] = PageType.INDEX  # type: ignore[assignment]
+    auto_generated: Literal[True] = True
+    stored_query: dict[str, Any] = Field(
+        description=(
+            "Query that defines this index's contents. Initial shape: "
+            "`{'kind': 'concept_flag', 'flag': 'glossary' | 'is_domain'}`. "
+            "Future kinds (e.g. tag-set, type-and-domain) can be added "
+            "non-breakingly — unknown kinds are ignored at regeneration "
+            "time."
+        ),
+    )
+
+
 # ---- discriminated union for round-tripping ----
 
 
 Page = Annotated[
-    EntityPage | ConceptPage | SourcePage | SynthesisPage,
+    EntityPage | ConceptPage | SourcePage | SynthesisPage | IndexPage,
     Field(discriminator="type"),
 ]
 """Any Smalt page, discriminated on `type`."""

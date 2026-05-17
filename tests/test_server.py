@@ -834,7 +834,9 @@ def test_search_filter_validation_error_on_bad_datetime(mcp_client: TestClient):
 
 
 def test_bootstrap_idempotent(mcp_client: TestClient):
-    """Second bootstrap call must be a complete no-op."""
+    """Second bootstrap call must be a complete no-op for dirs/files/tables.
+    `index_result` is non-empty either way (the indexer runs to materialize
+    or refresh the canonical IndexPages); just check the field exists."""
     sid = _initialize(mcp_client)
     # First call: may create some of the dirs/files the conftest didn't —
     # we don't assert specifics, just that the call succeeds and returns
@@ -844,12 +846,180 @@ def test_bootstrap_idempotent(mcp_client: TestClient):
     assert isinstance(first["created_dirs"], list)
     assert isinstance(first["created_files"], list)
     assert isinstance(first["created_tables"], list)
+    # C-3: bootstrap now runs the indexer to materialize the IndexPages.
+    assert isinstance(first["index_result"], dict)
 
-    # Second call: every canonical dir / file / table is already in place.
+    # Second call: every canonical dir / file / table is already in place;
+    # IndexPages already exist with up-to-date content (since corpus
+    # didn't change between the two bootstrap calls), so indexer skips
+    # the regeneration write.
     second = _call_tool(mcp_client, sid, "bootstrap", {}, req_id=61)
     assert second["created_dirs"] == []
     assert second["created_files"] == []
     assert second["created_tables"] == []
+    assert isinstance(second["index_result"], dict)
+
+
+# ---------------------------------------------------------------------------
+# IndexPage (C-3)
+
+
+def test_bootstrap_materializes_canonical_index_pages(mcp_client: TestClient):
+    """After bootstrap (which runs at session start via conftest), the two
+    canonical IndexPages exist in the indexed page set with the expected ids
+    + types + auto_generated flag."""
+    sid = _initialize(mcp_client)
+    # idx-glossary
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=420
+    )
+    assert glossary.get("error") is None
+    assert glossary["type"] == "index"
+    assert glossary["title"] == "Glossary"
+    assert glossary["frontmatter"]["auto_generated"] is True
+    assert glossary["frontmatter"]["stored_query"] == {
+        "kind": "concept_flag",
+        "flag": "glossary",
+    }
+    # The seed has con-embedding + con-index both flagged glossary: true
+    # → body must reference both ids.
+    assert "con-embedding" in glossary["body"]
+    assert "con-index" in glossary["body"]
+
+    # idx-domains
+    domains = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-domains"}, req_id=421
+    )
+    assert domains.get("error") is None
+    assert domains["type"] == "index"
+    assert domains["title"] == "Domains"
+    assert domains["frontmatter"]["auto_generated"] is True
+    assert domains["frontmatter"]["stored_query"] == {
+        "kind": "concept_flag",
+        "flag": "is_domain",
+    }
+    # Seed has only con-cs flagged is_domain: true.
+    assert "con-cs" in domains["body"]
+
+
+def test_index_pages_listed_with_type_filter(mcp_client: TestClient):
+    """list_pages(type='index') returns exactly the two canonical IndexPages."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client, sid, "list_pages", {"type": "index"}, req_id=422
+    )
+    ids = {p["id"] for p in result["pages"]}
+    assert {"idx-glossary", "idx-domains"} <= ids
+    assert all(p["type"] == "index" for p in result["pages"])
+
+
+def test_index_page_regenerates_on_new_glossary_concept(mcp_client: TestClient):
+    """Adding a `glossary: true` ConceptPage triggers the auto-indexer; the
+    pages/glossary.md IndexPage's body should now reference the new concept."""
+    sid = _initialize(mcp_client)
+    # Add a new glossary concept.
+    new_concept = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "con-regen-probe",
+                "type": "concept",
+                "title": "Regen Probe Concept",
+                "glossary": True,
+            },
+            "body": "First sentence is the definition. Second sentence too.",
+        },
+        req_id=423,
+    )
+    canonical = new_concept["id"]
+    # Read back the glossary IndexPage; it should now reference the new
+    # canonical id in its body.
+    glossary = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=424
+    )
+    assert canonical in glossary["body"]
+    # The first sentence should appear as the definition.
+    assert "First sentence is the definition." in glossary["body"]
+
+
+def test_index_page_skips_rewrite_when_corpus_unchanged(mcp_client: TestClient):
+    """Bootstrap twice in succession — the second run must skip the
+    IndexPage rewrite (content_hash stays stable across runs). We verify
+    by reading the IndexPage and seeing its frontmatter is well-formed
+    after a no-op-change indexer pass."""
+    sid = _initialize(mcp_client)
+    # First bootstrap (idempotent; runs the indexer).
+    _call_tool(mcp_client, sid, "bootstrap", {}, req_id=425)
+    before = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=426
+    )
+    # Second bootstrap — no corpus change between them.
+    _call_tool(mcp_client, sid, "bootstrap", {}, req_id=427)
+    after = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=428
+    )
+    # Body should be byte-identical (no rewrite happened).
+    assert before["body"] == after["body"]
+    # Frontmatter should also be identical.
+    assert before["frontmatter"] == after["frontmatter"]
+
+
+def test_write_page_rejects_index_page(mcp_client: TestClient):
+    """Direct writes to type='index' are rejected (the indexer is the only
+    writer for IndexPages)."""
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {
+            "frontmatter": {
+                "id": "idx-custom-attempt",
+                "type": "index",
+                "title": "Should Fail",
+                "auto_generated": True,
+                "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+            },
+        },
+        req_id=429,
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["type"] == "index"
+
+
+def test_write_pages_batch_rejects_index_page_entry(mcp_client: TestClient):
+    """One index entry in a batch aborts the whole batch (validate-all-then-act)."""
+    sid = _initialize(mcp_client)
+    pages_arg = [
+        # An otherwise-valid concept page (would succeed on its own).
+        {
+            "frontmatter": _ent_fm("ent-batch-w-idx-ok", "OK"),
+            "body": "",
+        },
+        # An IndexPage entry — should abort the batch at validation time.
+        {
+            "frontmatter": {
+                "id": "idx-rejected-batch",
+                "type": "index",
+                "title": "Should Fail",
+                "auto_generated": True,
+                "stored_query": {"kind": "concept_flag", "flag": "glossary"},
+            },
+            "body": "",
+        },
+    ]
+    result = _call_tool(
+        mcp_client, sid, "write_pages", {"pages": pages_arg}, req_id=430
+    )
+    assert result["error"] == "forbidden_page_type"
+    assert result["index"] == 1
+    # The valid first entry must NOT have been written (all-or-nothing).
+    probe = _call_tool(
+        mcp_client, sid, "read_page", {"page_id": "ent-batch-w-idx-ok"}, req_id=431
+    )
+    assert probe.get("error") == "not_found"
 
 
 # ---------------------------------------------------------------------------
