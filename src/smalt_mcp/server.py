@@ -170,6 +170,21 @@ async def admin_version() -> AdminVersion:
     )
 
 
+# `/admin/health` returns the detailed observability payload assembled
+# by `App.index_status_payload()`. Same payload as the `index_status` MCP
+# tool — use whichever channel is more convenient.
+#
+# Distinct from `/health` (deliberately minimal load-balancer probe):
+# this endpoint is for operators + monitoring, the other is for "is the
+# process up?" checks. The shape is intentionally not pinned to a
+# `response_model` Pydantic class — the payload is rich enough that
+# pinning would force a parallel-maintained schema, and the only
+# downside is no automatic OpenAPI schema gen for the body.
+@router.get("/admin/health", tags=["admin"])
+async def admin_health() -> dict[str, Any]:
+    return _app_instance.index_status_payload()
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 

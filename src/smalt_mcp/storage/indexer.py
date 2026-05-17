@@ -85,6 +85,12 @@ class IndexResult:
     failures: list[tuple[Path, str]] = field(default_factory=list)
     duration_seconds: float = 0.0
     cancelled: bool = False
+    # C-8 observability: per-index rebuild status (None when no refresh
+    # was needed this run — e.g., the run touched zero pages so
+    # `_refresh_indexes` wasn't called). Shapes match what the lance.py
+    # helpers return; see `create_or_refresh_fts` / `create_or_refresh_vector_index`.
+    fts_status: dict[str, dict[str, Any]] | None = None
+    vector_status: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable summary for MCP responses."""
@@ -98,6 +104,8 @@ class IndexResult:
             "failures": [(str(p), msg) for p, msg in self.failures],
             "duration_seconds": self.duration_seconds,
             "cancelled": self.cancelled,
+            "fts_status": self.fts_status,
+            "vector_status": self.vector_status,
         }
 
 
@@ -202,7 +210,7 @@ class Indexer:
             self._emit_progress(result, phase="indexing", current_file=None)
             self._project(to_index)
             self._emit_progress(result, phase="refreshing", current_file=None)
-            self._refresh_indexes()
+            self._refresh_indexes(result)
 
         # Regenerate the canonical IndexPages from the current pages
         # table (after the run's writes have landed). Each IndexPage that
@@ -215,7 +223,7 @@ class Indexer:
             # IndexPages are concepts in the FTS+ANN indexes too — refresh
             # so a search() right after a write_page that updated an index
             # returns the new body.
-            self._refresh_indexes()
+            self._refresh_indexes(result)
 
         result.duration_seconds = perf_counter() - started
         self._emit_progress(result, phase="done", current_file=None)
@@ -298,16 +306,36 @@ class Indexer:
         claims = self.db.open_table(lance.TABLE_CLAIMS)
         claims.delete(f"page_id = {quoted}")
 
-    def _refresh_indexes(self) -> None:
-        """Rebuild FTS and ANN after a batch of writes."""
+    def _refresh_indexes(self, result: IndexResult) -> None:
+        """Rebuild FTS and ANN after a batch of writes.
+
+        Captures per-index status onto `result` for observability (C-8).
+        The lance.py helpers no longer suppress exceptions internally;
+        failures arrive as `{"status": "failed", "error": ...}` payloads
+        and we propagate them rather than logging-and-forgetting. The
+        indexer itself does NOT raise — a failed FTS rebuild still
+        leaves the page rows intact, so the run is "succeeded with a
+        degraded index" not "failed."
+        """
         try:
-            lance.create_or_refresh_fts(self.db)
-        except Exception as e:  # pragma: no cover — best effort
-            logger.warning("FTS index refresh failed: %s", e)
+            result.fts_status = lance.create_or_refresh_fts(self.db)
+        except Exception as e:  # noqa: BLE001 — defensive; lance helper is supposed to capture per-field
+            logger.warning("FTS index refresh raised unexpectedly: %s", e)
+            result.fts_status = {
+                "_call": {
+                    "status": "failed",
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                }
+            }
         try:
-            lance.create_or_refresh_vector_index(self.db)
-        except Exception as e:  # pragma: no cover — best effort
-            logger.warning("Vector index refresh failed: %s", e)
+            result.vector_status = lance.create_or_refresh_vector_index(self.db)
+        except Exception as e:  # noqa: BLE001 — same defensive shape as above
+            logger.warning("Vector index refresh raised unexpectedly: %s", e)
+            result.vector_status = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                "reason": None,
+            }
 
     def _regenerate_index_pages(self) -> list[ParsedPage]:
         """Rewrite the canonical IndexPages from current corpus state.
