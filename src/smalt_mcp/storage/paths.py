@@ -50,15 +50,10 @@ def lance_dir(smalt_root: Path) -> Path:
 
 
 def tasks_dir(smalt_root: Path) -> Path:
+    """Reserved for future Smalt-internal task state. Proposals / experiments /
+    gap signals live in the `ebony-enriching` substrate (a separate MCP
+    server with its own EBONY_ENRICHING_DIR), not here."""
     return smalt_root / "tasks"
-
-
-def gaps_md_path(smalt_root: Path) -> Path:
-    return tasks_dir(smalt_root) / "gaps.md"
-
-
-def proposals_dir(smalt_root: Path) -> Path:
-    return tasks_dir(smalt_root) / "proposals"
 
 
 def per_smalt_config_path(smalt_root: Path) -> Path:
@@ -76,6 +71,5 @@ ALL_DIRS: tuple[str, ...] = (
     "index",
     "index/lance",
     "tasks",
-    "tasks/proposals",
 )
 """Directories created when bootstrapping an empty Smalt, relative to its root."""
