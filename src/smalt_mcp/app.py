@@ -21,10 +21,25 @@ metadata + per-index build state (FTS / ANN). Updated via
 C-13 async tasks: `App.scheduler` lazily constructs a `Scheduler` for
 long-running async operations (`reindex_all`, future heavy ops).
 Started in the FastAPI lifespan; shut down on app exit.
+
+E-1 (post-v1.0.0) concurrency hardening: lazy-init for `db()` and
+`embedder()` is now guarded by per-resource `threading.Lock`s so two
+concurrent first-callers don't race to construct duplicate connections
+/ models. The observability-state mutations (last_indexer_run_at and
+friends) and the matching reads from `index_status_payload` are
+guarded by `_obs_lock` so concurrent indexer runs + status queries
+can't return torn snapshots (some fields from run N, others from N+1).
+
+The FastAPI lifespan (server.lifespan) calls `db()` and `embedder()`
+once at startup to pre-warm — under normal operation no request ever
+races the init paths. The init locks are belt-and-suspenders for the
+test path (which constructs an `App` without a lifespan) and for
+defensive correctness if a future code path bypasses lifespan.
 """
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +62,12 @@ class App:
         self.mutex: CorpusWriteMutex = CorpusWriteMutex()
         self._db: lancedb.DBConnection | None = None
         self._embedder: Embedder | None = None
+        # E-1: per-resource init locks. Used in double-checked locking
+        # inside `db()` / `embedder()` to serialize concurrent
+        # first-callers. Acquired only on the cold path; once the
+        # resource is constructed the lock isn't taken again.
+        self._db_init_lock: threading.Lock = threading.Lock()
+        self._embedder_init_lock: threading.Lock = threading.Lock()
         # C-13 async tasks: scheduler is constructed eagerly because
         # it doesn't need a running event loop at __init__ time —
         # only `enqueue` / `start_gc` do.
@@ -65,6 +86,12 @@ class App:
         # create_or_refresh_vector_index return.
         self.last_fts_status: dict[str, dict[str, Any]] | None = None
         self.last_vector_status: dict[str, Any] | None = None
+        # E-1: lock guarding the four `last_*` observability fields
+        # above. Concurrent writers (`record_indexer_run`) +
+        # concurrent reader (`index_status_payload`) need this so a
+        # status call doesn't observe a torn state where some fields
+        # are from indexer run N and others from N+1.
+        self._obs_lock: threading.Lock = threading.Lock()
 
     # ---- lazy resource accessors ----
 
@@ -73,24 +100,42 @@ class App:
 
         Raises `FileNotFoundError` if the configured Smalt dir doesn't exist
         yet — callers that need it should bootstrap first.
-        """
-        if self._db is None:
-            from smalt_mcp.storage.lance import connect
 
-            if not self.cfg.smalt_dir.exists():
-                raise FileNotFoundError(
-                    f"Smalt directory does not exist: {self.cfg.smalt_dir}. "
-                    f"Bootstrap it first (smalt.bootstrap)."
-                )
-            self._db = connect(self.cfg.smalt_dir)
+        E-1: double-checked locking. Fast path returns the existing
+        connection without acquiring the lock; slow path serializes
+        first-callers so we don't open two parallel LanceDB
+        connections from racing handler threads.
+        """
+        if self._db is not None:
+            return self._db
+        with self._db_init_lock:
+            if self._db is None:
+                from smalt_mcp.storage.lance import connect
+
+                if not self.cfg.smalt_dir.exists():
+                    raise FileNotFoundError(
+                        f"Smalt directory does not exist: {self.cfg.smalt_dir}. "
+                        f"Bootstrap it first (smalt.bootstrap)."
+                    )
+                self._db = connect(self.cfg.smalt_dir)
         return self._db
 
     def embedder(self) -> Embedder:
-        """Return the fastembed model, constructing it on first use (slow first call)."""
-        if self._embedder is None:
-            from smalt_mcp.storage.embedder import make_embedder
+        """Return the fastembed model, constructing it on first use (slow first call).
 
-            self._embedder = make_embedder(self.cfg)
+        E-1: same double-checked locking pattern as `db()`. The
+        fastembed model load is expensive (model download + load into
+        memory) so concurrent first-callers MUST serialize — without
+        this lock, two threads could both invoke make_embedder and
+        waste the cost.
+        """
+        if self._embedder is not None:
+            return self._embedder
+        with self._embedder_init_lock:
+            if self._embedder is None:
+                from smalt_mcp.storage.embedder import make_embedder
+
+                self._embedder = make_embedder(self.cfg)
         return self._embedder
 
     # ---- status helpers ----
@@ -108,14 +153,19 @@ class App:
         — a no-op indexer run (zero pages changed) leaves the previous
         index state intact, which is the truthful state for
         `index_status` to report.
+
+        E-1: held under `_obs_lock` so a concurrent
+        `index_status_payload` reader can't observe a torn snapshot
+        where some fields are from run N and others from N+1.
         """
-        self.last_indexer_run_at = datetime.now(UTC)
-        self.last_indexer_run_duration_seconds = result.duration_seconds
-        self.last_indexer_result = result.to_dict()
-        if result.fts_status is not None:
-            self.last_fts_status = result.fts_status
-        if result.vector_status is not None:
-            self.last_vector_status = result.vector_status
+        with self._obs_lock:
+            self.last_indexer_run_at = datetime.now(UTC)
+            self.last_indexer_run_duration_seconds = result.duration_seconds
+            self.last_indexer_result = result.to_dict()
+            if result.fts_status is not None:
+                self.last_fts_status = result.fts_status
+            if result.vector_status is not None:
+                self.last_vector_status = result.vector_status
 
     def index_status_payload(self) -> dict[str, Any]:
         """Assemble the full `index_status` / `/admin/health` payload.
@@ -168,18 +218,30 @@ class App:
                 # Smalt dir exists but index/lance/ doesn't — pre-bootstrap.
                 pass
 
+        # E-1: snapshot the four `last_*` fields atomically under the
+        # obs lock so a concurrent `record_indexer_run` writer can't
+        # produce a torn read (some fields from run N, others from
+        # N+1). Hold for the minimum span — just the snapshot — then
+        # assemble the payload outside the lock.
+        with self._obs_lock:
+            obs_last_run_at = self.last_indexer_run_at
+            obs_last_duration = self.last_indexer_run_duration_seconds
+            obs_last_result = self.last_indexer_result
+            obs_fts_status = self.last_fts_status
+            obs_vector_status = self.last_vector_status
+
         return {
             "smalt_dir": smalt_dir,
             "smalt_exists": smalt_exists,
             "tables": tables,
             "indexer": {
-                "last_run_at": self.last_indexer_run_at.isoformat() if self.last_indexer_run_at else None,
-                "last_run_duration_seconds": self.last_indexer_run_duration_seconds,
-                "last_result": self.last_indexer_result,
+                "last_run_at": obs_last_run_at.isoformat() if obs_last_run_at else None,
+                "last_run_duration_seconds": obs_last_duration,
+                "last_result": obs_last_result,
             },
             "indexes": {
-                "fts": self.last_fts_status,
-                "vector": self.last_vector_status,
+                "fts": obs_fts_status,
+                "vector": obs_vector_status,
             },
             "embedding": {
                 "provider": self.cfg.embedding.provider,

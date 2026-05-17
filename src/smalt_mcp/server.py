@@ -123,6 +123,32 @@ mcp_asgi = MCPASGIApp()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvlog = logging.getLogger("uvicorn.error")
+    # E-1: pre-warm the lazy-init resources so the first inbound
+    # request doesn't pay (a) the LanceDB connection cost or (b) the
+    # fastembed model load. Also closes the only currently-exploitable
+    # race in those init paths: under normal operation, no request
+    # ever lands during init because we initialize before yield. The
+    # init locks inside App.db() / App.embedder() are belt-and-
+    # suspenders for the test path (no lifespan) and any future
+    # bypass path.
+    #
+    # Both calls are guarded: missing smalt dir is a normal state
+    # (pre-bootstrap servers come up healthy; first bootstrap call
+    # creates the directory + tables). embedder() failures (e.g.
+    # fastembed model download failure) are surfaced as warnings —
+    # the server stays up so /health + /admin/version still work for
+    # ops introspection. Real first-use failures still raise to the
+    # caller.
+    if _app_instance.smalt_exists():
+        try:
+            _app_instance.db()
+        except Exception as e:  # noqa: BLE001 — startup-time pre-warm
+            uvlog.warning("eager db() init failed (will retry on first request): %s", e)
+    try:
+        _app_instance.embedder()
+    except Exception as e:  # noqa: BLE001 — startup-time pre-warm
+        uvlog.warning("eager embedder() init failed (will retry on first request): %s", e)
+
     # C-13: start the async-task scheduler's GC loop. Shutdown is
     # handled in the finally so we always cancel running tasks +
     # stop the GC loop, even on lifespan errors.
