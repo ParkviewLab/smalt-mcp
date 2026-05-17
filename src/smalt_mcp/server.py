@@ -123,14 +123,21 @@ mcp_asgi = MCPASGIApp()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     uvlog = logging.getLogger("uvicorn.error")
-    async with session_manager.run():
-        uvlog.info(
-            "smalt-mcp v%s ready (scope=%s, smalt_dir=%s)",
-            VERSION,
-            _SERVER_SCOPE.value,
-            _app_instance.cfg.smalt_dir,
-        )
-        yield
+    # C-13: start the async-task scheduler's GC loop. Shutdown is
+    # handled in the finally so we always cancel running tasks +
+    # stop the GC loop, even on lifespan errors.
+    _app_instance.scheduler.start_gc()
+    try:
+        async with session_manager.run():
+            uvlog.info(
+                "smalt-mcp v%s ready (scope=%s, smalt_dir=%s)",
+                VERSION,
+                _SERVER_SCOPE.value,
+                _app_instance.cfg.smalt_dir,
+            )
+            yield
+    finally:
+        await _app_instance.scheduler.shutdown()
 
 
 # ---------------------------------------------------------------------------

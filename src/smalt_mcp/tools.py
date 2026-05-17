@@ -12,6 +12,7 @@ entry to `TOOLS` plus a handler function. No edits to `server.py` needed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -28,6 +29,7 @@ from mcp import types
 from pydantic import TypeAdapter, ValidationError
 
 from smalt_mcp.permissions import SCOPE_TIER, Scope
+from smalt_mcp.scheduler import TERMINAL_STATES, Task, TaskState
 from smalt_mcp.schema import Claim, Page, PageType
 from smalt_mcp.storage import lance, paths
 from smalt_mcp.storage.markdown import parse_page
@@ -1505,6 +1507,116 @@ async def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, An
     }
 
 
+# ---- handler: task_status, task_list (READ_ONLY, C-13) ----
+#
+# These tools surface the in-process Scheduler's task registry —
+# what's queued, what's running, what just finished. They're
+# READ_ONLY because they don't touch the corpus; the cancel tool
+# (task_cancel) is in READ_WRITE because it affects ongoing
+# corpus-modifying work.
+#
+# In-memory registry → tasks vanish after `gc_ttl_seconds` past
+# finished_at. Operators who care about historical task records
+# should poll on a faster cadence than the TTL.
+
+
+async def task_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the current state of one scheduled task by `task_id`.
+
+    Tasks transition pending → running → terminal (succeeded /
+    failed / cancelled). Once terminal, the task stays in the
+    registry until GC removes it (`gc_ttl_seconds` after
+    `finished_at`; default 1 hour).
+
+    Response shape: the full `Task.to_dict()` — `task_id`, `kind`,
+    `state`, timestamps (`created_at` / `started_at` / `finished_at`),
+    `progress` (kind-specific dict), `result` (the work function's
+    return value, populated only on `succeeded`), `error` (short
+    string, populated only on `failed`), `cancel_requested` bool.
+
+    Errors: `not_found` if `task_id` is unknown — could mean the id
+    never existed or the task was GC'd.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    task_id = arguments.get("task_id")
+    if not task_id:
+        return {"error": "missing_argument", "message": "task_id is required"}
+    task = app.scheduler.get(task_id)
+    if task is None:
+        return {
+            "error": "not_found",
+            "task_id": task_id,
+            "message": (
+                f"no task with id {task_id!r} — either it never existed "
+                f"or it was GC'd (default TTL is "
+                f"{app.scheduler._gc_ttl_seconds}s past finished_at)"
+            ),
+        }
+    return task.to_dict()
+
+
+async def task_list(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """List scheduled tasks, most-recent-first, optionally filtered.
+
+    Filters:
+      - `state` — one of `pending`, `running`, `succeeded`, `failed`,
+        `cancelled`. Returns tasks in that state only.
+      - `kind` — operation kind (e.g. `"reindex_all"`). Returns
+        tasks of that kind only.
+      - `limit` — max number of tasks to return (default 100). Applied
+        after filtering — `state=succeeded, limit=10` returns the 10
+        most recent successful tasks, not "10 most recent of which
+        some happen to be successful."
+
+    Returns minimal-but-useful metadata per task (the full Task
+    dict, same as `task_status`).
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    state_raw = arguments.get("state")
+    state: TaskState | None = None
+    if state_raw is not None:
+        try:
+            state = TaskState(state_raw)
+        except ValueError:
+            valid = [s.value for s in TaskState]
+            return {
+                "error": "invalid_argument",
+                "message": f"unknown state {state_raw!r}; valid: {valid}",
+            }
+    kind = arguments.get("kind")
+    if kind is not None and not isinstance(kind, str):
+        return {
+            "error": "invalid_argument",
+            "message": "kind must be a string",
+        }
+    try:
+        limit = int(arguments.get("limit", 100))
+    except (TypeError, ValueError):
+        return {
+            "error": "invalid_argument",
+            "message": "limit must be an integer",
+        }
+    if limit <= 0:
+        return {
+            "error": "invalid_argument",
+            "message": f"limit must be positive (got {limit})",
+        }
+
+    tasks = app.scheduler.list(state=state, kind=kind, limit=limit)
+    return {
+        "tasks": [t.to_dict() for t in tasks],
+        "count": len(tasks),
+        "state_filter": state.value if state else None,
+        "kind_filter": kind,
+    }
+
+
 # ---- handler: bootstrap (READ_WRITE) ----
 
 
@@ -2785,64 +2897,153 @@ async def reindex_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Full LanceDB rebuild from disk: wipe every table, recreate
-    schemas, walk `pages/`, project everything.
+    """Full LanceDB rebuild from disk (C-13: now async).
+
+    Enqueues a background task that wipes every table, recreates the
+    schemas, walks `pages/`, and projects everything. Returns
+    immediately with a `task_id`; clients poll via `task_status` to
+    track state and read the final IndexResult when the task reaches
+    `succeeded`.
 
     The thorough version of `Indexer.run(full=True)` — handles the case
     where the LanceDB tables themselves are missing or corrupt (e.g.,
     post-restore from a Restic backup that excluded `index/lance/`).
-    For the "tables are healthy but I want to force re-embed" case,
-    `Indexer.run(full=True)` (no wipe) would suffice — but the public
-    `reindex_all` tool does the wipe-first variant because that's the
-    one operators actually need.
 
-    Runs under the corpus mutex for the whole rebuild. On a multi-GB
-    Smalt this can take minutes; concurrent writers are blocked. Not
-    yet async (C-13 will make it a background task).
+    The task runs under the corpus mutex for the whole rebuild; on a
+    multi-GB Smalt this can take minutes. Pre-C-13 callers that
+    expected a synchronous result + `wiped_tables` / `recreated_tables`
+    / `index_result` payload should now poll `task_status(task_id)`
+    until state is terminal; the same payload appears in `task.result`.
 
-    Returns the full IndexResult summary of the rebuild pass.
+    Response shape:
+
+        {
+          "task_id": str,
+          "kind": "reindex_all",
+          "state": "pending",
+          "created_at": ISO datetime,
+          "message": "Enqueued; poll task_status(task_id) for progress."
+        }
     """
     if not app.smalt_exists():
         return _not_initialized()
 
-    with app.mutex.acquire("reindex_all"):
-        db = app.db()
+    async def _work(task: Task) -> dict[str, Any]:
+        """The actual reindex work. Runs under the corpus mutex; uses
+        `asyncio.to_thread` so the blocking LanceDB ops don't block the
+        event loop."""
 
-        # Wipe every canonical table. LanceDB's drop_table raises
-        # ValueError (or its own NotFoundError) for missing tables —
-        # treat that as "already gone, nothing to do."
-        wiped: list[str] = []
-        for table_name in lance.ALL_TABLES:
-            try:
-                db.drop_table(table_name)
-                wiped.append(table_name)
-            except (FileNotFoundError, ValueError, KeyError):
-                continue  # already absent
-            except Exception as e:  # noqa: BLE001 — surface but don't crash
-                logger.warning("reindex_all: drop_table(%s) failed: %s", table_name, e)
+        def _do_reindex() -> dict[str, Any]:
+            task.progress["phase"] = "acquiring_mutex"
+            with app.mutex.acquire("reindex_all"):
+                # Honor cancel before any destructive work happens.
+                if task.cancel_requested:
+                    raise asyncio.CancelledError(
+                        f"task {task.id} cancelled before reindex started"
+                    )
 
-        # Recreate empty schemas.
-        recreated = lance.ensure_tables(
-            app.cfg.smalt_dir, embedding_dim=app.cfg.embedding.dim
-        )
+                task.progress["phase"] = "wiping_tables"
+                db = app.db()
+                wiped: list[str] = []
+                for table_name in lance.ALL_TABLES:
+                    try:
+                        db.drop_table(table_name)
+                        wiped.append(table_name)
+                    except (FileNotFoundError, ValueError, KeyError):
+                        continue
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "reindex_all: drop_table(%s) failed: %s",
+                            table_name,
+                            e,
+                        )
+                task.progress["wiped_tables"] = list(wiped)
 
-        # Full reindex from disk. The indexer's `full=True` mode
-        # force-re-projects every file; no hash short-circuit.
-        from smalt_mcp.storage.indexer import Indexer
+                if task.cancel_requested:
+                    raise asyncio.CancelledError(
+                        f"task {task.id} cancelled after wipe"
+                    )
 
-        indexer = Indexer(
-            smalt_root=app.cfg.smalt_dir,
-            embedder=app.embedder(),
-            db=db,
-        )
-        result = indexer.run(full=True)
-        app.record_indexer_run(result)
+                task.progress["phase"] = "recreating_tables"
+                recreated = lance.ensure_tables(
+                    app.cfg.smalt_dir, embedding_dim=app.cfg.embedding.dim
+                )
+                task.progress["recreated_tables"] = list(recreated)
 
-    return {
-        "wiped_tables": wiped,
-        "recreated_tables": recreated,
-        "index_result": result.to_dict(),
-    }
+                task.progress["phase"] = "indexing"
+                from smalt_mcp.storage.indexer import Indexer
+
+                indexer = Indexer(
+                    smalt_root=app.cfg.smalt_dir,
+                    embedder=app.embedder(),
+                    db=app.db(),
+                )
+                result = indexer.run(full=True)
+                app.record_indexer_run(result)
+
+                task.progress["phase"] = "complete"
+                return {
+                    "wiped_tables": wiped,
+                    "recreated_tables": recreated,
+                    "index_result": result.to_dict(),
+                }
+
+        return await asyncio.to_thread(_do_reindex)
+
+    task = app.scheduler.enqueue("reindex_all", _work)
+    payload = task.to_dict()
+    payload["message"] = (
+        "Enqueued; poll task_status(task_id) for progress. "
+        "Final result available in task.result when state is 'succeeded'."
+    )
+    return payload
+
+
+# ---- handler: task_cancel (READ_WRITE, C-13) ----
+
+
+async def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Request cancellation of a scheduled task by `task_id`.
+
+    Cancellation is **cooperative** — the work function must check
+    `task.check_cancel()` at safe boundaries to honor the request.
+    For `reindex_all`, the worst-case latency between cancel-request
+    and actual stop is "one indexer iteration" (typically <1s).
+
+    State transitions:
+      - PENDING task → straight to CANCELLED; never runs.
+      - RUNNING task → `cancel_requested` flag set; the work function
+        bails at its next safe boundary. State stays RUNNING until
+        that happens (the response reflects the moment of cancel,
+        not the eventual transition — poll task_status to see the
+        final CANCELLED state).
+      - terminal task → no-op; returns the existing task unchanged.
+
+    Returns the task's current state (post-cancel-request). Errors:
+    `not_found` if `task_id` is unknown.
+    """
+    ok, err = _ensure_initialized(app)
+    if not ok:
+        return err  # type: ignore[return-value]
+
+    task_id = arguments.get("task_id")
+    if not task_id:
+        return {"error": "missing_argument", "message": "task_id is required"}
+    task = app.scheduler.cancel(task_id)
+    if task is None:
+        return {
+            "error": "not_found",
+            "task_id": task_id,
+            "message": (
+                f"no task with id {task_id!r} — either it never existed "
+                "or it was GC'd"
+            ),
+        }
+    payload = task.to_dict()
+    payload["was_terminal_at_call"] = task.state in TERMINAL_STATES and (
+        not task.cancel_requested or task.state == TaskState.CANCELLED
+    )
+    return payload
 
 
 # ---- handler: remove_page (REMOVE_DESTRUCTIVE) ----
@@ -3602,6 +3803,100 @@ TOOLS: list[ToolDef] = [
         scope=Scope.READ_ONLY,
         handler=source_similarity,
     ),
+    ToolDef(
+        spec=types.Tool(
+            name="task_status",
+            description=(
+                "Return the current state of one scheduled task "
+                "(C-13 async task model). Tasks transition pending "
+                "→ running → terminal (succeeded / failed / "
+                "cancelled). Once terminal, they stay in the "
+                "registry for ~1 hour (GC TTL) so clients can poll "
+                "the result later.\n\n"
+                "Response: full task dict — `task_id`, `kind`, "
+                "`state`, timestamps, `progress` (kind-specific "
+                "dict), `result` (work-function return value, "
+                "populated only on `succeeded`), `error` (short "
+                "string, populated only on `failed`), "
+                "`cancel_requested` bool.\n\n"
+                "Errors: `not_found` if `task_id` is unknown (id "
+                "never existed or was GC'd)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "The id returned by the heavy-op tool "
+                            "that enqueued the task "
+                            "(e.g. `reindex_all`)."
+                        ),
+                    },
+                },
+                "required": ["task_id"],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=task_status,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="task_list",
+            description=(
+                "List scheduled tasks, most-recent first, optionally "
+                "filtered by `state` and/or `kind` (C-13 async task "
+                "model). `limit` is applied after filtering.\n\n"
+                "Returns `{tasks: [...], count, state_filter, "
+                "kind_filter}` where each task entry is the same "
+                "shape as `task_status`. Useful for ops introspection "
+                "(\"what's currently running?\" → "
+                "`task_list(state='running')`) or debugging recent "
+                "failures (\"why did my last reindex fail?\" → "
+                "`task_list(state='failed', kind='reindex_all', "
+                "limit=5)`)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": [
+                            "pending",
+                            "running",
+                            "succeeded",
+                            "failed",
+                            "cancelled",
+                        ],
+                        "description": (
+                            "Optional state filter. When set, only "
+                            "tasks in that state are returned."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "Optional operation-kind filter "
+                            "(e.g. `'reindex_all'`). When set, only "
+                            "tasks of that kind are returned."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "Max number of tasks to return "
+                            "(default 100)."
+                        ),
+                        "default": 100,
+                        "minimum": 1,
+                    },
+                },
+                "required": [],
+            },
+        ),
+        scope=Scope.READ_ONLY,
+        handler=task_list,
+    ),
     # ---- READ_WRITE ----
     ToolDef(
         spec=types.Tool(
@@ -4032,10 +4327,20 @@ TOOLS: list[ToolDef] = [
                 "after a Restic restore (where `index/lance/` was "
                 "excluded from the backup) use this to rebuild the "
                 "derived index from the canonical markdown.\n\n"
-                "Runs under the corpus mutex for the whole rebuild. On "
-                "a multi-GB Smalt this can take minutes; concurrent "
-                "writers are blocked. Not yet async (C-13 will make it "
-                "a background task)."
+                "**Async (C-13)**: returns immediately with a "
+                "`task_id`; the actual work runs in the background "
+                "under the corpus mutex. Poll `task_status(task_id)` "
+                "to track progress; the final IndexResult appears in "
+                "`task.result` when state reaches `succeeded`. "
+                "Cancel via `task_cancel(task_id)` — cooperative, "
+                "honored at safe boundaries (between indexer "
+                "iterations and pre/post wipe).\n\n"
+                "Response shape: `{task_id, kind: 'reindex_all', "
+                "state: 'pending', created_at, message}`. "
+                "Pre-C-13 callers expecting `wiped_tables` / "
+                "`recreated_tables` / `index_result` directly in the "
+                "response should switch to reading those fields from "
+                "`task.result` after polling to terminal state."
             ),
             inputSchema={
                 "type": "object",
@@ -4045,6 +4350,43 @@ TOOLS: list[ToolDef] = [
         ),
         scope=Scope.READ_WRITE,
         handler=reindex_all,
+    ),
+    ToolDef(
+        spec=types.Tool(
+            name="task_cancel",
+            description=(
+                "Request cancellation of a scheduled task by "
+                "`task_id` (C-13 async task model). Cooperative — "
+                "the work function must check `task.check_cancel()` "
+                "at safe boundaries to honor the request.\n\n"
+                "Behavior by current state:\n"
+                "  - PENDING task → transitions straight to "
+                "CANCELLED; never runs.\n"
+                "  - RUNNING task → `cancel_requested` flag set; "
+                "work function bails at its next safe boundary. The "
+                "response reflects state at the cancel-request "
+                "moment — poll `task_status` to see the final "
+                "CANCELLED transition.\n"
+                "  - Terminal task → no-op; returns the existing "
+                "task unchanged.\n\n"
+                "Response: the full task dict (post-cancel-request "
+                "state) plus `was_terminal_at_call: bool` "
+                "indicating whether the cancel arrived too late.\n\n"
+                "Errors: `not_found` if `task_id` is unknown."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The task to cancel.",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        ),
+        scope=Scope.READ_WRITE,
+        handler=task_cancel,
     ),
     # ---- REMOVE_DESTRUCTIVE ----
     ToolDef(

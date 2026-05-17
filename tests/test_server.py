@@ -109,6 +109,80 @@ def _call_tool_raw_text(
     return contents[0]["text"]
 
 
+# ---- C-13 task-polling helpers ----
+
+
+def _await_task_completion(
+    client: TestClient,
+    session_id: str,
+    task_id: str,
+    *,
+    req_id_base: int = 9000,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 0.05,
+) -> dict:
+    """Poll `task_status(task_id)` until terminal state, then return the
+    final task dict. Raises TimeoutError if the task doesn't finish in
+    `timeout_seconds`.
+
+    Used by tests that exercise C-13's async tools (reindex_all and
+    later: any heavy op that returns a task_id). The poll interval is
+    tight by default — work runs on a real thread via asyncio.to_thread
+    so the loop ticks are cheap.
+    """
+    import time as _time
+
+    deadline = _time.time() + timeout_seconds
+    req_id = req_id_base
+    terminal = {"succeeded", "failed", "cancelled"}
+    while _time.time() < deadline:
+        status = _call_tool(
+            client, session_id, "task_status", {"task_id": task_id}, req_id=req_id
+        )
+        req_id += 1
+        if status.get("error") == "not_found":
+            raise AssertionError(
+                f"task {task_id} not found while polling — likely GC'd or never created"
+            )
+        if status.get("state") in terminal:
+            return status
+        _time.sleep(poll_interval)
+    raise TimeoutError(
+        f"task {task_id} did not reach terminal state in {timeout_seconds}s; "
+        f"last poll: {status}"
+    )
+
+
+def _reindex_all_sync(
+    client: TestClient,
+    session_id: str,
+    *,
+    req_id: int = 9500,
+    timeout_seconds: float = 30.0,
+) -> dict:
+    """Trigger `reindex_all`, wait for the task to finish, return
+    the work function's result payload.
+
+    Convenience for tests that pre-date C-13's async pattern — they
+    used to call reindex_all and read `{wiped_tables, recreated_tables,
+    index_result}` straight from the response. After C-13 the same
+    payload lives in `task.result` after polling to terminal. This
+    helper bridges the two so test sites don't all need polling
+    boilerplate.
+    """
+    enqueue = _call_tool(client, session_id, "reindex_all", {}, req_id=req_id)
+    assert "task_id" in enqueue, f"reindex_all didn't enqueue: {enqueue}"
+    final = _await_task_completion(
+        client,
+        session_id,
+        enqueue["task_id"],
+        req_id_base=req_id * 10 + 1,
+        timeout_seconds=timeout_seconds,
+    )
+    assert final["state"] == "succeeded", f"reindex_all failed: {final}"
+    return final["result"]
+
+
 # ---------------------------------------------------------------------------
 # HTTP routes
 
@@ -142,13 +216,14 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     assert "result" in body, f"tools/list returned: {body!r}"
     names = {t["name"] for t in body["result"]["tools"]}
     # Server runs at remove_destructive scope (from conftest); every tool
-    # (10 read-only + 10 read-write + 4 remove-destructive = 24) should
+    # (12 read-only + 11 read-write + 4 remove-destructive = 27) should
     # be listed. Proposal / experiment / gap tools moved to
     # ebony-enriching. C-5 added: add_links + add_claims (bulk
     # variants). C-6 added: write_batch. C-8 added: index_status. C-9
     # added: reindex_page + reindex_all. C-12 added: source_similarity.
+    # C-13 added: task_status + task_list (RO) and task_cancel (RW).
     assert names == {
-        # READ_ONLY (10)
+        # READ_ONLY (12)
         "status",
         "index_status",
         "list_pages",
@@ -159,7 +234,9 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "search",
         "list_domains",
         "source_similarity",
-        # READ_WRITE (10)
+        "task_status",
+        "task_list",
+        # READ_WRITE (11)
         "bootstrap",
         "write_page",
         "write_pages",
@@ -170,6 +247,7 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
         "write_batch",
         "reindex_page",
         "reindex_all",
+        "task_cancel",
         # REMOVE_DESTRUCTIVE (4)
         "remove_page",
         "update_claim",
@@ -2511,7 +2589,10 @@ def test_reindex_page_file_gone_returns_specific_error(mcp_client: TestClient):
 
 def test_reindex_all_rebuilds_from_disk(mcp_client: TestClient):
     """reindex_all wipes the LanceDB tables and rebuilds from `pages/`.
-    All pages that were listed before are still listed after."""
+    All pages that were listed before are still listed after.
+
+    C-13: reindex_all is now async — returns a task_id; we poll via
+    the `_reindex_all_sync` helper which wraps enqueue + await."""
     sid = _initialize(mcp_client)
     # Trigger an indexer pass to ensure the state is fresh.
     _call_tool(
@@ -2527,12 +2608,12 @@ def test_reindex_all_rebuilds_from_disk(mcp_client: TestClient):
     before_ids = {p["id"] for p in before["pages"]}
     assert before["count"] > 0
 
-    # Wipe + rebuild.
-    rxa = _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1402)
-    assert rxa.get("error") is None, rxa
-    assert "wiped_tables" in rxa
-    assert "recreated_tables" in rxa
-    assert isinstance(rxa["index_result"], dict)
+    # Wipe + rebuild — async; helper polls until done and returns the
+    # work-function result payload (same shape as pre-C-13).
+    result = _reindex_all_sync(mcp_client, sid, req_id=1402)
+    assert "wiped_tables" in result
+    assert "recreated_tables" in result
+    assert isinstance(result["index_result"], dict)
 
     # Every page id from before is back. Reindex preserves on-disk
     # content (which is the source of truth).
@@ -2550,7 +2631,7 @@ def test_reindex_all_preserves_index_pages(mcp_client: TestClient):
     are still present (the indexer's auto-regen step runs at the end
     of the rebuild pass)."""
     sid = _initialize(mcp_client)
-    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1410)
+    _reindex_all_sync(mcp_client, sid, req_id=1410)
     glossary = _call_tool(
         mcp_client, sid, "read_page", {"page_id": "idx-glossary"}, req_id=1411
     )
@@ -2562,7 +2643,7 @@ def test_reindex_all_search_still_works(mcp_client: TestClient):
     """After reindex_all, search returns hits — proves FTS + vector
     indexes get rebuilt on the new tables."""
     sid = _initialize(mcp_client)
-    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1420)
+    _reindex_all_sync(mcp_client, sid, req_id=1420)
     result = _call_tool(
         mcp_client, sid, "search", {"query": "Alice", "top_k": 5}, req_id=1421
     )
@@ -2767,7 +2848,7 @@ def test_reindex_all_populates_aliases_column(mcp_client: TestClient):
     ent-alice has `aliases: [Alicia]` — assert that after reindex_all
     the column reflects this."""
     sid = _initialize(mcp_client)
-    _call_tool(mcp_client, sid, "reindex_all", {}, req_id=1540)
+    _reindex_all_sync(mcp_client, sid, req_id=1540)
     from smalt_mcp.server import _app_instance
     from smalt_mcp.storage import lance
 
@@ -4117,6 +4198,530 @@ def test_c12_source_similarity_truncated_flag_when_filter_exhausts_pool(
         req_id=715,
     )
     assert no_filter["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# C-13: async task scheduler. Two layers of tests:
+#   1. Unit tests of the Scheduler class (no HTTP, no MCP, no asyncio
+#      event loop — just direct dataclass + state checks where possible,
+#      and a few minimal asyncio.run() exercises for lifecycle flow).
+#   2. Integration: reindex_all (async via task_id), task_status,
+#      task_list, task_cancel — all via the MCP surface.
+
+
+# ---- C-13 unit: Scheduler class ----
+
+
+def test_c13_task_id_uniqueness():
+    """Task ids are short URL-safe strings; should never collide in
+    practice."""
+    from smalt_mcp.scheduler import _new_task_id
+
+    ids = {_new_task_id() for _ in range(10_000)}
+    assert len(ids) == 10_000, "task id collision in 10k samples"
+
+
+def test_c13_task_to_dict_shape():
+    """Task.to_dict() returns the documented field set with correct
+    serialization (datetimes → ISO strings; nested dicts copied)."""
+    from smalt_mcp.scheduler import Task, TaskState
+
+    t = Task(id="abc123", kind="reindex_all")
+    d = t.to_dict()
+    assert d["task_id"] == "abc123"
+    assert d["kind"] == "reindex_all"
+    assert d["state"] == "pending"
+    # created_at is ISO; started/finished are None
+    assert isinstance(d["created_at"], str)
+    assert "T" in d["created_at"]
+    assert d["started_at"] is None
+    assert d["finished_at"] is None
+    assert d["progress"] == {}
+    assert d["result"] is None
+    assert d["error"] is None
+    assert d["cancel_requested"] is False
+
+    # Mutating the returned progress shouldn't affect the task
+    d["progress"]["mutated"] = True
+    assert "mutated" not in t.progress
+
+
+def test_c13_task_check_cancel_raises_when_requested():
+    """task.check_cancel() raises CancelledError exactly when
+    cancel_requested is set."""
+    import asyncio
+    from smalt_mcp.scheduler import Task
+
+    t = Task(id="x", kind="k")
+    # No-op when not requested.
+    t.check_cancel()
+    t.cancel_requested = True
+    try:
+        t.check_cancel()
+    except asyncio.CancelledError as e:
+        assert "x" in str(e)
+    else:
+        raise AssertionError("check_cancel should have raised")
+
+
+def test_c13_scheduler_enqueue_succeeds_path():
+    """A successful work function transitions through pending →
+    running → succeeded. Final state has result set, error None,
+    finished_at populated."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            await asyncio.sleep(0)  # one tick
+            return {"ok": True, "value": 42}
+
+        task = sched.enqueue("kind-a", _work)
+        # Initial: pending (until the first await tick gives the runner CPU).
+        assert task.state in {TaskState.PENDING, TaskState.RUNNING}
+        # Wait for the runner to finish.
+        await task._asyncio_task
+        assert task.state == TaskState.SUCCEEDED
+        assert task.result == {"ok": True, "value": 42}
+        assert task.error is None
+        assert task.finished_at is not None
+        assert task.started_at is not None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_enqueue_failed_path():
+    """An exception in the work function transitions to FAILED with
+    error string populated."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            raise RuntimeError("oh no")
+
+        task = sched.enqueue("kind-b", _work)
+        await task._asyncio_task
+        assert task.state == TaskState.FAILED
+        assert task.error is not None
+        assert "RuntimeError" in task.error
+        assert "oh no" in task.error
+        assert task.result is None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_pending_immediately():
+    """Cancelling a freshly-enqueued task before it runs transitions
+    directly to CANCELLED."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+        ran = []
+
+        async def _work(task):
+            ran.append(True)
+            return None
+
+        task = sched.enqueue("kind-c", _work)
+        # Cancel before the runner has had a chance to start.
+        cancelled = sched.cancel(task.id)
+        assert cancelled is task
+        assert task.cancel_requested is True
+        # The async runner sees the cancel; await its completion.
+        try:
+            await task._asyncio_task
+        except asyncio.CancelledError:
+            pass
+        # The work function may or may not have entered (race), but the
+        # task's final state must be CANCELLED either way.
+        assert task.state == TaskState.CANCELLED
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_running_via_check_cancel():
+    """A running task that calls check_cancel() at a safe boundary
+    transitions to CANCELLED."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+        started = asyncio.Event()
+
+        async def _work(task):
+            started.set()
+            # Loop until cancel arrives.
+            for _ in range(1000):
+                await asyncio.sleep(0.001)
+                task.check_cancel()
+            return "didnt-get-cancelled"
+
+        task = sched.enqueue("kind-d", _work)
+        await started.wait()
+        sched.cancel(task.id)
+        try:
+            await task._asyncio_task
+        except asyncio.CancelledError:
+            pass
+        assert task.state == TaskState.CANCELLED
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_terminal_is_noop():
+    """Cancelling an already-terminal task is a no-op; returns the
+    existing task unchanged."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _work(task):
+            return "done"
+
+        task = sched.enqueue("kind-e", _work)
+        await task._asyncio_task
+        assert task.state == TaskState.SUCCEEDED
+
+        result = sched.cancel(task.id)
+        assert result is task
+        assert task.state == TaskState.SUCCEEDED
+        # cancel_requested stays False — we don't flip it on a terminal task.
+        assert task.cancel_requested is False
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_cancel_unknown_returns_none():
+    """Cancelling an unknown task_id returns None."""
+    from smalt_mcp.scheduler import Scheduler
+
+    sched = Scheduler()
+    assert sched.cancel("nope") is None
+
+
+def test_c13_scheduler_list_filters_by_state_and_kind():
+    """list(state=..., kind=...) returns most-recent-first, AND-composed."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler, TaskState
+
+    async def _go():
+        sched = Scheduler()
+
+        async def _ok(task):
+            return None
+
+        async def _fail(task):
+            raise ValueError("x")
+
+        t1 = sched.enqueue("kind-a", _ok)
+        t2 = sched.enqueue("kind-b", _ok)
+        t3 = sched.enqueue("kind-a", _fail)
+        for t in (t1, t2, t3):
+            try:
+                await t._asyncio_task
+            except Exception:
+                pass
+
+        # state=succeeded → t1 + t2 (not t3 which failed)
+        succeeded = sched.list(state=TaskState.SUCCEEDED)
+        ids = {t.id for t in succeeded}
+        assert ids == {t1.id, t2.id}
+
+        # kind=kind-a → t1 + t3
+        kind_a = sched.list(kind="kind-a")
+        ids = {t.id for t in kind_a}
+        assert ids == {t1.id, t3.id}
+
+        # AND: state=succeeded AND kind=kind-a → just t1
+        both = sched.list(state=TaskState.SUCCEEDED, kind="kind-a")
+        assert {t.id for t in both} == {t1.id}
+
+        # limit applies after filtering
+        limited = sched.list(state=TaskState.SUCCEEDED, limit=1)
+        assert len(limited) == 1
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_gc_purges_old_terminal_tasks():
+    """GC removes terminal tasks whose finished_at is older than TTL."""
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+    from smalt_mcp.scheduler import Scheduler
+
+    async def _go():
+        sched = Scheduler(gc_ttl_seconds=1)
+
+        async def _work(task):
+            return None
+
+        task = sched.enqueue("k", _work)
+        await task._asyncio_task
+
+        # Backdate finished_at past the TTL.
+        task.finished_at = datetime.now(UTC) - timedelta(seconds=5)
+        removed = sched._gc_once()
+        assert removed == 1
+        assert sched.get(task.id) is None
+
+    asyncio.run(_go())
+
+
+def test_c13_scheduler_gc_preserves_recent_terminal_tasks():
+    """GC leaves recent terminal tasks alone (within TTL)."""
+    import asyncio
+    from smalt_mcp.scheduler import Scheduler
+
+    async def _go():
+        sched = Scheduler(gc_ttl_seconds=3600)
+
+        async def _work(task):
+            return None
+
+        task = sched.enqueue("k", _work)
+        await task._asyncio_task
+
+        removed = sched._gc_once()
+        assert removed == 0
+        assert sched.get(task.id) is task
+
+    asyncio.run(_go())
+
+
+# ---- C-13 integration: MCP-facing task tools ----
+
+
+def test_c13_reindex_all_returns_task_id(mcp_client: TestClient):
+    """reindex_all is now async — response includes task_id, kind,
+    state, created_at, message (NOT the work-function payload)."""
+    sid = _initialize(mcp_client)
+    response = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=720
+    )
+    assert "task_id" in response
+    assert response["kind"] == "reindex_all"
+    assert response["state"] in {"pending", "running"}
+    assert "created_at" in response
+    assert "message" in response
+    # Pre-C-13 fields don't appear in the enqueue response.
+    assert "wiped_tables" not in response
+    assert "recreated_tables" not in response
+    assert "index_result" not in response
+    # Wait for it to finish so it doesn't bleed into later tests.
+    _await_task_completion(
+        mcp_client, sid, response["task_id"], req_id_base=7200
+    )
+
+
+def test_c13_task_status_reflects_terminal_state(mcp_client: TestClient):
+    """After reindex_all enqueues + completes, task_status returns
+    state='succeeded' with the full IndexResult in task.result."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=721
+    )
+    task_id = enqueue["task_id"]
+    final = _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7210
+    )
+    assert final["state"] == "succeeded"
+    assert final["task_id"] == task_id
+    assert final["kind"] == "reindex_all"
+    assert final["finished_at"] is not None
+    assert final["error"] is None
+    # The work-function payload is now in task.result.
+    assert "wiped_tables" in final["result"]
+    assert "recreated_tables" in final["result"]
+    assert "index_result" in final["result"]
+
+
+def test_c13_task_status_missing_arg(mcp_client: TestClient):
+    """task_status requires task_id (input-schema validation)."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client, sid, "task_status", {}, req_id=722
+    )
+    assert "task_id" in raw
+    assert "required" in raw.lower() or "validation" in raw.lower()
+
+
+def test_c13_task_status_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "task_status",
+        {"task_id": "no-such-task-id"},
+        req_id=723,
+    )
+    assert result["error"] == "not_found"
+    assert result["task_id"] == "no-such-task-id"
+
+
+def test_c13_task_list_returns_recent_tasks(mcp_client: TestClient):
+    """task_list returns the most recent tasks, including any
+    enqueued in this test session (reindex_all from earlier
+    tests)."""
+    sid = _initialize(mcp_client)
+    # Enqueue a fresh task so we have something concrete to find.
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=724
+    )
+    task_id = enqueue["task_id"]
+    _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7240
+    )
+
+    listed = _call_tool(
+        mcp_client, sid, "task_list", {"limit": 100}, req_id=725
+    )
+    assert "tasks" in listed
+    assert listed["count"] >= 1
+    ids = {t["task_id"] for t in listed["tasks"]}
+    assert task_id in ids
+
+
+def test_c13_task_list_filters_by_state(mcp_client: TestClient):
+    """task_list(state='succeeded') returns only succeeded tasks."""
+    sid = _initialize(mcp_client)
+    # Make sure at least one succeeded task exists.
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=726
+    )
+    _await_task_completion(
+        mcp_client, sid, enqueue["task_id"], req_id_base=7260
+    )
+
+    listed = _call_tool(
+        mcp_client,
+        sid,
+        "task_list",
+        {"state": "succeeded", "limit": 100},
+        req_id=727,
+    )
+    for t in listed["tasks"]:
+        assert t["state"] == "succeeded"
+    assert listed["state_filter"] == "succeeded"
+
+
+def test_c13_task_list_filters_by_kind(mcp_client: TestClient):
+    """task_list(kind='reindex_all') returns only reindex_all tasks."""
+    sid = _initialize(mcp_client)
+    listed = _call_tool(
+        mcp_client,
+        sid,
+        "task_list",
+        {"kind": "reindex_all", "limit": 100},
+        req_id=728,
+    )
+    for t in listed["tasks"]:
+        assert t["kind"] == "reindex_all"
+    assert listed["kind_filter"] == "reindex_all"
+
+
+def test_c13_task_list_rejects_invalid_state_at_mcp(mcp_client: TestClient):
+    """Unknown state values fail JSON-schema enum validation."""
+    sid = _initialize(mcp_client)
+    raw = _call_tool_raw_text(
+        mcp_client,
+        sid,
+        "task_list",
+        {"state": "nopenope"},
+        req_id=729,
+    )
+    assert "validation" in raw.lower() or "not one of" in raw.lower()
+
+
+def test_c13_task_cancel_unknown_returns_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "task_cancel",
+        {"task_id": "no-such-task"},
+        req_id=730,
+    )
+    assert result["error"] == "not_found"
+
+
+def test_c13_task_cancel_terminal_is_noop(mcp_client: TestClient):
+    """Cancelling an already-succeeded task returns it unchanged."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=731
+    )
+    task_id = enqueue["task_id"]
+    _await_task_completion(
+        mcp_client, sid, task_id, req_id_base=7310
+    )
+    cancel = _call_tool(
+        mcp_client,
+        sid,
+        "task_cancel",
+        {"task_id": task_id},
+        req_id=732,
+    )
+    assert cancel.get("error") is None
+    # State stays succeeded.
+    assert cancel["state"] == "succeeded"
+    assert cancel.get("was_terminal_at_call") is True
+
+
+def test_c13_task_status_includes_progress(mcp_client: TestClient):
+    """After completion, the task's progress dict has the 'complete'
+    phase recorded (set by reindex_all's _work function)."""
+    sid = _initialize(mcp_client)
+    enqueue = _call_tool(
+        mcp_client, sid, "reindex_all", {}, req_id=733
+    )
+    final = _await_task_completion(
+        mcp_client, sid, enqueue["task_id"], req_id_base=7330
+    )
+    assert "progress" in final
+    assert final["progress"].get("phase") == "complete"
+    # Mid-flight phase fields are also captured.
+    assert "wiped_tables" in final["progress"]
+    assert "recreated_tables" in final["progress"]
+
+
+def test_c13_reindex_all_unblocked_with_uninitialized_smalt():
+    """When the Smalt dir doesn't exist, reindex_all returns the
+    pre-existing `smalt_not_initialized` error (NOT a task_id). The
+    error path runs synchronously — no point enqueuing work that can't
+    run."""
+    import asyncio
+    from pathlib import Path
+    from smalt_mcp.app import App
+    from smalt_mcp.config import Config, EmbeddingConfig
+    from smalt_mcp.tools import reindex_all
+
+    # Construct an App whose smalt_dir doesn't exist.
+    nonexistent = Path("/tmp/c13-this-does-not-exist-12345")
+    if nonexistent.exists():
+        import shutil
+        shutil.rmtree(nonexistent)
+    cfg = Config(
+        smalt_dir=nonexistent,
+        embedding=EmbeddingConfig(provider="fake", model="fake", dim=384),
+    )
+    app = App(cfg=cfg)
+
+    async def _go():
+        return await reindex_all(app, {})
+
+    result = asyncio.run(_go())
+    assert "error" in result
+    assert "task_id" not in result
 
 
 # ---------------------------------------------------------------------------

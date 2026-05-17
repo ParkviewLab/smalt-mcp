@@ -17,6 +17,10 @@ C-8 observability: `App` also tracks runtime state used by the
 `index_status` MCP tool + `/admin/health` HTTP route — last indexer run
 metadata + per-index build state (FTS / ANN). Updated via
 `record_indexer_run()` which `tools._run_indexer` calls after each pass.
+
+C-13 async tasks: `App.scheduler` lazily constructs a `Scheduler` for
+long-running async operations (`reindex_all`, future heavy ops).
+Started in the FastAPI lifespan; shut down on app exit.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from smalt_mcp.config import Config, load_config
 from smalt_mcp.mutex import CorpusWriteMutex
+from smalt_mcp.scheduler import Scheduler
 
 if TYPE_CHECKING:
     import lancedb
@@ -42,6 +47,10 @@ class App:
         self.mutex: CorpusWriteMutex = CorpusWriteMutex()
         self._db: lancedb.DBConnection | None = None
         self._embedder: Embedder | None = None
+        # C-13 async tasks: scheduler is constructed eagerly because
+        # it doesn't need a running event loop at __init__ time —
+        # only `enqueue` / `start_gc` do.
+        self.scheduler: Scheduler = Scheduler()
 
         # C-8: indexer-run + index-build observability state. None until
         # the first indexer pass completes (via _run_indexer in tools.py).
