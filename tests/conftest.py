@@ -146,6 +146,8 @@ def mcp_client(tmp_path_factory) -> TestClient:
     os.environ["SMALT_DIR"] = str(smalt_dir)
     os.environ["EMBEDDING_PROVIDER"] = "fake"
     os.environ["EMBEDDING_DIM"] = "384"
+    # Expose the destructive tools so tests can exercise remove_*, update_claim.
+    os.environ["SMALT_SCOPE"] = "remove_destructive"
 
     _write_seed_smalt(smalt_dir)
     _bootstrap_and_index(smalt_dir)

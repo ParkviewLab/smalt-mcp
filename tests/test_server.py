@@ -127,7 +127,7 @@ def test_admin_version(mcp_client: TestClient):
     body = r.json()
     assert body["name"] == "smalt-mcp"
     assert body["version"]
-    assert body["scope"] in {"read_only", "read_write"}
+    assert body["scope"] in {"read_only", "read_write", "remove_destructive"}
     assert body["smalt_dir"]
 
 
@@ -143,22 +143,28 @@ def test_mcp_initialize_lists_all_tools(mcp_client: TestClient):
     # Server defaults to read_write scope; every tool (7 read-only + 4
     # read-write) should be listed.
     assert names == {
-        # READ_ONLY
+        # READ_ONLY (9)
         "status",
         "list_pages",
         "read_page",
         "find_by_alias",
+        "incoming_links",
         "traverse",
         "search",
         "list_domains",
         "list_proposals",
-        # READ_WRITE
+        # READ_WRITE (6)
         "bootstrap",
         "write_page",
         "write_pages",
         "write_proposal",
         "add_link",
         "add_claim",
+        # REMOVE_DESTRUCTIVE (4)
+        "remove_page",
+        "update_claim",
+        "remove_claim",
+        "remove_link",
     }
 
 
@@ -1327,3 +1333,482 @@ def test_read_page_unknown_id_or_alias_still_returns_not_found(mcp_client: TestC
     )
     assert result["error"] == "not_found"
     assert result["page_id"] == "ent-truly-missing"
+
+
+# ---------------------------------------------------------------------------
+# Scope-tier filtering (unit-level — exercising the helpers directly)
+
+
+def test_scope_tier_filtering_read_only_hides_higher_tiers():
+    """READ_ONLY scope sees only read_only tools — no write or remove ones."""
+    from smalt_mcp.tools import list_tools
+    from smalt_mcp.permissions import Scope
+
+    names = {t.name for t in list_tools(Scope.READ_ONLY)}
+    assert "status" in names
+    assert "read_page" in names
+    # READ_WRITE tools must be excluded
+    assert "write_page" not in names
+    assert "add_link" not in names
+    # REMOVE_DESTRUCTIVE tools must be excluded
+    assert "remove_page" not in names
+    assert "update_claim" not in names
+
+
+def test_scope_tier_filtering_read_write_hides_remove():
+    """READ_WRITE scope sees read_only + read_write — no remove tools."""
+    from smalt_mcp.tools import list_tools
+    from smalt_mcp.permissions import Scope
+
+    names = {t.name for t in list_tools(Scope.READ_WRITE)}
+    assert "status" in names      # read_only
+    assert "write_page" in names  # read_write
+    assert "remove_page" not in names
+    assert "update_claim" not in names
+    assert "remove_claim" not in names
+    assert "remove_link" not in names
+
+
+def test_scope_tier_filtering_remove_destructive_sees_all():
+    from smalt_mcp.tools import list_tools
+    from smalt_mcp.permissions import Scope
+
+    names = {t.name for t in list_tools(Scope.REMOVE_DESTRUCTIVE)}
+    assert "status" in names
+    assert "write_page" in names
+    assert "remove_page" in names
+    assert "update_claim" in names
+    assert "remove_claim" in names
+    assert "remove_link" in names
+
+
+# ---------------------------------------------------------------------------
+# incoming_links
+
+
+def test_incoming_links_finds_what_links_to_seed_page(mcp_client: TestClient):
+    """The seed Smalt has con-embedding → ent-alice (label: example_of), and
+    con-index → con-embedding (label: built_over). incoming_links on each
+    target should find them."""
+    sid = _initialize(mcp_client)
+    # Pages that link TO ent-alice
+    result = _call_tool(
+        mcp_client, sid, "incoming_links", {"page_id": "ent-alice"}, req_id=600
+    )
+    from_ids = {e["from_id"] for e in result["edges"]}
+    assert "con-embedding" in from_ids
+    # Pages that link TO con-embedding
+    result2 = _call_tool(
+        mcp_client, sid, "incoming_links", {"page_id": "con-embedding"}, req_id=601
+    )
+    from_ids2 = {e["from_id"] for e in result2["edges"]}
+    assert "con-index" in from_ids2
+
+
+def test_incoming_links_filter_by_label(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "incoming_links",
+        {"page_id": "ent-alice", "label": "example_of"},
+        req_id=602,
+    )
+    assert all(e["label"] == "example_of" for e in result["edges"])
+    # Wrong label → empty
+    empty = _call_tool(
+        mcp_client,
+        sid,
+        "incoming_links",
+        {"page_id": "ent-alice", "label": "no_such_label"},
+        req_id=603,
+    )
+    assert empty["count"] == 0
+
+
+def test_incoming_links_unknown_page_returns_empty(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "incoming_links",
+        {"page_id": "ent-nobody-points-here"},
+        req_id=604,
+    )
+    assert result["count"] == 0
+    assert result["edges"] == []
+
+
+# ---------------------------------------------------------------------------
+# remove_page (cascading)
+
+
+def test_remove_page_cascades_links_and_claims(mcp_client: TestClient):
+    """Create a page, link to it from another, add a claim — then remove_page
+    cleans up everything."""
+    sid = _initialize(mcp_client)
+    # Create the page that will be removed.
+    target = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-remove-target", "target")},
+        req_id=700,
+    )
+    target_id = target["id"]
+    # Create another page that links TO it.
+    referrer = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-remove-referrer", "referrer")},
+        req_id=701,
+    )
+    referrer_id = referrer["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": referrer_id, "to_id": target_id, "label": "knows"},
+        req_id=702,
+    )
+    # Add a claim on the target.
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {
+            "page_id": target_id,
+            "claim": {"id": "claim-on-target-1", "text": "fact"},
+        },
+        req_id=703,
+    )
+    # Pre-check: incoming_links sees the inbound edge; read_page works.
+    inc = _call_tool(mcp_client, sid, "incoming_links", {"page_id": target_id}, req_id=704)
+    assert any(e["from_id"] == referrer_id for e in inc["edges"])
+
+    # Now remove
+    result = _call_tool(
+        mcp_client, sid, "remove_page", {"page_id": target_id}, req_id=705
+    )
+    assert result["id"] == target_id
+    assert result["removed"]["embedding"] == 1
+    assert result["removed"]["incoming_links"] >= 1
+    assert result["removed"]["claims"] >= 1
+
+    # Verify: read_page now returns not_found (no exact match, no alias either).
+    r = _call_tool(mcp_client, sid, "read_page", {"page_id": target_id}, req_id=706)
+    assert r["error"] == "not_found"
+    # The referrer's outgoing link is gone from the index too.
+    trav = _call_tool(
+        mcp_client,
+        sid,
+        "traverse",
+        {"from_id": referrer_id, "label": "knows"},
+        req_id=707,
+    )
+    target_ids = {e["to_id"] for e in trav["edges"]}
+    assert target_id not in target_ids
+
+
+def test_remove_page_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_page",
+        {"page_id": "ent-nope-AbCdEfGhIjKlMnOpQrStUv"},
+        req_id=710,
+    )
+    assert result["error"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# update_claim
+
+
+def test_update_claim_replaces_in_place(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    # Set up: a page with a claim.
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-update-claim", "host")},
+        req_id=720,
+    )
+    page_id = page["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {
+            "page_id": page_id,
+            "claim": {"id": "c-1", "text": "v1", "confidence": 0.3},
+        },
+        req_id=721,
+    )
+    # Update it.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "update_claim",
+        {
+            "page_id": page_id,
+            "claim_id": "c-1",
+            "new_claim": {"id": "c-1", "text": "v2", "confidence": 0.9},
+        },
+        req_id=722,
+    )
+    assert result["updated"] is True
+    # Read back: the claim text + confidence changed.
+    read = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=723)
+    claims = read["frontmatter"].get("claims", [])
+    c = next(c for c in claims if c.get("id") == "c-1")
+    assert c["text"] == "v2"
+    assert c["confidence"] == 0.9
+
+
+def test_update_claim_claim_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-update-claim-missing", "host")},
+        req_id=730,
+    )
+    page_id = page["id"]
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "update_claim",
+        {
+            "page_id": page_id,
+            "claim_id": "no-such-claim",
+            "new_claim": {"id": "no-such-claim", "text": "x"},
+        },
+        req_id=731,
+    )
+    assert result["error"] == "claim_not_found"
+
+
+def test_update_claim_id_mismatch_rejected(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-update-mismatch", "host")},
+        req_id=740,
+    )
+    page_id = page["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page_id, "claim": {"id": "c-orig", "text": "x"}},
+        req_id=741,
+    )
+    # new_claim.id != claim_id → rejected
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "update_claim",
+        {
+            "page_id": page_id,
+            "claim_id": "c-orig",
+            "new_claim": {"id": "c-renamed", "text": "x"},
+        },
+        req_id=742,
+    )
+    assert result["error"] == "invalid_argument"
+
+
+# ---------------------------------------------------------------------------
+# remove_claim
+
+
+def test_remove_claim_removes(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-remove-claim", "host")},
+        req_id=750,
+    )
+    page_id = page["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page_id, "claim": {"id": "c-keep", "text": "keep me"}},
+        req_id=751,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_claim",
+        {"page_id": page_id, "claim": {"id": "c-drop", "text": "drop me"}},
+        req_id=752,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_claim",
+        {"page_id": page_id, "claim_id": "c-drop"},
+        req_id=753,
+    )
+    assert result["removed"] is True
+    # Read back: c-keep present, c-drop absent.
+    read = _call_tool(mcp_client, sid, "read_page", {"page_id": page_id}, req_id=754)
+    ids = {c.get("id") for c in read["frontmatter"].get("claims", [])}
+    assert "c-keep" in ids
+    assert "c-drop" not in ids
+
+
+def test_remove_claim_not_found(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    page = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-remove-claim-miss", "host")},
+        req_id=760,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_claim",
+        {"page_id": page["id"], "claim_id": "no-such-claim"},
+        req_id=761,
+    )
+    assert result["error"] == "claim_not_found"
+
+
+# ---------------------------------------------------------------------------
+# remove_link
+
+
+def test_remove_link_with_label_removes_matching_edge(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    # Set up: two pages, two distinct labeled edges between them.
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rmlink-src", "src")},
+        req_id=770,
+    )
+    dst = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rmlink-dst", "dst")},
+        req_id=771,
+    )
+    src_id, dst_id = src["id"], dst["id"]
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src_id, "to_id": dst_id, "label": "knows"},
+        req_id=772,
+    )
+    _call_tool(
+        mcp_client,
+        sid,
+        "add_link",
+        {"from_id": src_id, "to_id": dst_id, "label": "cites"},
+        req_id=773,
+    )
+    # Remove only the `knows` edge.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_link",
+        {"from_id": src_id, "to_id": dst_id, "label": "knows"},
+        req_id=774,
+    )
+    assert result["removed"] == 1
+    # `cites` survives.
+    trav = _call_tool(
+        mcp_client, sid, "traverse", {"from_id": src_id}, req_id=775
+    )
+    labels = {e["label"] for e in trav["edges"] if e["to_id"] == dst_id}
+    assert "cites" in labels
+    assert "knows" not in labels
+
+
+def test_remove_link_without_label_removes_all_between_pair(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rmlink-allsrc", "src")},
+        req_id=780,
+    )
+    dst = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rmlink-alldst", "dst")},
+        req_id=781,
+    )
+    src_id, dst_id = src["id"], dst["id"]
+    for lbl in ("a", "b", "c"):
+        _call_tool(
+            mcp_client,
+            sid,
+            "add_link",
+            {"from_id": src_id, "to_id": dst_id, "label": lbl},
+            req_id=782,
+        )
+    # Remove ALL edges from src → dst regardless of label.
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_link",
+        {"from_id": src_id, "to_id": dst_id},
+        req_id=783,
+    )
+    assert result["removed"] == 3
+    trav = _call_tool(mcp_client, sid, "traverse", {"from_id": src_id}, req_id=784)
+    assert all(e["to_id"] != dst_id for e in trav["edges"])
+
+
+def test_remove_link_no_match_returns_zero(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    src = _call_tool(
+        mcp_client,
+        sid,
+        "write_page",
+        {"frontmatter": _ent_fm("ent-rmlink-nomatch", "src")},
+        req_id=790,
+    )
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_link",
+        {"from_id": src["id"], "to_id": "ent-never-linked", "label": "x"},
+        req_id=791,
+    )
+    assert result["removed"] == 0
+    assert result.get("reason") == "no_matching_link"
+
+
+def test_remove_link_unknown_from_page(mcp_client: TestClient):
+    sid = _initialize(mcp_client)
+    result = _call_tool(
+        mcp_client,
+        sid,
+        "remove_link",
+        {
+            "from_id": "ent-no-such-page-AbCdEfGhIjKlMnOpQrStUv",
+            "to_id": "ent-target",
+        },
+        req_id=795,
+    )
+    assert result["error"] == "not_found"
