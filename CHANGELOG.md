@@ -23,6 +23,12 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v1.3.0] - 2026-06-14
+
+### Highlights
+
+This release adds an automated changelog and GitHub Release generation step to the tag-push workflow, producing a CHANGELOG.md section (LLM-written highlights paragraph plus a git-cliff categorized commit list) and publishing it as the GitHub Release body. CHANGELOG.md has been backfilled for all prior tags from v0.1.0 through v1.2.0, and the README now documents the changelog job and the Conventional Commit convention it relies on. The workflow requires an org-level ANTHROPIC_API_KEY secret, and falls back to a placeholder paragraph if it is unset.
+
 ## [v1.2.0] - 2026-05-18
 
 ### Highlights
