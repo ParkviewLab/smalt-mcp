@@ -29,6 +29,16 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v1.3.1] - 2026-06-15
+
+### Highlights
+
+This is a maintenance release that aligns smalt-mcp with ParkviewLab's handbook conventions, with no behavioural changes. The license moves from MIT to a dual `MIT OR Apache-2.0` arrangement, with dual LICENSE files, per-file SPDX headers, a REUSE.toml, and updated README and LICENSING.md. Internally, CI workflows for reuse, version-guard, test, license-check, and a dormant dev-release were added, ruff and ty replaced the prior lint/type setup, and the test suite (217 tests) remains green.
+
+### Docs
+
+- V1.3.0 [skip ci] (8941151)
+
 ## [v1.3.0] - 2026-06-14
 
 ### Highlights
