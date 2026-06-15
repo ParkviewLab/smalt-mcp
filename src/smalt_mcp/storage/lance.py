@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """LanceDB connection + table-creation helpers.
 
 This module *creates* the empty tables and exposes a connection helper plus
@@ -235,14 +239,10 @@ def upsert_embeddings(db: lancedb.DBConnection, rows: list[dict[str, Any]]) -> N
     if not rows:
         return
     table = _open_table(db, TABLE_EMBEDDINGS)
-    table.merge_insert("page_id").when_matched_update_all().when_not_matched_insert_all().execute(
-        rows
-    )
+    table.merge_insert("page_id").when_matched_update_all().when_not_matched_insert_all().execute(rows)
 
 
-def replace_links_for_page(
-    db: lancedb.DBConnection, page_id: str, rows: list[dict[str, Any]]
-) -> None:
+def replace_links_for_page(db: lancedb.DBConnection, page_id: str, rows: list[dict[str, Any]]) -> None:
     """Replace all outgoing links from a single page.
 
     Links are page-owned; when a page is re-indexed we drop its old links
@@ -254,9 +254,7 @@ def replace_links_for_page(
         table.add(rows)
 
 
-def replace_claims_for_page(
-    db: lancedb.DBConnection, page_id: str, rows: list[dict[str, Any]]
-) -> None:
+def replace_claims_for_page(db: lancedb.DBConnection, page_id: str, rows: list[dict[str, Any]]) -> None:
     """Replace all claims attached to a single page (same rationale as links)."""
     table = _open_table(db, TABLE_CLAIMS)
     table.delete(f"page_id = {sql_str(page_id)}")
@@ -340,7 +338,7 @@ def create_or_refresh_fts(db: lancedb.DBConnection, *, replace: bool = True) -> 
         try:
             table.create_fts_index(field, replace=replace)
             status[field] = {"status": "ok", "error": None}
-        except Exception as e:  # noqa: BLE001 — capture per-field for /admin/health surfacing
+        except Exception as e:
             status[field] = {"status": "failed", "error": _short_lance_error(e)}
     return status
 
@@ -379,7 +377,7 @@ def create_or_refresh_vector_index(
     try:
         table.create_index(**kwargs)
         return {"status": "ok", "error": None, "reason": None}
-    except Exception as e:  # noqa: BLE001 — capture for /admin/health surfacing
+    except Exception as e:
         return {
             "status": "failed",
             "error": _short_lance_error(e),

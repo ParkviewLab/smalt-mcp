@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Read and parse markdown pages with YAML frontmatter.
 
 Each page in `smalt/pages/<type>/<id>.md` has a YAML frontmatter block delimited

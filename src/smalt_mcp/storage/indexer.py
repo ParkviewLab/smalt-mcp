@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """The indexer: markdown corpus → LanceDB.
 
 Walks `smalt/pages/`, parses every markdown file's YAML frontmatter, validates
@@ -62,7 +66,7 @@ EMBED_BODY_CHAR_BUDGET = 2000
 # disk; this constant is just the bootstrap-time defaults.
 _CANONICAL_INDEX_PAGES: tuple[tuple[str, str, str, str], ...] = (
     ("glossary.md", "idx-glossary", "Glossary", "glossary"),
-    ("domains.md",  "idx-domains",  "Domains",  "is_domain"),
+    ("domains.md", "idx-domains", "Domains", "is_domain"),
 )
 
 
@@ -354,7 +358,7 @@ class Indexer:
         """
         try:
             result.fts_status = lance.create_or_refresh_fts(self.db)
-        except Exception as e:  # noqa: BLE001 — defensive; lance helper is supposed to capture per-field
+        except Exception as e:
             logger.warning("FTS index refresh raised unexpectedly: %s", e)
             result.fts_status = {
                 "_call": {
@@ -364,7 +368,7 @@ class Indexer:
             }
         try:
             result.vector_status = lance.create_or_refresh_vector_index(self.db)
-        except Exception as e:  # noqa: BLE001 — same defensive shape as above
+        except Exception as e:
             logger.warning("Vector index refresh raised unexpectedly: %s", e)
             result.vector_status = {
                 "status": "failed",
@@ -428,7 +432,7 @@ class Indexer:
             .where(f"type = {lance.sql_str('concept')}")
             .select(["id", "title", "body", "frontmatter_json"])
             .limit(100_000)  # honest cap; if a Smalt has >100k concept pages, IndexPages
-                              # need a different rendering strategy than "every entry inline"
+            # need a different rendering strategy than "every entry inline"
             .to_arrow()
         )
 

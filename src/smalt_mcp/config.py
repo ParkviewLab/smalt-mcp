@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Static configuration. Pure leaf module — no internal imports.
 
 Env-driven, mirroring the deco-assaying pattern. One `Config` dataclass with
@@ -9,7 +13,7 @@ unchanged from the ported code.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -47,7 +51,7 @@ class Config:
     """Runtime config bundle. Construct once at startup; pass to everything that needs it."""
 
     smalt_dir: Path
-    embedding: EmbeddingConfig = field(default=None)  # type: ignore[assignment]
+    embedding: EmbeddingConfig
     # E-2 (concurrency): max worker threads in the asyncio loop's
     # default `ThreadPoolExecutor`. Bounds the number of concurrent
     # handler executions (each `asyncio.to_thread` call takes one
@@ -63,9 +67,7 @@ def load_config() -> Config:
         model=os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         dim=int(os.environ.get("EMBEDDING_DIM", "384")),
     )
-    thread_pool_workers = int(
-        os.environ.get("SMALT_THREAD_POOL_WORKERS", str(_DEFAULT_THREAD_POOL_WORKERS))
-    )
+    thread_pool_workers = int(os.environ.get("SMALT_THREAD_POOL_WORKERS", str(_DEFAULT_THREAD_POOL_WORKERS)))
     if thread_pool_workers <= 0:
         thread_pool_workers = _DEFAULT_THREAD_POOL_WORKERS
     return Config(

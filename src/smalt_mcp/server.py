@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """FastAPI app construction + MCP server wiring + lifespan.
 
 Mounts a Streamable-HTTP MCP transport at `/sse` (same pattern as deco-assaying).
@@ -87,14 +91,12 @@ async def list_tools() -> list[types.Tool]:
 @mcp.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     try:
-        result = await tools_module.dispatch(
-            name, arguments, app=_app_instance, scope=_SERVER_SCOPE
-        )
+        result = await tools_module.dispatch(name, arguments, app=_app_instance, scope=_SERVER_SCOPE)
     except KeyError as e:
         return _ok({"error": "unknown_tool", "message": str(e)})
     except PermissionError as e:
         return _ok({"error": "forbidden", "message": str(e)})
-    except Exception as e:  # noqa: BLE001 — surface the error to the LLM as a tool_result
+    except Exception as e:
         logger.exception("tool %s raised", name)
         return _ok({"error": "tool_error", "message": str(e), "type": type(e).__name__})
     return _ok(result)
@@ -155,11 +157,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _app_instance.smalt_exists():
         try:
             _app_instance.db()
-        except Exception as e:  # noqa: BLE001 — startup-time pre-warm
+        except Exception as e:
             uvlog.warning("eager db() init failed (will retry on first request): %s", e)
     try:
         _app_instance.embedder()
-    except Exception as e:  # noqa: BLE001 — startup-time pre-warm
+    except Exception as e:
         uvlog.warning("eager embedder() init failed (will retry on first request): %s", e)
 
     # C-13: start the async-task scheduler's GC loop. Shutdown is
