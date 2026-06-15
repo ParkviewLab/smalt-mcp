@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # smalt-mcp
 
 MCP server wrapping the **Smalt**'s storage surface (read / write / link / claim / search) for ParkviewLab's [CoGrind](https://github.com/ParkviewLab/cobalt-grinding) project. Thinnest viable wrapper around markdown + LanceDB; no agentic logic. Single-writer to a given Smalt.
@@ -172,4 +178,18 @@ Squash-merge PRs use the PR title as the commit subject — so the **PR title** 
 
 ## License
 
-MIT. See `LICENSE`.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>), or
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option. In SPDX terms: `MIT OR Apache-2.0`.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you shall be dual-licensed as above, without any
+additional terms or conditions. See [LICENSING.md](LICENSING.md).
+
+---
+<sub>© 2026 Gary Frattarola · Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) · part of [ParkviewLab](https://github.com/ParkviewLab)</sub>

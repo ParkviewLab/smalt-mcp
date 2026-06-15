@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Shared-resource bundle for the running smalt-mcp server.
 
 One `App` instance is constructed at startup (in `server.lifespan`) and made
@@ -212,7 +216,7 @@ class App:
                         continue
                     try:
                         tables[name] = {"row_count": db.open_table(name).count_rows()}
-                    except Exception as e:  # noqa: BLE001 — surface, don't crash status
+                    except Exception as e:
                         tables[name] = {"row_count": None, "error": f"{type(e).__name__}: {e}"}
             except FileNotFoundError:
                 # Smalt dir exists but index/lance/ doesn't — pre-bootstrap.

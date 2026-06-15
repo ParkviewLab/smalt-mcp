@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Pydantic models for the page frontmatter schema.
 
 These are the canonical types for everything that lives in `smalt/pages/`.
@@ -60,9 +64,7 @@ _SECTION_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 Same alphabet as slug ids plus dots — for real filename extensions."""
 
 _WINDOWS_RESERVED: frozenset[str] = frozenset(
-    {"con", "prn", "aux", "nul"}
-    | {f"com{i}" for i in range(1, 10)}
-    | {f"lpt{i}" for i in range(1, 10)}
+    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
 )
 
 
@@ -91,9 +93,7 @@ def _validate_slug_id(value: str) -> str:
             f"alphanumeric / underscore / hyphen body, 1..254 chars; got {value!r}"
         )
     if value.lower() in _WINDOWS_RESERVED:
-        raise ValueError(
-            f"id {value!r} is a Windows-reserved filename; pick a different slug"
-        )
+        raise ValueError(f"id {value!r} is a Windows-reserved filename; pick a different slug")
     return value
 
 
@@ -111,9 +111,7 @@ def _validate_section_id(value: str) -> str:
             f"headroom for the .md extension on disk); got {value!r}"
         )
     if value.count("::") != 1:
-        raise ValueError(
-            f"section id must contain exactly one '::' separator; got {value!r}"
-        )
+        raise ValueError(f"section id must contain exactly one '::' separator; got {value!r}")
 
     source_id, rel_path = value.split("::", 1)
 
@@ -121,15 +119,11 @@ def _validate_section_id(value: str) -> str:
     try:
         _validate_slug_id(source_id)
     except ValueError as e:
-        raise ValueError(
-            f"section id source-id part {source_id!r} is invalid: {e}"
-        ) from e
+        raise ValueError(f"section id source-id part {source_id!r} is invalid: {e}") from e
 
     # Rel-path part: non-empty, no leading slash, components valid.
     if not rel_path:
-        raise ValueError(
-            f"section id rel-path (after '::') must be non-empty; got {value!r}"
-        )
+        raise ValueError(f"section id rel-path (after '::') must be non-empty; got {value!r}")
     if rel_path.startswith("/"):
         raise ValueError(
             f"section id rel-path must not start with '/' (absolute paths "
@@ -139,14 +133,9 @@ def _validate_section_id(value: str) -> str:
     components = rel_path.split("/")
     for comp in components:
         if not comp:
-            raise ValueError(
-                f"section id rel-path must not contain '//' (empty component); got {value!r}"
-            )
+            raise ValueError(f"section id rel-path must not contain '//' (empty component); got {value!r}")
         if comp in (".", ".."):
-            raise ValueError(
-                f"section id rel-path must not contain '{comp}' (path traversal); "
-                f"got {value!r}"
-            )
+            raise ValueError(f"section id rel-path must not contain '{comp}' (path traversal); got {value!r}")
         if not _SECTION_PATH_COMPONENT_RE.match(comp):
             raise ValueError(
                 f"section id rel-path component {comp!r} contains disallowed "
@@ -164,6 +153,7 @@ def _validate_section_id(value: str) -> str:
 
     return value
 
+
 # ---- enums ----
 
 
@@ -174,7 +164,7 @@ class PageType(StrEnum):
     CONCEPT = "concept"
     SOURCE = "source"
     SYNTHESIS = "synthesis"  # cross-source pages, written by Cogitate (Phase 2)
-    INDEX = "index"          # auto-generated index pages (glossary, domains, ...); see IndexPage
+    INDEX = "index"  # auto-generated index pages (glossary, domains, ...); see IndexPage
 
 
 class LocationKind(StrEnum):
@@ -260,6 +250,7 @@ class PageBase(BaseModel):
     @classmethod
     def _check_id(cls, v: str) -> str:
         return _validate_id(v)
+
     aliases: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 

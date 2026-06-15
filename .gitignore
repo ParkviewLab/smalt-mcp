@@ -17,7 +17,6 @@ dist/
 
 # venv / uv
 .venv/
-.python-version
 
 # IDE
 .vscode/

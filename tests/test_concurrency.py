@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Concurrency assertions for the MCP server (Workstream E).
 
 Separated from `test_server.py` because it uses a different test
@@ -36,7 +40,6 @@ import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
-
 
 # ---- session-scoped ASGI app + smalt setup ----
 #
@@ -122,6 +125,7 @@ Computer Science is a seed domain ConceptPage.
     # Force a re-import in case a previous test module already imported it
     # against a different smalt_dir.
     import importlib
+
     import smalt_mcp.server as server_mod
 
     importlib.reload(server_mod)
@@ -154,9 +158,7 @@ async def async_client(_concurrency_app) -> AsyncIterator[AsyncClient]:
 
 
 @contextlib.contextmanager
-def _swap_tool_handler(
-    tool_name: str, new_sync_fn: Callable[..., dict[str, Any]]
-):
+def _swap_tool_handler(tool_name: str, new_sync_fn: Callable[..., dict[str, Any]]):
     """Temporarily replace a tool's handler with one wrapping `new_sync_fn`
     via `_wrap_sync_in_thread`. Restores the original on exit.
 
@@ -252,10 +254,10 @@ async def _call_tool(
 @pytest.mark.asyncio
 async def test_e2_concurrent_reads_run_in_parallel(async_client):
     """Three concurrent `search` MCP requests complete in wall-clock
-    time substantially less than 3× single-call latency.
+    time substantially less than 3x single-call latency.
 
     Sync function sleeps 0.3s; sequential = 0.9s, parallel ≈ 0.3s.
-    Bound: wall-clock < 0.9s × 0.7 = 0.63s (parallelism factor ≥ ~1.4×).
+    Bound: wall-clock < 0.9s x 0.7 = 0.63s (parallelism factor ≥ ~1.4x).
     Real-world parallelism is much higher (~0.3s actual) but the
     ceiling gives slack for thread-pool warmup + httpx + MCP overhead.
     """
@@ -282,7 +284,7 @@ async def test_e2_concurrent_reads_run_in_parallel(async_client):
     assert all(r.get("_concurrency_test") is True for r in results)
     assert elapsed < 0.9 * 0.7, (
         f"3 concurrent searches took {elapsed:.3f}s wall-clock; "
-        f"expected <{0.9 * 0.7:.3f}s (parallelism factor ≥ 1.4×). "
+        f"expected <{0.9 * 0.7:.3f}s (parallelism factor ≥ 1.4x). "
         "Event loop is likely blocked on sync work — to_thread wrap missing."
     )
 
@@ -297,12 +299,14 @@ async def test_e2_event_loop_not_blocked_during_slow_read(async_client):
     requests run concurrently — status returns in <100ms while
     search is still sleeping.
     """
+
     def _slow_search(app, arguments):
         time.sleep(0.5)
         return {"results": [], "count": 0}
 
     with _swap_tool_handler("search", _slow_search):
         sid = await _mcp_init(async_client)
+
         # Fire both in parallel via gather. The slow one is search;
         # status is fast. asyncio.gather collects both. If the loop
         # is blocked, both serialize and total elapsed is ~0.5s.
@@ -407,12 +411,16 @@ async def test_e3_writes_serialize_at_mutex(async_client):
         sid = await _mcp_init(async_client)
         results = await asyncio.gather(
             _call_tool(
-                async_client, sid, "write_page",
+                async_client,
+                sid,
+                "write_page",
                 {"frontmatter": {"id": "ent-e3-a", "type": "entity", "title": "A", "entity_kind": "test"}},
                 req_id=301,
             ),
             _call_tool(
-                async_client, sid, "write_page",
+                async_client,
+                sid,
+                "write_page",
                 {"frontmatter": {"id": "ent-e3-b", "type": "entity", "title": "B", "entity_kind": "test"}},
                 req_id=302,
             ),
@@ -448,15 +456,23 @@ async def test_e3_read_overlaps_with_in_flight_write(async_client):
     def _fast_search(app, arguments):
         return {"results": [], "count": 0, "_overlap_test": True}
 
-    with _swap_tool_handler("write_page", _slow_write_page), \
-         _swap_tool_handler("search", _fast_search):
+    with _swap_tool_handler("write_page", _slow_write_page), _swap_tool_handler("search", _fast_search):
         sid = await _mcp_init(async_client)
         # Start the write; wait for it to actually acquire the mutex
         # (so we know the search runs DURING the write, not before).
         write_task = asyncio.create_task(
             _call_tool(
-                async_client, sid, "write_page",
-                {"frontmatter": {"id": "ent-e3-overlap", "type": "entity", "title": "x", "entity_kind": "test"}},
+                async_client,
+                sid,
+                "write_page",
+                {
+                    "frontmatter": {
+                        "id": "ent-e3-overlap",
+                        "type": "entity",
+                        "title": "x",
+                        "entity_kind": "test",
+                    }
+                },
                 req_id=311,
             )
         )
@@ -489,6 +505,7 @@ async def test_e3_mutex_contention_counters_advance(async_client):
     """After two concurrent writes serialize on the mutex,
     `index_status.mutex.acquire_count` advances by at least 2 and
     `mean_wait_ms` is > 0 (the second write actually waited)."""
+
     def _slow_write_page(app, arguments):
         with app.mutex.acquire("e3_test_contention"):
             time.sleep(0.15)
@@ -503,13 +520,31 @@ async def test_e3_mutex_contention_counters_advance(async_client):
 
         await asyncio.gather(
             _call_tool(
-                async_client, sid, "write_page",
-                {"frontmatter": {"id": "ent-e3-ctn-a", "type": "entity", "title": "A", "entity_kind": "test"}},
+                async_client,
+                sid,
+                "write_page",
+                {
+                    "frontmatter": {
+                        "id": "ent-e3-ctn-a",
+                        "type": "entity",
+                        "title": "A",
+                        "entity_kind": "test",
+                    }
+                },
                 req_id=321,
             ),
             _call_tool(
-                async_client, sid, "write_page",
-                {"frontmatter": {"id": "ent-e3-ctn-b", "type": "entity", "title": "B", "entity_kind": "test"}},
+                async_client,
+                sid,
+                "write_page",
+                {
+                    "frontmatter": {
+                        "id": "ent-e3-ctn-b",
+                        "type": "entity",
+                        "title": "B",
+                        "entity_kind": "test",
+                    }
+                },
                 req_id=322,
             ),
         )
