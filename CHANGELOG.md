@@ -29,6 +29,20 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v1.3.2] - 2026-06-15
+
+### Highlights
+
+This is a security maintenance release that floors the starlette dependency to >=1.0.1 to address GHSA-86qp-5c8j-p5mr, a Host-header validation issue in the previously unconstrained 1.0.0 resolution.
+
+### Bug fixes
+
+- Floor starlette>=1.0.1 (GHSA-86qp-5c8j-p5mr) (#43) (770d64c)
+
+### Docs
+
+- V1.3.1 [skip ci] (1bbe671)
+
 ## [v1.3.1] - 2026-06-15
 
 ### Highlights
