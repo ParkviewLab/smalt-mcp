@@ -1272,7 +1272,7 @@ wheels = [
 
 [[package]]
 name = "smalt-mcp"
-version = "1.3.2"
+version = "1.3.3.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
