@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """In-process async task scheduler for long-running operations (C-13).
 
 Heavy operations (`reindex_all`, future large batch writes) enqueue an
@@ -48,13 +52,13 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-class TaskState(str, Enum):
+class TaskState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -146,6 +150,12 @@ class Task:
         }
 
 
+# Module-scope alias for the `Scheduler.list` return annotation. Inside the
+# class body `list` would resolve to the `list` *method*, not the builtin, so
+# `-> list[Task]` is ambiguous; this alias names the builtin unambiguously.
+type TaskList = list[Task]
+
+
 class Scheduler:
     """In-process scheduler.
 
@@ -174,9 +184,7 @@ class Scheduler:
         """
         task = Task(id=_new_task_id(), kind=kind)
         self._tasks[task.id] = task
-        task._asyncio_task = asyncio.create_task(
-            self._runner(task, work), name=f"task-{task.id}"
-        )
+        task._asyncio_task = asyncio.create_task(self._runner(task, work), name=f"task-{task.id}")
         return task
 
     async def _runner(self, task: Task, work: WorkFn) -> None:
@@ -200,7 +208,7 @@ class Scheduler:
             task.state = TaskState.CANCELLED
             # Don't re-raise — let the asyncio task end cleanly so the
             # event loop doesn't log a CancelledError traceback.
-        except Exception as e:  # noqa: BLE001 — capture every failure
+        except Exception as e:
             task.state = TaskState.FAILED
             task.error = f"{type(e).__name__}: {e}"
             logger.exception("scheduled task %s (%s) failed", task.id, task.kind)
@@ -216,7 +224,7 @@ class Scheduler:
         state: TaskState | None = None,
         kind: str | None = None,
         limit: int = 100,
-    ) -> list[Task]:
+    ) -> TaskList:
         """List tasks, most-recent first, optionally filtered.
 
         `limit` is applied AFTER filtering — so `state=SUCCEEDED,

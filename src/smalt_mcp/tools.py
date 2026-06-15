@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Tool specs + dispatch.
 
 Each tool is registered as a `ToolDef` with its MCP spec (name, description,
@@ -23,7 +27,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import frontmatter
 from mcp import types
@@ -118,7 +122,7 @@ class ToolDef:
 
 
 def _wrap_sync_in_thread(
-    sync_fn: Callable[["App", dict[str, Any]], dict[str, Any]],
+    sync_fn: Callable[[App, dict[str, Any]], dict[str, Any]],
 ) -> Handler:
     """Turn a sync handler `(app, arguments) -> dict` into an async
     handler that runs the work in the asyncio loop's default
@@ -134,7 +138,7 @@ def _wrap_sync_in_thread(
     """
 
     @functools.wraps(sync_fn)
-    async def wrapper(app: "App", arguments: dict[str, Any]) -> dict[str, Any]:
+    async def wrapper(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(sync_fn, app, arguments)
 
     return wrapper
@@ -144,18 +148,24 @@ def _wrap_sync_in_thread(
 
 
 def _not_initialized() -> dict[str, Any]:
-    return {"error": "smalt_not_initialized", "message": "Smalt directory or LanceDB tables not present; bootstrap first."}
+    return {
+        "error": "smalt_not_initialized",
+        "message": "Smalt directory or LanceDB tables not present; bootstrap first.",
+    }
 
 
-def _ensure_initialized(app: App) -> tuple[bool, dict[str, Any] | None]:
-    """Return (ok, error_payload). Use as: `ok, err = _ensure_initialized(app); if not ok: return err`."""
+def _ensure_initialized(app: App) -> dict[str, Any] | None:
+    """Return an error payload if the Smalt isn't initialized, else `None`.
+
+    Use as: `err = _ensure_initialized(app); if err is not None: return err`.
+    """
     if not app.smalt_exists():
-        return False, _not_initialized()
+        return _not_initialized()
     try:
         app.db()
     except FileNotFoundError:
-        return False, _not_initialized()
-    return True, None
+        return _not_initialized()
+    return None
 
 
 def _serialize_and_write_page(target: Path, fm_dict: dict[str, Any], body: str) -> None:
@@ -237,14 +247,16 @@ def _run_indexer(app: App) -> dict[str, Any]:
 # column) sets up the perf foundation; some of these filters may migrate
 # to LanceDB-native predicates in later C PRs once the column work lands.
 
-_PROPERTY_FILTER_ARGS: frozenset[str] = frozenset({
-    "glossary",
-    "is_domain",
-    "domain",
-    "fetched_at_before",
-    "fetched_at_after",
-    "has_aliases_containing",
-})
+_PROPERTY_FILTER_ARGS: frozenset[str] = frozenset(
+    {
+        "glossary",
+        "is_domain",
+        "domain",
+        "fetched_at_before",
+        "fetched_at_after",
+        "has_aliases_containing",
+    }
+)
 
 
 def _has_property_filters(args: dict[str, Any]) -> bool:
@@ -439,9 +451,9 @@ def list_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     `fetched_at_before`, `fetched_at_after`, `has_aliases_containing`,
     client-side post-fetch). All filters AND-composed; `limit` applies to the
     final filtered set."""
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     type_filter = arguments.get("type")
     prefix = arguments.get("prefix")
@@ -556,11 +568,7 @@ def _find_pages_by_alias_legacy_scan(app: App, alias: str) -> list[dict[str, Any
     `_find_pages_by_alias`."""
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
-    arrow = (
-        pages.search()
-        .select(["id", "title", "type", "path", "frontmatter_json"])
-        .to_arrow()
-    )
+    arrow = pages.search().select(["id", "title", "type", "path", "frontmatter_json"]).to_arrow()
     matches: list[dict[str, Any]] = []
     for i in range(arrow.num_rows):
         fm_raw = arrow.column("frontmatter_json")[i].as_py()
@@ -632,9 +640,9 @@ def read_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
          - Zero matches → `{error: 'not_found', page_id: ..., fuzzy: true}`
            (the `fuzzy: true` here signals we tried but didn't find).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     if not page_id:
@@ -724,9 +732,9 @@ def find_by_alias(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
          page). Top-level `fuzzy: true` flags the fallback fired.
       3. If still zero, return `count: 0` (no error).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     alias = arguments.get("alias")
     if not alias:
@@ -787,9 +795,9 @@ def traverse(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     Each hop's outgoing-edge query is capped at `_PER_HOP_EDGE_LIMIT` (1000)
     rows; if a hop hits the cap, the response sets `truncated: true`.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     from_id = arguments.get("from_id")
     if not from_id:
@@ -878,9 +886,9 @@ def incoming_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     page silently drops all incoming references; this tool lets the caller
     see them first).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     if not page_id:
@@ -962,16 +970,8 @@ def _find_alias_matches(app: App, query: str) -> list[str]:
     if not needles:
         return []
     # OR together one array_has predicate per needle.
-    where = " OR ".join(
-        f"array_has(aliases, {lance.sql_str(n)})" for n in needles
-    )
-    arrow = (
-        pages.search()
-        .where(where)
-        .select(["id"])
-        .limit(10_000)
-        .to_arrow()
-    )
+    where = " OR ".join(f"array_has(aliases, {lance.sql_str(n)})" for n in needles)
+    arrow = pages.search().where(where).select(["id"]).limit(10_000).to_arrow()
     return arrow.column("id").to_pylist()
 
 
@@ -980,11 +980,7 @@ def _find_alias_matches_legacy_scan(app: App, query: str) -> list[str]:
     `_find_pages_by_alias_legacy_scan` for the rationale."""
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
-    arrow = (
-        pages.search()
-        .select(["id", "frontmatter_json"])
-        .to_arrow()
-    )
+    arrow = pages.search().select(["id", "frontmatter_json"]).to_arrow()
     needles: set[str] = {query}
     needles.update(t.strip() for t in query.split() if t.strip())
     matches: list[str] = []
@@ -1071,7 +1067,7 @@ def _trigram_set(s: str) -> set[str]:
 
 
 def _jaccard_trigram(a: str, b: str) -> float:
-    """Trigram-set Jaccard similarity: |A ∩ B| / |A ∪ B|.
+    """Trigram-set Jaccard similarity: |A intersect B| / |A union B|.
 
     Returns 0.0 if either operand's trigram set is empty (string < 3
     chars) or if both are empty (so the union is empty too).
@@ -1096,7 +1092,7 @@ def _find_pages_by_alias_fuzzy(
       - `fuzzy_score`: float in [threshold, 1.0], the alias's best score
       - `matched_alias`: the alias string that scored highest for this page
 
-    Implementation note: O(N pages × M aliases per page) score evaluations.
+    Implementation note: O(N pages x M aliases per page) score evaluations.
     Acceptable at hundreds-to-low-thousands of pages — at our current
     scale a 1k-page Smalt with ~3 aliases per page scores in ms. If this
     becomes a bottleneck, materialize a trigram inverted index (separate
@@ -1107,9 +1103,7 @@ def _find_pages_by_alias_fuzzy(
     (deterministic; doesn't depend on scan order, so callers see a
     stable list across runs).
     """
-    threshold = (
-        threshold if threshold is not None else _fuzzy_alias_threshold()
-    )
+    threshold = threshold if threshold is not None else _fuzzy_alias_threshold()
     query_set = _trigram_set(query)
     if not query_set:
         return []
@@ -1178,9 +1172,9 @@ def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     of which some happen to pass." When filters are set, the retrieval
     over-fetches further to keep the post-filter candidate pool deep.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     query = arguments.get("query")
     if not query:
@@ -1196,7 +1190,7 @@ def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     # post-filter pool stays deep enough to fill top_k.
     fetch_k = max(top_k * 3, top_k + 5)
     if has_props:
-        fetch_k = max(fetch_k * 5, 100)  # 5× extra room for filter dropoff
+        fetch_k = max(fetch_k * 5, 100)  # 5x extra room for filter dropoff
 
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
@@ -1205,14 +1199,9 @@ def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     # have one for each — search uses whichever the table considers primary).
     fts_ids: list[str] = []
     try:
-        fts_arrow = (
-            pages.search(query, query_type="fts")
-            .select(["id"])
-            .limit(fetch_k)
-            .to_arrow()
-        )
+        fts_arrow = pages.search(query, query_type="fts").select(["id"]).limit(fetch_k).to_arrow()
         fts_ids = fts_arrow.column("id").to_pylist()
-    except Exception as e:  # noqa: BLE001 — FTS index might not be built yet
+    except Exception as e:
         logger.info("FTS search unavailable (%s); falling back to vector-only", e)
 
     # Vector over embeddings table; pull page_ids ranked by similarity.
@@ -1220,10 +1209,7 @@ def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     embs = db.open_table(lance.TABLE_EMBEDDINGS)
     try:
         vec_arrow = (
-            embs.search(vec, vector_column_name="vector")
-            .select(["page_id"])
-            .limit(fetch_k)
-            .to_arrow()
+            embs.search(vec, vector_column_name="vector").select(["page_id"]).limit(fetch_k).to_arrow()
         )
         vec_ids = vec_arrow.column("page_id").to_pylist()
     except Exception as e:
@@ -1245,10 +1231,7 @@ def search(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     # pool (not just top_k) so we have enough rows to apply the filter
     # and still fill top_k. Cap the hydration set at fetch_k to bound the
     # IN-clause + parse cost.
-    if has_props:
-        candidate_pool = fused[:fetch_k]
-    else:
-        candidate_pool = fused[:top_k]
+    candidate_pool = fused[:fetch_k] if has_props else fused[:top_k]
     candidate_ids = [pid for pid, _ in candidate_pool]
 
     if not candidate_ids:
@@ -1321,9 +1304,9 @@ def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     response. Use `traverse(from_id=<domain>, label='subdomain_of')` to walk
     the hierarchy.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
@@ -1369,7 +1352,7 @@ def list_domains(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # Type filter: optional list of page-type strings (e.g.
 # `types: ["source"]`) restricts results to those types. Filtering
 # happens client-side after the vector hit list comes back from
-# LanceDB (over-fetched 5× to preserve depth post-filter); the
+# LanceDB (over-fetched 5x to preserve depth post-filter); the
 # `embeddings` table doesn't carry a type column.
 
 
@@ -1395,9 +1378,9 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
       - `vector_search_failed` if LanceDB raises mid-search (rare;
         usually means the ANN index is in a bad state).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     source_id = arguments.get("source_id")
     if not source_id:
@@ -1426,10 +1409,7 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         if unknown:
             return {
                 "error": "invalid_argument",
-                "message": (
-                    f"unknown page type(s): {unknown!r}; "
-                    f"valid: {sorted(valid_types)}"
-                ),
+                "message": (f"unknown page type(s): {unknown!r}; valid: {sorted(valid_types)}"),
             }
 
     db = app.db()
@@ -1454,7 +1434,7 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         }
     query_vec = src_arrow.column("vector")[0].as_py()
 
-    # 2. Over-fetch by 5× when filtering by type so the post-filter pool
+    # 2. Over-fetch by 5x when filtering by type so the post-filter pool
     # stays deep enough to fill top_k. +1 to cover the self-exclusion. The
     # `page_id != source_id` predicate runs at the LanceDB layer so the
     # source row never even appears in the hit list — `+1` is here for
@@ -1471,7 +1451,7 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             .limit(fetch_k)
             .to_arrow()
         )
-    except Exception as e:  # noqa: BLE001 — surface a clean error to the caller
+    except Exception as e:
         return {
             "error": "vector_search_failed",
             "source_id": source_id,
@@ -1520,7 +1500,9 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     # 4. Walk hit_ids in vector-search rank order (already cosine-sorted
     # by LanceDB), applying the optional type filter, until `top_k` results
     # accumulate or the pool is exhausted.
-    type_set: set[str] | None = set(types) if types else None
+    # `types` was validated as a list[str] above (the `all(isinstance(t, str))`
+    # guard); cast restores that element type for the type checker.
+    type_set: set[str] | None = set(cast("list[str]", types)) if types else None
     results: list[dict[str, Any]] = []
     for pid in hit_ids:
         meta = meta_by_id.get(pid)
@@ -1547,11 +1529,7 @@ def source_similarity(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         if len(results) >= top_k:
             break
 
-    truncated = (
-        types is not None
-        and len(results) < top_k
-        and hit_arrow.num_rows >= fetch_k
-    )
+    truncated = types is not None and len(results) < top_k and hit_arrow.num_rows >= fetch_k
     return {
         "source_id": source_id,
         "results": results,
@@ -1592,9 +1570,9 @@ def task_status(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     Errors: `not_found` if `task_id` is unknown — could mean the id
     never existed or the task was GC'd.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     task_id = arguments.get("task_id")
     if not task_id:
@@ -1630,9 +1608,9 @@ def task_list(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     Returns minimal-but-useful metadata per task (the full Task
     dict, same as `task_status`).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     state_raw = arguments.get("state")
     state: TaskState | None = None
@@ -1768,13 +1746,7 @@ def _existing_page_path(app: App, page_id: str) -> str | None:
     """
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
-    arrow = (
-        pages.search()
-        .where(f"id = {lance.sql_str(page_id)}")
-        .select(["path"])
-        .limit(1)
-        .to_arrow()
-    )
+    arrow = pages.search().where(f"id = {lance.sql_str(page_id)}").select(["path"]).limit(1).to_arrow()
     if arrow.num_rows == 0:
         return None
     return arrow.column("path")[0].as_py()
@@ -1821,9 +1793,9 @@ def write_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     write + indexer pass run inside the corpus single-writer mutex; the
     existence check (for update) is in the same critical section.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     fm_in = arguments.get("frontmatter")
     if not fm_in:
@@ -1958,9 +1930,9 @@ def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     every id unique by construction), so phase 2's existence check is a
     no-op in that mode.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     items = arguments.get("pages")
     if not items or not isinstance(items, list):
@@ -1977,6 +1949,7 @@ def write_pages(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     for i, entry in enumerate(items):
         if not isinstance(entry, dict):
             return {"error": "validation_error", "index": i, "message": "each entry must be an object"}
+        entry = cast("dict[str, Any]", entry)
         fm = entry.get("frontmatter")
         if not fm:
             return {"error": "validation_error", "index": i, "message": "frontmatter is required"}
@@ -2088,13 +2061,7 @@ def _locate_page_file(app: App, page_id: str) -> Path | None:
     """
     db = app.db()
     pages = db.open_table(lance.TABLE_PAGES)
-    arrow = (
-        pages.search()
-        .where(f"id = {lance.sql_str(page_id)}")
-        .select(["path"])
-        .limit(1)
-        .to_arrow()
-    )
+    arrow = pages.search().where(f"id = {lance.sql_str(page_id)}").select(["path"]).limit(1).to_arrow()
     if arrow.num_rows == 0:
         return None
     rel = arrow.column("path")[0].as_py()
@@ -2111,9 +2078,9 @@ def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     pass. Skips duplicates: a link with the same `target` AND `label`
     already in the list is a no-op and `added: false, reason: duplicate`.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     from_id = arguments.get("from_id")
     to_id = arguments.get("to_id")
@@ -2148,7 +2115,7 @@ def add_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 }
 
         new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
-        new_fm["links_out"] = existing_links + [new_link]
+        new_fm["links_out"] = [*existing_links, new_link]
 
         _serialize_and_write_page(page_path, new_fm, parsed.body)
         index_result = _run_indexer(app)
@@ -2175,9 +2142,9 @@ def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     indexer. Skips duplicates: a claim with an id already present in the
     list is a no-op and `added: false, reason: duplicate_claim_id`.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     claim = arguments.get("claim")
@@ -2211,7 +2178,7 @@ def add_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         new_fm: dict[str, Any] = dict(parsed.raw_frontmatter)
         # Store the user-provided dict so sparse-on-disk philosophy holds
         # (don't auto-fill optional fields the user omitted).
-        new_fm["claims"] = existing_claims + [claim]
+        new_fm["claims"] = [*existing_claims, claim]
 
         _serialize_and_write_page(page_path, new_fm, parsed.body)
         index_result = _run_indexer(app)
@@ -2248,9 +2215,9 @@ def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     instead of N round-trips for callers that have many links to add
     (M3 ingest's entity-resolution stage is the motivating use case).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     links_in = arguments.get("links")
@@ -2269,6 +2236,7 @@ def add_links(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     for i, item in enumerate(links_in):
         if not isinstance(item, dict):
             return {"error": "validation_error", "index": i, "message": "each link must be an object"}
+        item = cast("dict[str, Any]", item)
         try:
             Link.model_validate(item)
         except ValidationError as e:
@@ -2354,9 +2322,9 @@ def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
     Net: one disk read, one disk write, one indexer pass per call.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     claims_in = arguments.get("claims")
@@ -2373,6 +2341,7 @@ def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     for i, item in enumerate(claims_in):
         if not isinstance(item, dict):
             return {"error": "validation_error", "index": i, "message": "each claim must be an object"}
+        item = cast("dict[str, Any]", item)
         try:
             validated = Claim.model_validate(item)
         except ValidationError as e:
@@ -2392,7 +2361,7 @@ def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
         existing_claims: list[dict[str, Any]] = list(parsed.raw_frontmatter.get("claims") or [])
 
-        existing_ids: set[str] = {c.get("id") for c in existing_claims if c.get("id")}
+        existing_ids: set[str] = {cid for c in existing_claims if (cid := c.get("id"))}
         to_append: list[dict[str, Any]] = []
 
         for raw, claim_id in validated_pairs:
@@ -2437,12 +2406,14 @@ def add_claims(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 # tier. Bulk versions (`add_links`, `add_claims`) are also not accepted —
 # callers can flatten them into many single-op entries, and supporting
 # batch-of-batch raises edge-case complexity for no real win.
-_WRITE_BATCH_OP_KINDS: frozenset[str] = frozenset({
-    "write_page",
-    "add_link",
-    "add_claim",
-    "update_claim",
-})
+_WRITE_BATCH_OP_KINDS: frozenset[str] = frozenset(
+    {
+        "write_page",
+        "add_link",
+        "add_claim",
+        "update_claim",
+    }
+)
 
 
 @_wrap_sync_in_thread
@@ -2486,9 +2457,9 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     mixed ops, the indexer's fastembed call + LanceDB writes happen once
     instead of 20 times.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     ops = arguments.get("ops")
     if not isinstance(ops, list) or not ops:
@@ -2506,6 +2477,7 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     for i, op in enumerate(ops):
         if not isinstance(op, dict):
             return {"error": "validation_error", "index": i, "message": "each op must be an object"}
+        op = cast("dict[str, Any]", op)
         kind = op.get("kind")
         if kind not in _WRITE_BATCH_OP_KINDS:
             return {
@@ -2554,6 +2526,7 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 link_shape["via_source"] = op["via_source"]
             try:
                 from smalt_mcp.schema import Link
+
                 Link.model_validate(link_shape)
             except ValidationError as e:
                 return {"error": "validation_error", "index": i, "message": str(e)}
@@ -2570,7 +2543,9 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 validated_claim = Claim.model_validate(claim)
             except ValidationError as e:
                 return {"error": "validation_error", "index": i, "message": str(e)}
-            validated.append((i, kind, {"page_id": page_id, "claim_raw": claim, "claim_id": validated_claim.id}))
+            validated.append(
+                (i, kind, {"page_id": page_id, "claim_raw": claim, "claim_id": validated_claim.id})
+            )
 
         else:  # kind == "update_claim"
             page_id = op.get("page_id")
@@ -2606,14 +2581,13 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             if kind == "write_page":
                 fm = op["frontmatter"]
                 mode = op["mode"]
-                if mode == "update":
-                    if _existing_page_path(app, fm["id"]) is None:
-                        return {
-                            "error": "not_found",
-                            "index": i,
-                            "id": fm["id"],
-                            "message": f"page {fm['id']!r} does not exist; batch aborted",
-                        }
+                if mode == "update" and _existing_page_path(app, fm["id"]) is None:
+                    return {
+                        "error": "not_found",
+                        "index": i,
+                        "id": fm["id"],
+                        "message": f"page {fm['id']!r} does not exist; batch aborted",
+                    }
                 # mode='create' with slug: no existence check (mangling
                 # makes each new id unique by construction).
                 # mode='create' with section id: upsert, no existence check.
@@ -2666,8 +2640,7 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                         "page_id": op["page_id"],
                         "claim_id": op["claim_id"],
                         "message": (
-                            f"claim {op['claim_id']!r} not found on page "
-                            f"{op['page_id']!r}; batch aborted"
+                            f"claim {op['claim_id']!r} not found on page {op['page_id']!r}; batch aborted"
                         ),
                     }
 
@@ -2684,16 +2657,18 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                     target = _page_target_path(app.cfg.smalt_dir, page)
                     already_existed = _existing_page_path(app, page.id) is not None
                     _serialize_and_write_page(target, fm_in, body)
-                    results.append({
-                        "index": i,
-                        "kind": kind,
-                        "id": page.id,
-                        "path": str(target.relative_to(app.cfg.smalt_dir)),
-                        "type": page.type.value,
-                        "mode": "create",
-                        "mangled": False,
-                        "upserted": already_existed,
-                    })
+                    results.append(
+                        {
+                            "index": i,
+                            "kind": kind,
+                            "id": page.id,
+                            "path": str(target.relative_to(app.cfg.smalt_dir)),
+                            "type": page.type.value,
+                            "mode": "create",
+                            "mangled": False,
+                            "upserted": already_existed,
+                        }
+                    )
                 elif mode == "create":
                     # Slug create — always mangle.
                     page, fm_out, original_id = _prepare_create_write(fm_in)
@@ -2706,35 +2681,40 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                             "message": "UUID4 collision (extraordinary); retry the batch",
                         }
                     _serialize_and_write_page(target, fm_out, body)
-                    results.append({
-                        "index": i,
-                        "kind": kind,
-                        "id": page.id,
-                        "original_id": original_id,
-                        "path": str(target.relative_to(app.cfg.smalt_dir)),
-                        "type": page.type.value,
-                        "mode": "create",
-                        "mangled": True,
-                    })
+                    results.append(
+                        {
+                            "index": i,
+                            "kind": kind,
+                            "id": page.id,
+                            "original_id": original_id,
+                            "path": str(target.relative_to(app.cfg.smalt_dir)),
+                            "type": page.type.value,
+                            "mode": "create",
+                            "mangled": True,
+                        }
+                    )
                 else:  # mode == "update"
                     page = PAGE_ADAPTER.validate_python(fm_in)
                     target = _page_target_path(app.cfg.smalt_dir, page)
                     _serialize_and_write_page(target, fm_in, body)
-                    results.append({
-                        "index": i,
-                        "kind": kind,
-                        "id": page.id,
-                        "path": str(target.relative_to(app.cfg.smalt_dir)),
-                        "type": page.type.value,
-                        "mode": "update",
-                        "mangled": False,
-                    })
+                    results.append(
+                        {
+                            "index": i,
+                            "kind": kind,
+                            "id": page.id,
+                            "path": str(target.relative_to(app.cfg.smalt_dir)),
+                            "type": page.type.value,
+                            "mode": "update",
+                            "mangled": False,
+                        }
+                    )
 
             elif kind == "add_link":
                 from_id = op["from_id"]
                 new_link = op["link"]
-                page_path = _locate_page_file(app, from_id)
-                # page_path can't be None — phase 2 verified existence.
+                # page_path can't be None — phase 2 verified existence (under
+                # the same mutex, so the file can't vanish between phases).
+                page_path = cast("Path", _locate_page_file(app, from_id))
                 parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
                 existing_links = list(parsed.raw_frontmatter.get("links_out") or [])
                 duplicate = any(
@@ -2743,62 +2723,72 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                     for existing in existing_links
                 )
                 if duplicate:
-                    results.append({
+                    results.append(
+                        {
+                            "index": i,
+                            "kind": kind,
+                            "id": from_id,
+                            "added": False,
+                            "reason": "duplicate",
+                            "link": new_link,
+                        }
+                    )
+                    continue
+                new_fm = dict(parsed.raw_frontmatter)
+                new_fm["links_out"] = [*existing_links, new_link]
+                _serialize_and_write_page(page_path, new_fm, parsed.body)
+                results.append(
+                    {
                         "index": i,
                         "kind": kind,
                         "id": from_id,
-                        "added": False,
-                        "reason": "duplicate",
+                        "added": True,
                         "link": new_link,
-                    })
-                    continue
-                new_fm = dict(parsed.raw_frontmatter)
-                new_fm["links_out"] = existing_links + [new_link]
-                _serialize_and_write_page(page_path, new_fm, parsed.body)
-                results.append({
-                    "index": i,
-                    "kind": kind,
-                    "id": from_id,
-                    "added": True,
-                    "link": new_link,
-                    "links_out_count": len(new_fm["links_out"]),
-                })
+                        "links_out_count": len(new_fm["links_out"]),
+                    }
+                )
 
             elif kind == "add_claim":
                 page_id = op["page_id"]
                 claim_raw = op["claim_raw"]
                 claim_id = op["claim_id"]
-                page_path = _locate_page_file(app, page_id)
+                # page_path can't be None — phase 2 verified existence.
+                page_path = cast("Path", _locate_page_file(app, page_id))
                 parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
                 existing_claims = list(parsed.raw_frontmatter.get("claims") or [])
                 duplicate = any(c.get("id") == claim_id for c in existing_claims if isinstance(c, dict))
                 if duplicate:
-                    results.append({
+                    results.append(
+                        {
+                            "index": i,
+                            "kind": kind,
+                            "id": page_id,
+                            "added": False,
+                            "reason": "duplicate_claim_id",
+                            "claim_id": claim_id,
+                        }
+                    )
+                    continue
+                new_fm = dict(parsed.raw_frontmatter)
+                new_fm["claims"] = [*existing_claims, claim_raw]
+                _serialize_and_write_page(page_path, new_fm, parsed.body)
+                results.append(
+                    {
                         "index": i,
                         "kind": kind,
                         "id": page_id,
-                        "added": False,
-                        "reason": "duplicate_claim_id",
+                        "added": True,
                         "claim_id": claim_id,
-                    })
-                    continue
-                new_fm = dict(parsed.raw_frontmatter)
-                new_fm["claims"] = existing_claims + [claim_raw]
-                _serialize_and_write_page(page_path, new_fm, parsed.body)
-                results.append({
-                    "index": i,
-                    "kind": kind,
-                    "id": page_id,
-                    "added": True,
-                    "claim_id": claim_id,
-                    "claims_count": len(new_fm["claims"]),
-                })
+                        "claims_count": len(new_fm["claims"]),
+                    }
+                )
 
             else:  # update_claim
                 page_id = op["page_id"]
                 claim_id = op["claim_id"]
                 new_claim = op["new_claim"]
-                page_path = _locate_page_file(app, page_id)
+                # page_path can't be None — phase 2 verified existence.
+                page_path = cast("Path", _locate_page_file(app, page_id))
                 parsed = parse_page(page_path, smalt_root=app.cfg.smalt_dir)
                 claims = list(parsed.raw_frontmatter.get("claims") or [])
                 # Phase 2 already verified claim_id presence — but a
@@ -2823,13 +2813,15 @@ def write_batch(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 new_fm = dict(parsed.raw_frontmatter)
                 new_fm["claims"] = claims
                 _serialize_and_write_page(page_path, new_fm, parsed.body)
-                results.append({
-                    "index": i,
-                    "kind": kind,
-                    "id": page_id,
-                    "claim_id": claim_id,
-                    "updated": True,
-                })
+                results.append(
+                    {
+                        "index": i,
+                        "kind": kind,
+                        "id": page_id,
+                        "claim_id": claim_id,
+                        "updated": True,
+                    }
+                )
 
         # One indexer pass at the end.
         index_result = _run_indexer(app)
@@ -2905,9 +2897,9 @@ def reindex_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
     Runs under the corpus mutex; one indexer pass for the single file.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     if not page_id:
@@ -3003,9 +2995,7 @@ async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
             with app.mutex.acquire("reindex_all"):
                 # Honor cancel before any destructive work happens.
                 if task.cancel_requested:
-                    raise asyncio.CancelledError(
-                        f"task {task.id} cancelled before reindex started"
-                    )
+                    raise asyncio.CancelledError(f"task {task.id} cancelled before reindex started")
 
                 task.progress["phase"] = "wiping_tables"
                 db = app.db()
@@ -3016,7 +3006,7 @@ async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                         wiped.append(table_name)
                     except (FileNotFoundError, ValueError, KeyError):
                         continue
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:
                         logger.warning(
                             "reindex_all: drop_table(%s) failed: %s",
                             table_name,
@@ -3025,14 +3015,10 @@ async def reindex_all(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
                 task.progress["wiped_tables"] = list(wiped)
 
                 if task.cancel_requested:
-                    raise asyncio.CancelledError(
-                        f"task {task.id} cancelled after wipe"
-                    )
+                    raise asyncio.CancelledError(f"task {task.id} cancelled after wipe")
 
                 task.progress["phase"] = "recreating_tables"
-                recreated = lance.ensure_tables(
-                    app.cfg.smalt_dir, embedding_dim=app.cfg.embedding.dim
-                )
+                recreated = lance.ensure_tables(app.cfg.smalt_dir, embedding_dim=app.cfg.embedding.dim)
                 task.progress["recreated_tables"] = list(recreated)
 
                 task.progress["phase"] = "indexing"
@@ -3088,9 +3074,9 @@ def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     Returns the task's current state (post-cancel-request). Errors:
     `not_found` if `task_id` is unknown.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     task_id = arguments.get("task_id")
     if not task_id:
@@ -3100,10 +3086,7 @@ def task_cancel(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
         return {
             "error": "not_found",
             "task_id": task_id,
-            "message": (
-                f"no task with id {task_id!r} — either it never existed "
-                "or it was GC'd"
-            ),
+            "message": (f"no task with id {task_id!r} — either it never existed or it was GC'd"),
         }
     payload = task.to_dict()
     payload["was_terminal_at_call"] = task.state in TERMINAL_STATES and (
@@ -3133,9 +3116,9 @@ def remove_page(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     No alias resolution: caller must pass the canonical id (use `find_by_alias`
     or `read_page` to resolve from an alias first).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     if not page_id:
@@ -3196,9 +3179,9 @@ def update_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     in `new_claim` must match `claim_id` (we don't let updates change the
     identifier — use add_claim + remove_claim if you want to rename).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     claim_id = arguments.get("claim_id")
@@ -3257,9 +3240,9 @@ def remove_claim(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
 
     Returns `{error: 'claim_not_found'}` if the claim id isn't on the page.
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     page_id = arguments.get("page_id")
     claim_id = arguments.get("claim_id")
@@ -3311,9 +3294,9 @@ def remove_link(app: App, arguments: dict[str, Any]) -> dict[str, Any]:
     RMW under the mutex. Returns `{removed: <count>}`; 0 means no matching
     link existed (not an error — symmetric with add_link's duplicate-no-op).
     """
-    ok, err = _ensure_initialized(app)
-    if not ok:
-        return err  # type: ignore[return-value]
+    err = _ensure_initialized(app)
+    if err is not None:
+        return err
 
     from_id = arguments.get("from_id")
     to_id = arguments.get("to_id")
@@ -3601,10 +3584,7 @@ TOOLS: list[ToolDef] = [
                     },
                     "fuzzy": {
                         "type": "boolean",
-                        "description": (
-                            "Opt out of the fuzzy fallback (exact-only "
-                            "match). Default true."
-                        ),
+                        "description": ("Opt out of the fuzzy fallback (exact-only match). Default true."),
                         "default": True,
                     },
                 },
@@ -3643,8 +3623,7 @@ TOOLS: list[ToolDef] = [
                     "label": {
                         "type": "string",
                         "description": (
-                            "Optional edge-label filter, applied per hop "
-                            "(only matching edges are followed)."
+                            "Optional edge-label filter, applied per hop (only matching edges are followed)."
                         ),
                     },
                     "hops": {
@@ -3827,9 +3806,7 @@ TOOLS: list[ToolDef] = [
                     "source_id": {
                         "type": "string",
                         "description": (
-                            "Canonical page id whose embedding "
-                            "becomes the query vector. Any page type "
-                            "works."
+                            "Canonical page id whose embedding becomes the query vector. Any page type works."
                         ),
                     },
                     "top_k": {
@@ -3858,7 +3835,7 @@ TOOLS: list[ToolDef] = [
                             "Optional page-type filter — only "
                             "results whose `type` is in this list "
                             "are returned. Applied client-side after "
-                            "vector retrieval (5× over-fetch keeps "
+                            "vector retrieval (5x over-fetch keeps "
                             "the post-filter pool deep). When set, "
                             "the response carries "
                             "`truncated: true` if the filter "
@@ -3920,9 +3897,9 @@ TOOLS: list[ToolDef] = [
                 "Returns `{tasks: [...], count, state_filter, "
                 "kind_filter}` where each task entry is the same "
                 "shape as `task_status`. Useful for ops introspection "
-                "(\"what's currently running?\" → "
+                '("what\'s currently running?" → '
                 "`task_list(state='running')`) or debugging recent "
-                "failures (\"why did my last reindex fail?\" → "
+                'failures ("why did my last reindex fail?" → '
                 "`task_list(state='failed', kind='reindex_all', "
                 "limit=5)`)."
             ),
@@ -3939,8 +3916,7 @@ TOOLS: list[ToolDef] = [
                             "cancelled",
                         ],
                         "description": (
-                            "Optional state filter. When set, only "
-                            "tasks in that state are returned."
+                            "Optional state filter. When set, only tasks in that state are returned."
                         ),
                     },
                     "kind": {
@@ -3953,10 +3929,7 @@ TOOLS: list[ToolDef] = [
                     },
                     "limit": {
                         "type": "integer",
-                        "description": (
-                            "Max number of tasks to return "
-                            "(default 100)."
-                        ),
+                        "description": ("Max number of tasks to return (default 100)."),
                         "default": 100,
                         "minimum": 1,
                     },

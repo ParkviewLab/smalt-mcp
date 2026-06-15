@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gary Frattarola <garyf@parkviewlab.ai>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Single-writer corpus mutex.
 
 smalt-mcp's invariant: only one task may be in the *commit* phase of a
