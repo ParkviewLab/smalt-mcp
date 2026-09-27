@@ -20,6 +20,26 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v1.3.4] - 2026-09-27
+
+### Highlights
+
+This release updates locked dependencies past open security advisories, moving anyio from 4.13.0 to 4.14.2 and cryptography from 48.0.0 to 50.0.1, which affects the container image built from the lockfile. It also adds `docs/Smalt_Operations.md`, an explainer of what smalt-mcp does and how, covering the data model, on-disk layout, retrieval and indexing, the 27 MCP tools by permission tier, runtime configuration, backup and concurrency, and noting where `README.md` has fallen out of date. The remaining changes are internal: the release and dev-release workflows are re-assembled from the handbook's templates, adding version-increase and dev-version checks to the release gate, and changelog generation moves to dev-tools' shared script.
+
+### Bug fixes
+
+- Anyio and cryptography past their security advisories (#49)
+
+### Docs
+
+- Add Smalt_Operations.md (what and how smalt-mcp works) (#45)
+
+### Maintenance
+
+- Drop the shallow re-fetch from the version guard (#46)
+- Assemble the release workflows from the handbook's parts (#47)
+- Generate the changelog with dev-tools' shared script (#48)
+
 ## [v1.3.3] - 2026-06-25
 
 ### Highlights
