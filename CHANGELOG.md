@@ -20,6 +20,17 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v1.3.5] - 2026-09-27
+
+### Highlights
+
+This release contains only build and contribution-process changes, with no user-visible changes to the MCP server itself. Dev builds now derive their version from the newest release tag and the run number rather than committing a version, and that version is applied in each build job's workspace and used as the dev image's version label. The repository also moves from squash merges and a direct back-merge to merge commits and a back-merge pull request, with `docs/CONTRIBUTING.md` updated to describe the new flow.
+
+### Maintenance
+
+- Dev builds take their version in the workspace (#50)
+- Merge commits and the checked back-merge pull request (#51)
+
 ## [v1.3.4] - 2026-09-27
 
 ### Highlights
