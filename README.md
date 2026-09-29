@@ -67,7 +67,7 @@ HTTP responses are gzipped when the client sends `Accept-Encoding: gzip`.
 
 ## MCP tools
 
-Three permission tiers controlled by `SMALT_SCOPE`. A caller at tier N sees and may call any tool whose required scope is ≤ N.
+Three permission tiers controlled by `SMALT_SCOPE`. A caller at tier N sees and may call any tool whose required scope is ≤ N. While `SMALT_INTERNAL_TOKEN` is unset, the scope is capped at `read_only` whatever `SMALT_SCOPE` says (an unconfigured token means read-only), and the server logs a warning naming the cap; set the token to serve `read_write` or `remove_destructive`.
 
 **`read_only` (8 tools):**
 
@@ -104,11 +104,11 @@ For the proposal / experiment / gap surface (writing hypotheses, recording exper
 | `PORT` | `35833` | HTTP listen port. |
 | `HOST` | `0.0.0.0` | HTTP bind address. |
 | `SMALT_DIR` | `~/Documents/Smalt` | Path to the Smalt this server wraps. Call the `bootstrap` MCP tool once to initialize. |
-| `SMALT_SCOPE` | `read_write` | `read_only`, `read_write`, or `remove_destructive`. Tiered: caller at tier N sees every tool whose required scope is ≤ N. |
+| `SMALT_SCOPE` | `read_write` | `read_only`, `read_write`, or `remove_destructive`. Tiered: caller at tier N sees every tool whose required scope is ≤ N. Capped at `read_only` while `SMALT_INTERNAL_TOKEN` is unset. |
 | `EMBEDDING_PROVIDER` | `fastembed` | Embedding backend. `fastembed` is the only one wired up; `voyage` / `openai` are placeholders. |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Model name passed to the provider. |
 | `EMBEDDING_DIM` | `384` | Must match the model. |
-| `SMALT_INTERNAL_TOKEN` | *(unset)* | Reserved for future per-client scope routing; not yet enforced. |
+| `SMALT_INTERNAL_TOKEN` | *(unset)* | Unset: the server is read-only whatever `SMALT_SCOPE` says. Set: `SMALT_SCOPE` applies. Not yet checked on incoming requests. |
 
 ## Operations: backup and restore
 

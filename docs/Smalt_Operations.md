@@ -351,7 +351,9 @@ registry entry plus a handler, with no edit to `server.py`.
 
 Access is tiered by `SMALT_SCOPE`: a caller at tier N sees and may call every tool whose
 required scope is at or below N. The tiers are `read_only` (0), `read_write` (1), and
-`remove_destructive` (2).
+`remove_destructive` (2). While `SMALT_INTERNAL_TOKEN` is unset, the scope is capped at
+`read_only` whatever `SMALT_SCOPE` says (the handbook's mcp-server-conventions.md: an
+unconfigured token means read-only), and a warning at startup names the cap.
 
 ### `read_only` (12 tools)
 
@@ -439,13 +441,13 @@ imports.
 | `PORT` | `35833` | HTTP listen port (`deco-assaying`'s 35832 plus one). |
 | `HOST` | `0.0.0.0` | HTTP bind address. |
 | `SMALT_DIR` | `~/Documents/Smalt` | The Smalt this server wraps. Expanded and resolved at startup. |
-| `SMALT_SCOPE` | `read_write` | Permission tier: `read_only`, `read_write`, or `remove_destructive`. |
+| `SMALT_SCOPE` | `read_write` | Permission tier: `read_only`, `read_write`, or `remove_destructive`. Capped at `read_only` while `SMALT_INTERNAL_TOKEN` is unset. |
 | `EMBEDDING_PROVIDER` | `fastembed` | `fastembed` is wired; `fake` is the test hook; `voyage`/`openai` are placeholders. |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Model passed to the provider. |
 | `EMBEDDING_DIM` | `384` | Must match the model. |
 | `SMALT_THREAD_POOL_WORKERS` | `32` | Bounds concurrent handler execution on the loop's thread pool. |
 | `SMALT_FUZZY_ALIAS_THRESHOLD` | `0.6` | Trigram-Jaccard threshold for fuzzy alias resolution. |
-| `SMALT_INTERNAL_TOKEN` | unset | Reserved for future per-client scope routing. Not yet enforced. |
+| `SMALT_INTERNAL_TOKEN` | unset | Unset: read-only whatever `SMALT_SCOPE` says. Set: `SMALT_SCOPE` applies. Not yet checked on incoming requests. |
 
 The scope is parsed once at startup, so the tier is a property of the running server, not of
 the caller. Running two servers at different scopes against one Smalt is the way to give

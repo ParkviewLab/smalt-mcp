@@ -74,6 +74,8 @@ def _concurrency_app(_concurrency_smalt_dir):
     os.environ["EMBEDDING_PROVIDER"] = "fake"
     os.environ["EMBEDDING_DIM"] = "384"
     os.environ["SMALT_SCOPE"] = "remove_destructive"
+    # A configured token: without one the scope is capped at read_only.
+    os.environ["SMALT_INTERNAL_TOKEN"] = "test-internal-token"
 
     # Seed the same shape as conftest._SEED_PAGES so search returns
     # something. Copy the conftest helper inline (small).

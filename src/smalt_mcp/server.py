@@ -32,7 +32,7 @@ from starlette.routing import Route
 from smalt_mcp import tools as tools_module
 from smalt_mcp.app import App
 from smalt_mcp.config import VERSION
-from smalt_mcp.permissions import Scope
+from smalt_mcp.permissions import Scope, effective_scope, expected_internal_token
 
 logger = logging.getLogger(__name__)
 _started_at = time.time()
@@ -58,19 +58,31 @@ def _server_scope() -> Scope:
       - `remove_destructive`  (2): READ_ONLY + READ_WRITE + REMOVE_DESTRUCTIVE.
 
     Default is `read_write` so the destructive tools (`remove_page`,
-    `update_claim`, `remove_claim`, `remove_link`) are opt-in to expose —
+    `update_claim`, `remove_claim`, `remove_link`) are opt-in to expose;
     they're powerful enough that operators should consciously enable them.
+
+    While `SMALT_INTERNAL_TOKEN` is unset the scope is capped at `read_only`
+    whatever `SMALT_SCOPE` asks for (an unconfigured token means read-only),
+    and a warning names the cap.
     """
     raw = (os.environ.get("SMALT_SCOPE") or "read_write").lower()
     if raw == "read_only":
-        return Scope.READ_ONLY
-    if raw == "read_write":
-        return Scope.READ_WRITE
-    if raw == "remove_destructive":
-        return Scope.REMOVE_DESTRUCTIVE
-    raise ValueError(
-        f"invalid SMALT_SCOPE={raw!r}; expected one of read_only / read_write / remove_destructive"
-    )
+        requested = Scope.READ_ONLY
+    elif raw == "read_write":
+        requested = Scope.READ_WRITE
+    elif raw == "remove_destructive":
+        requested = Scope.REMOVE_DESTRUCTIVE
+    else:
+        raise ValueError(
+            f"invalid SMALT_SCOPE={raw!r}; expected one of read_only / read_write / remove_destructive"
+        )
+    scope = effective_scope(requested, expected_internal_token())
+    if scope != requested:
+        logging.getLogger("uvicorn.error").warning(
+            "SMALT_INTERNAL_TOKEN is unset, so the scope is capped at read_only (SMALT_SCOPE=%s asked for more)",
+            requested.value,
+        )
+    return scope
 
 
 _SERVER_SCOPE: Scope = _server_scope()
