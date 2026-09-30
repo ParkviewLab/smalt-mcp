@@ -152,6 +152,8 @@ def mcp_client(tmp_path_factory) -> TestClient:
     os.environ["EMBEDDING_DIM"] = "384"
     # Expose the destructive tools so tests can exercise remove_*, update_claim.
     os.environ["SMALT_SCOPE"] = "remove_destructive"
+    # A configured token: without one the scope is capped at read_only.
+    os.environ["SMALT_INTERNAL_TOKEN"] = "test-internal-token"
 
     _write_seed_smalt(smalt_dir)
     _bootstrap_and_index(smalt_dir)
