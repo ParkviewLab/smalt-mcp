@@ -9,8 +9,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 What `smalt-mcp` does, and how it does it. This document covers the concept, the place the
 server occupies in the wider CoGrind system, the data model, the retrieval machinery, the
 full MCP tool surface, and the operational surface (running, configuring, backing up, and
-the ways it can fail). It is written against the code rather than against the prose; see
-[Document currency](#document-currency) at the end.
+the ways it can fail). It is written against the code rather than against the prose.
 
 ## What the Smalt is
 
@@ -141,7 +140,8 @@ so that nobody re-adds them by accident. From `schema.py`:
 > `EBONY_ENRICHING_DIR` storage. Smalt-mcp is purely the canonical knowledge substrate; no
 > proposal / experiment / gap models live here.
 
-The `tasks/` directory carries the same warning, and the `SCHEMA.md` and `POLICY.md`
+The warning is repeated in the docstring of `paths.tasks_dir()`; the `tasks/` directory
+itself, which `bootstrap` creates, contains nothing. The `SCHEMA.md` and `POLICY.md`
 placeholders written at bootstrap state that schema and policy changes are proposed,
 tested, and applied through `ebony-enriching`.
 
@@ -172,10 +172,12 @@ field.
 | `IndexPage` | `index` | An auto-generated index (`glossary.md`, `domains.md`) |
 
 Every page shares `PageBase`: an `id`, `type`, `title`, `aliases`, `tags`, `created_at` and
-`updated_at`, and `links_out`. Two scoring fields, `quality_score` and `veracity_score`, are
-reserved for future veracity work. `PageBase` sets `extra="allow"`, so a page carrying
-frontmatter fields this version does not know about still parses; the schema is
-forward-compatible on purpose.
+`updated_at`, and `links_out`. Two optional scoring fields, `quality_score` and
+`veracity_score`, exist on `PageBase` and as columns of the `sources` table, but nothing in
+the server computes them. `PageBase` sets `extra="allow"`, so a page carrying frontmatter
+fields this version does not know about still parses; the page schema is forward-compatible
+on purpose (`Link`, `Claim`, and `Evidence` are not; see
+[Design invariants](#design-invariants)).
 
 Three building blocks compose onto pages:
 
@@ -220,7 +222,7 @@ $SMALT_DIR/
 │   └── POLICY.md       # living, human-facing policy doc
 ├── index/
 │   └── lance/          # LanceDB store: derived, rebuildable, excluded from backup
-└── tasks/              # reserved for future Smalt-internal task state
+└── tasks/              # created empty by bootstrap; nothing writes to it
 ```
 
 The important line runs between `pages/` and `index/lance/`. Everything under `pages/` is
@@ -260,9 +262,8 @@ default, and what fires after every write), full (`reindex_all`), and path-scope
 
 Two details are worth knowing because they bound retrieval quality:
 
-**There is no real chunking yet.** Each page produces exactly one embedding, computed over
-its body truncated to a fixed 2000-character budget (`EMBED_BODY_CHAR_BUDGET`). The module
-docstring says plainly that "chunking is planned for a later iteration." The practical
+**There is no chunking.** Each page produces exactly one embedding, computed over its body
+truncated to a fixed 2000-character budget (`EMBED_BODY_CHAR_BUDGET`). The practical
 consequence is that vector recall on a long page reflects only its opening; the coarse
 substitute is granularity at the page level, which is why ingestion emits one section page
 per file rather than one page per repository.
@@ -353,7 +354,8 @@ Access is tiered by `SMALT_SCOPE`: a caller at tier N sees and may call every to
 required scope is at or below N. The tiers are `read_only` (0), `read_write` (1), and
 `remove_destructive` (2). While `SMALT_INTERNAL_TOKEN` is unset, the scope is capped at
 `read_only` whatever `SMALT_SCOPE` says (the handbook's mcp-server-conventions.md: an
-unconfigured token means read-only), and a warning at startup names the cap.
+unconfigured token means read-only; an empty token counts as unset). When the cap lowers
+the requested scope, a warning at startup names it.
 
 ### `read_only` (12 tools)
 
@@ -429,7 +431,11 @@ matching the family pattern: `uvx` for a one-off, `uv tool install` for a pinned
 Docker or docker compose for a container. The Docker image sets `SMALT_DIR=/data` and
 exposes 35833; the compose file defaults to `SMALT_SCOPE=read_only`.
 
-A first run against a fresh directory needs exactly one call to `bootstrap`.
+A first run against a fresh directory needs exactly one call to `bootstrap`. Bootstrap,
+every write, and `reindex_all` need two settings: `SMALT_INTERNAL_TOKEN` set to a non-empty
+value, and `SMALT_SCOPE` at `read_write` or above (the default is `read_write`). Without the
+token the scope is capped at `read_only`, and `bootstrap` is then not offered. The compose
+file carries a commented `SMALT_INTERNAL_TOKEN` line for the purpose.
 
 ### Configuration
 
@@ -447,7 +453,7 @@ imports.
 | `EMBEDDING_DIM` | `384` | Must match the model. |
 | `SMALT_THREAD_POOL_WORKERS` | `32` | Bounds concurrent handler execution on the loop's thread pool. |
 | `SMALT_FUZZY_ALIAS_THRESHOLD` | `0.6` | Trigram-Jaccard threshold for fuzzy alias resolution. |
-| `SMALT_INTERNAL_TOKEN` | unset | Unset: read-only whatever `SMALT_SCOPE` says. Set: `SMALT_SCOPE` applies. Not yet checked on incoming requests. |
+| `SMALT_INTERNAL_TOKEN` | unset | Unset or empty: read-only whatever `SMALT_SCOPE` says. Set: `SMALT_SCOPE` applies. Not checked on incoming requests; it only lifts the cap. |
 
 The scope is parsed once at startup, so the tier is a property of the running server, not of
 the caller. Running two servers at different scopes against one Smalt is the way to give
@@ -469,8 +475,8 @@ supervisor that probes it.
 
 ### Backup and restore
 
-There is no backup endpoint, deliberately. One shipped briefly as `GET /admin/backup` and was
-removed in v0.12.0. The reasoning is that Restic's content-defined chunk-level deduplication
+There is no backup endpoint, deliberately. One was built during development as
+`GET /admin/backup` and reverted before any release. The reasoning is that Restic's content-defined chunk-level deduplication
 must see raw file content to work; a server-side tar.gz reduces every snapshot to one opaque
 blob and defeats it.
 
@@ -486,8 +492,9 @@ regenerate. This can run against a live server, since the mutex is held only bri
 a write's commit phase; for a strict point-in-time snapshot, stop the server first.
 
 To restore: stop the server, `restic restore latest --target /staging`, move the tree into
-place, start the server against it, and rebuild the index with `reindex_all` (asynchronous;
-poll the returned `task_id` with `task_status`). `bootstrap` also rebuilds and is idempotent,
+place, start the server against it (with `SMALT_INTERNAL_TOKEN` set and `SMALT_SCOPE` at
+`read_write` or above, since the rebuild is a `read_write` call), and rebuild the index with
+`reindex_all` (asynchronous; poll the returned `task_id` with `task_status`). `bootstrap` also rebuilds and is idempotent,
 but `reindex_all` is the explicit instrument for this case.
 
 For a Smalt on a host where Restic cannot reach the filesystem, mount `SMALT_DIR` over SSHFS
@@ -558,24 +565,11 @@ There is one writer per Smalt, and every write commits under the mutex.
 Writes are atomic: a temporary file, then `os.replace`. A reader never sees a half-written
 page.
 
-The schema is forward-compatible. Models allow unknown fields, so an older server can read a
-corpus written by a newer one without discarding data.
-
-## Document currency
-
-This document describes the code on `develop`, verified against the source rather than the
-prose. Where it disagrees with `README.md`, the README lags, in three known respects:
-
-- The README's status section reports 17 tools across three tiers (8 + 5 + 4). The registry
-  and `tests/test_server.py` both hold 27 (12 + 11 + 4), and have since v0.6.0.
-- The README's restore instructions call `reindex_all` "a planned future tool." It ships, in
-  the `read_write` tier, and is the right instrument for a post-restore rebuild.
-- The README's endpoint list omits `GET /admin/health`.
-
-Note also that `CLAUDE.md` and `docs/CONTRIBUTING.md` instruct the reader to begin with
-`docs/northstar.md`. No such file exists in this repo; the governing intent lives in
-`cobalt-grinding/docs/northstar.md`, which states CoGrind's axioms and the substrate split
-this server implements.
+The page schema is forward-compatible. Only the page frontmatter allows unknown fields
+(`PageBase` sets `extra="allow"`), so an older server can read a corpus written by a newer
+one without discarding new top-level keys. `Link`, `Claim`, and `Evidence` forbid unknown
+fields: a page with an unknown key inside a claim or a link fails validation and is skipped
+by the indexer, which records it as a per-file failure.
 
 ## Further reading
 
@@ -583,6 +577,6 @@ this server implements.
 - `CHANGELOG.md` — the release history, including the v0.5.0 substrate split.
 - `cobalt-grinding/docs/northstar.md` — the governing intent: why memory is markdown, why
   memory is earned rather than stored, and how the Smalt evolves by hypothesis and test.
-- `cobalt-grinding/docs/plan.md` — the full system design; the LanceDB table list here is
-  kept in step with it.
+- `cobalt-grinding/docs/architecture.md` — how the CoGrind daemon uses this server and its
+  sibling substrate.
 - `ebony-enriching` — the sibling substrate: proposals, experiments, and gaps.
