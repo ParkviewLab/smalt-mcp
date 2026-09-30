@@ -1300,7 +1300,7 @@ requires-dist = [
     { name = "fastapi" },
     { name = "fastembed" },
     { name = "lancedb", specifier = ">=0.30" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.27.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "pydantic" },
