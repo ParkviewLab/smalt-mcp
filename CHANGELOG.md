@@ -20,6 +20,24 @@ section here, and uses the same content as the GitHub Release body.
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-10-01
+
+### Highlights
+
+Starting the server without a non-empty `SMALT_INTERNAL_TOKEN` now caps the scope at read-only, where it previously defaulted to read-write; if `SMALT_SCOPE` asks for more, a warning is logged explaining the cap. The `mcp` dependency is now pinned below 2.0, since mcp 2.x removes the low-level `list_tools`/`call_tool` decorators and every earlier release fails at import against it. Documentation has been corrected throughout: the token requirement is stated in the run, bootstrap and restore instructions, the README tool lists match the 27-tool registry with `reindex_all` documented as shipped, and `PUBLIC_BASE_URL` has been dropped from the compose file.
+
+### Breaking changes
+
+- An unconfigured token means read-only (#54)
+
+### Bug fixes
+
+- Keep mcp below 2, and correct the documents (#55)
+
+### Maintenance
+
+- Align with handbook v2.1.0 (#53)
+
 ## [v1.3.5] - 2026-09-27
 
 ### Highlights
