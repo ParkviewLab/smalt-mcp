@@ -16,13 +16,15 @@ services:
     ports:
       - "35833:35833"
     environment:
-      # Externally-reachable URL clients use (set in real deployments).
-      # Default is fine for local dev.
-      # PUBLIC_BASE_URL: "http://localhost:35833"
-
       # Read-only by default for shared deployments; flip to read_write only
       # if you trust every client that can reach this container.
       SMALT_SCOPE: "read_only"
+
+      # Bootstrapping a new Smalt and every write need both settings: this
+      # token set to a non-empty value, and SMALT_SCOPE at read_write or above.
+      # Without the token the scope is capped at read_only whatever
+      # SMALT_SCOPE says; an empty token counts as unset.
+      # SMALT_INTERNAL_TOKEN: "CHANGE-ME"
 
       # Embedder defaults — see README for alternative providers.
       EMBEDDING_PROVIDER: "fastembed"
